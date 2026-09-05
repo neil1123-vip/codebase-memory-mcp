@@ -684,14 +684,16 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
          * internally inconsistent: on Windows stat() truncates mtime to
          * seconds while the recorded value carries FILETIME nanoseconds, which
          * made every file look changed on each incremental pass. */
-        cbm_path_info_t info;
-        if (cbm_path_info_utf8(files[i].path, &info) != 0) {
+        cbm_path_info_t path_info;
+        if (cbm_path_info_utf8(files[i].path, &path_info) != CBM_PATH_INFO_OK ||
+            !path_info.is_regular ||
+            path_info.is_symlink) {
             changed[i] = true;
             n_changed++;
             continue;
         }
 
-        if (info.mtime_ns != h->mtime_ns || info.size != h->size) {
+        if (path_info.mtime_ns != h->mtime_ns || path_info.size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {
