@@ -398,6 +398,48 @@ static bool frontend_write_cancelled_response(FILE *out, const frontend_item_t *
     return written;
 }
 
+static bool frontend_write_application_error(FILE *out, const frontend_item_t *item,
+                                             cbm_daemon_runtime_application_status_t status) {
+    if (!item->has_id) {
+        return true;
+    }
+    int code = -32603;
+    const char *error_json = "{\"code\":-32603,\"message\":\"CBM request failed\"}";
+    switch (status) {
+    case CBM_DAEMON_RUNTIME_APPLICATION_BUSY:
+        code = -32001;
+        error_json = "{\"code\":-32001,\"message\":\"CBM request busy; retry\"}";
+        break;
+    case CBM_DAEMON_RUNTIME_APPLICATION_UNAVAILABLE:
+        code = -32002;
+        error_json = "{\"code\":-32002,\"message\":\"CBM application unavailable; retry\"}";
+        break;
+    case CBM_DAEMON_RUNTIME_APPLICATION_REJECTED:
+        code = -32003;
+        error_json = "{\"code\":-32003,\"message\":\"CBM request rejected\"}";
+        break;
+    case CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR:
+        break;
+    default:
+        return false;
+    }
+    cbm_jsonrpc_response_t response = {
+        .id = item->id,
+        .id_str = item->id_str,
+        .error_json = error_json,
+        .error_code = code,
+    };
+    char *encoded = cbm_jsonrpc_format_response(&response);
+    if (!encoded) {
+        return false;
+    }
+    bool written = frontend_write_response(out, (const uint8_t *)encoded,
+                                           (uint32_t)strlen(encoded),
+                                           item->content_length_framed);
+    free(encoded);
+    return written;
+}
+
 static bool frontend_parse_cancellation(const char *message, cbm_jsonrpc_request_t *request_out) {
     if (!message || !request_out) {
         return false;
@@ -510,11 +552,12 @@ static void *frontend_worker(void *opaque) {
                                                          FRONTEND_REQUEST_TIMEOUT_MS);
             if (status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
                 failed = !frontend_write_cancelled_response(state->out, &item);
+            } else if (status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+                /* These are valid application responses; keep the session alive.
+                 * Only TRANSPORT_ERROR below is terminal because the connection
+                 * is no longer safe for another request. */
+                failed = !frontend_write_application_error(state->out, &item, status);
             } else {
-                failed = status != CBM_DAEMON_RUNTIME_APPLICATION_OK;
-            }
-            if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK && !failed && response &&
-                response_length > 0) {
                 failed = !frontend_write_response(state->out, response, response_length,
                                                   item.content_length_framed);
             }

@@ -1962,7 +1962,6 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
      * thread slot. This is non-blocking unless the thread already published
      * terminal state. */
     (void)application_update_reap(application, false, 0);
-    bool db_exists = application_regular_db_exists(project);
     bool auto_index = application->config &&
                       cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_INDEX, false);
     int auto_index_limit =
@@ -1970,7 +1969,10 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                                                  CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT)
                             : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     int tracked_files = -1;
-    bool auto_index_candidate = auto_index && !db_exists;
+    /* Refresh on every eligible startup. A pre-existing DB can lag behind
+     * commits made while the daemon was down; relying on the watcher baseline
+     * would adopt the current HEAD and lose that delta. */
+    bool auto_index_candidate = auto_index;
     if (auto_index_candidate &&
         !application_session_workspace_allowed(session, "auto_index_discovery")) {
         auto_index_candidate = false;

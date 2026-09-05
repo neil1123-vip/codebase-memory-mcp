@@ -102,18 +102,6 @@ static const char *itoa_buf(int v) {
     return buf[idx];
 }
 
-/* ── Platform-portable mtime_ns ──────────────────────────────────── */
-
-static int64_t stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * CBM_NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 static const char *incr_mode_name(int mode) {
     switch (mode) {
     case CBM_MODE_FULL:
@@ -683,14 +671,15 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        cbm_path_info_t path_info;
+        if (cbm_path_info_utf8(files[i].path, &path_info) != 0 || !path_info.is_regular ||
+            path_info.is_symlink) {
             changed[i] = true;
             n_changed++;
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (path_info.mtime_ns != h->mtime_ns || path_info.size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {

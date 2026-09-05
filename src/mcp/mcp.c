@@ -2296,6 +2296,12 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
     srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    if (!srv->store && path[0] && cbm_file_exists(path) && recovery_status) {
+        /* A published DB can be briefly unavailable while its writer swaps
+         * generations. Keep this distinct from a genuinely missing project so
+         * query callers can retry without turning hard errors into sleeps. */
+        *recovery_status = STORE_RECOVERY_BUSY;
+    }
     if (srv->store) {
         /* Query-only resolve: classify a failed integrity check without any
          * mutation — no lease, no quarantine. A corrupt database is reported
@@ -2434,7 +2440,21 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
 
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* Query-only callers (every read tool): strictly non-mutating resolve. */
-    return resolve_store_internal(srv, project, false, false, NULL, false);
+    enum {
+        STORE_RESOLVE_ATTEMPTS = 3,
+        STORE_RESOLVE_RETRY_US = 50000,
+    };
+    store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
+    for (int attempt = 0; attempt < STORE_RESOLVE_ATTEMPTS; attempt++) {
+        cbm_store_t *store = resolve_store_internal(srv, project, false, false,
+                                                     &recovery_status, false);
+        if (store || recovery_status != STORE_RECOVERY_BUSY ||
+            attempt + 1 >= STORE_RESOLVE_ATTEMPTS) {
+            return store;
+        }
+        cbm_usleep(STORE_RESOLVE_RETRY_US);
+    }
+    return NULL;
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
@@ -6219,17 +6239,6 @@ static coverage_path_result_t coverage_normalize_rel(const char *input, bool all
     return written > 0U || allow_root ? COVERAGE_PATH_OK : COVERAGE_PATH_INVALID;
 }
 
-static int64_t coverage_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 static const char *coverage_path_freshness(cbm_store_t *store, const char *project,
                                            const char *root_path, const char *rel_path,
                                            bool *outside) {
@@ -6243,8 +6252,9 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
     if (n < 0 || (size_t)n >= sizeof(abs_path)) {
         return "unavailable";
     }
-    struct stat st;
-    if (stat(abs_path, &st) != 0) {
+    cbm_path_info_t path_info;
+    if (cbm_path_info_utf8(abs_path, &path_info) != 0 || !path_info.is_regular ||
+        path_info.is_symlink) {
         return "missing";
     }
     if (!cbm_path_within_root(root_path, abs_path)) {
@@ -6260,7 +6270,7 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
     if (rc != CBM_STORE_OK) {
         return "unavailable";
     }
-    bool matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    bool matches = hash.mtime_ns == path_info.mtime_ns && hash.size == path_info.size;
     cbm_store_clear_file_hash(&hash);
     return matches ? "metadata_match" : "metadata_changed";
 }
@@ -17307,7 +17317,8 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
     return status == CBM_DISCOVER_OK;
 }
 
-/* Start auto-indexing if configured and project not yet indexed. */
+/* Start auto-indexing if configured. Existing DBs are refreshed once at startup
+ * so commits made while the process was down cannot be missed by the watcher. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
@@ -17328,21 +17339,6 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Check if project already has a DB */
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        char db_check[CBM_SZ_1K];
-        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
-                 srv->session_project);
-        if (cbm_file_size(db_check) >= 0) {
-            /* Already indexed → register watcher for change detection */
-            cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
-                         srv->session_project);
-            register_watcher_if_enabled(srv);
-            return;
-        }
-    }
-
     /* Check auto_index config */
     bool auto_index = false;
     int file_limit = CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
@@ -17350,6 +17346,24 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, false);
         file_limit = cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                         CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT);
+    }
+
+    /* Existing DBs still get one startup refresh when auto_index is enabled. */
+    const char *home = cbm_get_home_dir();
+    if (home) {
+        char db_check[CBM_SZ_1K];
+        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
+                 srv->session_project);
+        if (cbm_file_size(db_check) >= 0) {
+            if (!auto_index) {
+                cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
+                             srv->session_project);
+                register_watcher_if_enabled(srv);
+                return;
+            }
+            cbm_log_info("autoindex.refresh", "reason", "startup", "project",
+                         srv->session_project);
+        }
     }
 
     if (!auto_index) {
