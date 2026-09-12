@@ -13,6 +13,7 @@
 #include "daemon/ipc_internal.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/subprocess.h"
@@ -920,6 +921,120 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     ASSERT_TRUE(acl_injected);
     ASSERT_TRUE(secured);
     ASSERT_TRUE(cache_created);
+    PASS();
+}
+
+/* Derive THIS machine's account-domain SID (S-1-5-21-a-b-c) from the current
+ * process token (S-1-5-21-a-b-c-<rid>), independently of production's LSA-based
+ * resolution. Caller frees with FreeSid. */
+static PSID ipc_test_local_account_domain_sid(void) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    PSID domain = NULL;
+    if (needed > 0) {
+        void *buffer = calloc(1, needed);
+        if (buffer && GetTokenInformation(token, TokenUser, buffer, needed, &needed)) {
+            PSID user = ((TOKEN_USER *)buffer)->User.Sid;
+            if (user && IsValidSid(user)) {
+                UCHAR count = *GetSidSubAuthorityCount(user);
+                SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(user);
+                /* Machine/domain account SID: NT authority (Value[5]==5), first
+                 * sub-authority 21, at least the three domain sub-authorities plus
+                 * the account RID. Drop the RID to recover the domain SID. */
+                if (count >= 4 && authority->Value[5] == 5 && *GetSidSubAuthority(user, 0) == 21U) {
+                    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+                    (void)AllocateAndInitializeSid(
+                        &nt, 4, *GetSidSubAuthority(user, 0), *GetSidSubAuthority(user, 1),
+                        *GetSidSubAuthority(user, 2), *GetSidSubAuthority(user, 3), 0, 0, 0, 0,
+                        &domain);
+                }
+            }
+        }
+        free(buffer);
+    }
+    (void)CloseHandle(token);
+    return domain;
+}
+
+/* Synthesize the RID-500 built-in Administrator SID for a given account-domain
+ * SID, exactly as production does. Caller frees with free(). */
+static PSID ipc_test_admin_sid_for_domain(PSID domain_sid) {
+    if (!domain_sid) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, NULL, &needed);
+    if (needed == 0) {
+        return NULL;
+    }
+    PSID admin = malloc(needed);
+    if (admin && CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, admin, &needed) &&
+        IsValidSid(admin)) {
+        return admin;
+    }
+    free(admin);
+    return NULL;
+}
+
+/* #1705: THIS machine's built-in Administrator ACCOUNT (RID-500 under the local
+ * account-domain SID) is a trusted directory owner/grantee, while a FOREIGN
+ * S-1-5-21-*-500 (a domain administrator, or another machine's built-in
+ * Administrator) must never be.
+ *
+ * RED without the fix: win_sid_trusted rejects the local RID-500 — on the VM this
+ * process runs as `test`, whose RID is not 500, so the -500 SID matches neither
+ * the current user nor SYSTEM, the Administrators GROUP, or TrustedInstaller — so
+ * local_ok is false. GREEN with the fix. foreign_ok is false either way, which is
+ * the exact cross-machine bypass this must never open. */
+TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
+    PSID local_domain = ipc_test_local_account_domain_sid();
+    PSID local_admin = ipc_test_admin_sid_for_domain(local_domain);
+
+    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+    PSID foreign_domain = NULL;
+    (void)AllocateAndInitializeSid(&nt, 4, 21U, 111U, 222U, 333U, 0, 0, 0, 0, &foreign_domain);
+    PSID foreign_admin = ipc_test_admin_sid_for_domain(foreign_domain);
+
+    PSID builtin_admins = NULL;
+    DWORD builtin_needed = 0;
+    (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
+    if (builtin_needed > 0) {
+        builtin_admins = malloc(builtin_needed);
+        if (builtin_admins &&
+            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
+            free(builtin_admins);
+            builtin_admins = NULL;
+        }
+    }
+
+    bool local_built = local_admin != NULL;
+    bool foreign_built = foreign_admin != NULL;
+    bool builtin_built = builtin_admins != NULL;
+
+    bool local_ok = local_built && cbm_daemon_ipc_win_sid_trusted_for_testing(local_admin);
+    bool foreign_ok = foreign_built && cbm_daemon_ipc_win_sid_trusted_for_testing(foreign_admin);
+    bool builtin_ok = builtin_built && cbm_daemon_ipc_win_sid_trusted_for_testing(builtin_admins);
+
+    free(local_admin);
+    free(foreign_admin);
+    free(builtin_admins);
+    if (local_domain) {
+        FreeSid(local_domain);
+    }
+    if (foreign_domain) {
+        FreeSid(foreign_domain);
+    }
+
+    ASSERT_TRUE(local_built);
+    ASSERT_TRUE(foreign_built);
+    ASSERT_TRUE(builtin_built);
+    ASSERT_TRUE(builtin_ok);  /* the seam works: an already-trusted SID passes */
+    ASSERT_TRUE(local_ok);    /* #1705 fix: THIS machine's RID-500 is trusted */
+    ASSERT_FALSE(foreign_ok); /* safety: a foreign -500 is NEVER trusted */
     PASS();
 }
 
@@ -5073,6 +5188,83 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 #endif /* CBM_ENABLE_TEST_SEAMS */
 #endif /* !_WIN32 */
 
+#ifndef _WIN32
+enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
+static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
+static size_t ipc_test_log_capture_used;
+
+static void ipc_test_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t length = strlen(line);
+    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
+        return;
+    }
+    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
+    ipc_test_log_capture_used += length;
+    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
+    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
+}
+
+/* #1828: a full /tmp made every daemon start die at pending publication, and
+ * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
+ * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
+ * `df` on the wrong mount) to find the cause. The failure line must name the
+ * errno and the exact artifact path that could not be written. */
+TEST(daemon_ipc_listen_failure_names_errno_and_path) {
+    static const char key[] = "1828000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char pending_path[TEST_PATH_CAP] = {0};
+    char expected_path[TEST_PATH_CAP + 16] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "enospc-diag");
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+    }
+    bool paths_ok = endpoint && ipc_test_socket_pending_path(pending_path, socket_path) &&
+                    snprintf(expected_path, sizeof(expected_path), "path=%s.tmp", pending_path) > 0;
+    if (paths_ok) {
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        listener = cbm_daemon_ipc_listen(endpoint);
+        cbm_log_set_sink(NULL);
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    }
+    const char *failed = strstr(ipc_test_log_capture, "msg=daemon.ipc.listen_failed");
+    bool stage_named = failed && strstr(failed, "stage=pending_publication") != NULL;
+    bool errno_named = failed && strstr(failed, "errno=ENOSPC") != NULL;
+    bool path_named = failed && strstr(failed, expected_path) != NULL;
+    struct stat leftover;
+    bool namespace_clean = paths_ok && lstat(socket_path, &leftover) != 0 && errno == ENOENT &&
+                           lstat(pending_path, &leftover) != 0 && errno == ENOENT;
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(listener == NULL);
+    ASSERT_TRUE(failed != NULL);
+    ASSERT_TRUE(stage_named);
+    ASSERT_TRUE(errno_named);
+    ASSERT_TRUE(path_named);
+    ASSERT_TRUE(namespace_clean);
+    PASS();
+}
+#endif
+
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
     RUN_TEST(daemon_ipc_pending_wait_failure_cancels_and_drains);
@@ -5085,6 +5277,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
+    RUN_TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);
@@ -5145,5 +5338,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
+#ifndef _WIN32
+    RUN_TEST(daemon_ipc_listen_failure_names_errno_and_path);
+#endif
 #endif
 }
