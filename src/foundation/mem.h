@@ -119,9 +119,11 @@ void cbm_mem_collect(void);
 size_t cbm_mem_footprint(void);
 
 /* Hand freed memory back to the OS on every allocator this process uses:
- * mimalloc (mi_collect), the macOS system zones (malloc_zone_pressure_relief)
- * and glibc (malloc_trim). Costs a few ms; call at phase boundaries after a
- * bulk release, never per allocation. */
+ * mimalloc (mi_collect) and, on macOS, the system zones
+ * (malloc_zone_pressure_relief). Never glibc's malloc_trim: on Linux mimalloc
+ * owns malloc, and the reference alone breaks the static release link. Costs
+ * a few ms; call at phase boundaries after a bulk release, never per
+ * allocation. */
 void cbm_mem_release_to_os(void);
 
 /* ── Memory map: where does the process's memory actually live? ──────
