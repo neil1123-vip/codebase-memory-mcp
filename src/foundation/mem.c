@@ -35,9 +35,6 @@
 #include <malloc/malloc.h> /* malloc_zone_pressure_relief */
 #else
 #include <unistd.h>
-#if defined(__GLIBC__)
-#include <malloc.h> /* malloc_trim */
-#endif
 #endif
 
 /* Does THIS build ask mimalloc to replace ordinary malloc process-wide?
@@ -606,11 +603,15 @@ size_t cbm_mem_footprint(void) {
 }
 
 void cbm_mem_release_to_os(void) {
+    /* mi_collect is the release: on Linux and Windows mimalloc owns malloc, so
+     * there is no libc heap to trim. glibc's malloc_trim was called here once
+     * and cost the static Linux release its link: the reference pulls
+     * libc.a(malloc.o) in beside mimalloc's malloc/free (multiple definition,
+     * release run 34948714902, 2026-09-15). macOS keeps the system heap for
+     * everything outside the core, hence the pressure-relief call there. */
     mi_collect(true);
 #if defined(__APPLE__)
     (void)malloc_zone_pressure_relief(NULL, 0);
-#elif defined(__GLIBC__)
-    (void)malloc_trim(0);
 #endif
 }
 
