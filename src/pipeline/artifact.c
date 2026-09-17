@@ -12,7 +12,6 @@ enum {
     ART_ZSTD_BEST = 9,
     ART_RATIO_SCALE = 10,        /* multiply ratio by 10 for integer logging */
     ART_NUL = 1,                 /* NUL terminator byte */
-    ART_NS_PER_SEC = 1000000000, /* nanoseconds per second (mtime_ns helper) */
     ART_OID_SHA1_LEN = 40,       /* hex length of a SHA-1 git object id */
     ART_OID_SHA256_LEN = 64,     /* hex length of a SHA-256 git object id */
 };
@@ -319,65 +318,6 @@ static bool is_hex_oid(const char *s) {
     return true;
 }
 
-/* Portable mtime in nanoseconds. MUST stay bit-identical to
- * pipeline_incremental.c's stat_mtime_ns: that is the function the incremental
- * classifier compares a restamped row against, and a differing encoding would
- * make every restamped row look changed. */
-static int64_t art_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * ART_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * ART_NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * ART_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
-/* Stat a path, refusing symlinks. Returns 0 on success, CBM_NOT_FOUND to skip.
- * Mirrors discover.c's safe_stat / pass_pkgmap.c's pkgmap_safe_stat.
- *
- * Symlinks are refused rather than followed because git tracks a symlink's
- * LINK TEXT, not its target's content: "unchanged" from git means the link
- * still points at the same name, which says nothing about the bytes the
- * indexer would actually parse. Following it would stamp the target's mtime
- * into the row and let a changed target read as unchanged. Discovery already
- * skips symlinks (discover.c safe_stat), so in practice no such row exists —
- * this keeps the invariant true even if that ever changes.
- *
- * On Windows the wide stat also keeps non-ASCII repo paths off the ANSI CRT
- * (the cbm_fopen rule applied to stat). */
-static int reconcile_stat_no_symlink(const char *abs_path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_path_to_wide(abs_path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
-    }
-    DWORD attr = GetFileAttributesW(wpath);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        free(wpath);
-        return CBM_NOT_FOUND; /* junction / symlink — same escape hatch */
-    }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
-#else
-    if (lstat(abs_path, st) != 0) {
-        return CBM_NOT_FOUND;
-    }
-    if (S_ISLNK(st->st_mode)) {
-        return CBM_NOT_FOUND;
-    }
-    return 0;
-#endif
-}
-
 /* Build `git -C "<repo>" <args> 2><null>` with a shell-validated repo path.
  * repo_path is the only untrusted component; args is a trusted literal or a
  * hex-validated commit string (never arbitrary data). Returns false on
@@ -544,9 +484,8 @@ static bool reconcile_is_synthetic_row(const char *rel_path) {
  * like: same function on both sides, no encoding to keep in sync.
  *
  * cbm_path_info_utf8 reports symlinks/reparse points rather than following
- * them, so the is_symlink/is_regular guard below preserves exactly the
- * refusal reconcile_stat_no_symlink provides (git tracks a symlink's link
- * text, not its target's bytes). */
+ * them, so the is_symlink/is_regular guard below preserves the refusal of
+ * symlinks (git tracks a symlink's link text, not its target's bytes). */
 static bool db_hashes_match_disk(const char *repo_path, const char *db_path, const char *project,
                                  char *detail, size_t detail_sz) {
     snprintf(detail, detail_sz, "store_unreadable");
@@ -1396,7 +1335,7 @@ static bool reconcile_sets_build(const char *repo_path, const char *commit,
 }
 
 /* Restamp every row that is tracked at the artifact commit and not in the
- * changed set, with local stat() values. Returns the number of rows restamped,
+ * changed set, with local path metadata. Returns the number of rows restamped,
  * or CBM_NOT_FOUND if the store could not be read/written. */
 static int reconcile_restamp_rows(const char *repo_path, const char *cache_db_path,
                                   const char *project_name, const reconcile_sets_t *sets,
@@ -1440,8 +1379,9 @@ static int reconcile_restamp_rows(const char *repo_path, const char *cache_db_pa
             skipped++;
             continue;
         }
-        struct stat st;
-        if (reconcile_stat_no_symlink(abs, &st) != 0) {
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(abs, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+            info.is_symlink) {
             skipped++;
             continue; /* missing locally → find_deleted_files purges the row */
         }
@@ -1451,17 +1391,11 @@ static int reconcile_restamp_rows(const char *repo_path, const char *cache_db_pa
         batch[batch_n].project = project_name;
         batch[batch_n].rel_path = stored[i].rel_path;
         batch[batch_n].sha256 = stored[i].sha256;
-        /* art_stat_mtime_ns, NOT cbm_path_info_utf8 (which db_hashes_match_disk
-         * uses): the two disagree on Windows and each side must match ITS OWN
-         * consumer. A restamped row exists to be read by the incremental
-         * classifier (pipeline_incremental.c classify_files) and by
-         * check_index_coverage (mcp.c coverage_path_freshness) — both stat()
-         * the file and encode whole seconds on Windows. Stamping a 100-ns
-         * FILETIME value here would make every restamped row read as changed
-         * there and reconcile would buy nothing. Do not unify these two call
-         * sites without changing those consumers first. */
-        batch[batch_n].mtime_ns = art_stat_mtime_ns(&st);
-        batch[batch_n].size = (int64_t)st.st_size;
+        /* Keep the producer and every consumer on cbm_path_info_utf8. On
+         * Windows this preserves the FILETIME precision used by incremental
+         * classification and check_index_coverage. */
+        batch[batch_n].mtime_ns = info.mtime_ns;
+        batch[batch_n].size = info.size;
         batch_n++;
     }
 

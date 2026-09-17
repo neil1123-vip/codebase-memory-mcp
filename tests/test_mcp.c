@@ -5726,20 +5726,11 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     ASSERT_NOT_NULL(store);
     char source_path[512];
     snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
-    struct stat source_stat;
-    ASSERT_EQ(stat(source_path, &source_stat), 0);
-#ifdef __APPLE__
-    int64_t source_mtime_ns =
-        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-        (int64_t)source_stat.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-                              (int64_t)source_stat.st_mtim.tv_nsec;
-#endif
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
-                                         source_stat.st_size),
+    cbm_path_info_t source_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &source_info), CBM_PATH_INFO_OK);
+    ASSERT_TRUE(source_info.is_regular && !source_info.is_symlink);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_info.mtime_ns,
+                                         source_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
     ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
