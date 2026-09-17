@@ -641,21 +641,15 @@ static void git_init(const char *repo) {
     runf("git -C \"%s\" config commit.gpgsign false", repo);
 }
 
-/* Portable local mtime_ns for assertions (mirrors artifact.c's art_stat_mtime_ns
- * and pipeline_incremental.c's stat_mtime_ns — all three must agree or a
- * restamped row would never match the incremental classifier). */
+/* Use the same UTF-8 metadata helper as artifact reconciliation and the
+ * incremental classifier so assertions use the platform's full precision. */
 static int64_t t_mtime_ns(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+        info.is_symlink) {
         return -1;
     }
-#ifdef __APPLE__
-    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + (int64_t)st.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st.st_mtime * 1000000000LL;
-#else
-    return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
-#endif
+    return info.mtime_ns;
 }
 
 /* True iff <repo>/.codebase-memory/artifact.json contains substr. */
@@ -682,12 +676,7 @@ static int64_t row_mtime(cbm_file_hash_t *rows, int n, const char *rel) {
     return -1;
 }
 
-/* Overwrite one file_hashes row's mtime with a caller-chosen sentinel.
- * Tests assert against this sentinel rather than against "a different
- * wall-clock time": on Windows mtime_ns has ONE-SECOND resolution, so two
- * writes in the same second are indistinguishable and an inequality
- * assertion would be a coin flip (O9 — a verdict must not depend on
- * filesystem timestamp granularity). */
+/* Overwrite one file_hashes row's mtime with a caller-chosen sentinel. */
 static bool stamp_row_mtime(const char *db, const char *proj, const char *rel, int64_t sentinel,
                             const char *sha) {
     cbm_store_t *s = cbm_store_open_path(db);

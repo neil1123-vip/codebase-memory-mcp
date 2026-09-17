@@ -5907,7 +5907,8 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
      * nanoseconds, so a stat-written fixture would never compare equal and the
      * metadata_match contract below would fail. */
     cbm_path_info_t path_info;
-    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), CBM_PATH_INFO_OK);
+    ASSERT_TRUE(path_info.is_regular && !path_info.is_symlink);
     ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
                                          path_info.size),
               CBM_STORE_OK);
