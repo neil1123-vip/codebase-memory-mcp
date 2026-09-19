@@ -1,11 +1,13 @@
 /*
  * watcher.h — File change watcher for auto-reindexing.
  *
- * Polls indexed projects for git changes (HEAD movement or dirty working tree)
- * and triggers re-indexing via a callback. Uses adaptive polling intervals
- * based on project size (5s base + 1s per 500 files, capped at 60s).
+ * Polls indexed projects for git changes (HEAD movement or dirty working tree).
+ * Non-git roots discover child repositories and coalesce their changes into
+ * one refresh of the enclosing project. Files outside Git are not monitored.
+ * Uses adaptive polling intervals based on project size
+ * (5s base + 1s per 500 files, capped at 60s).
  *
- * Depends on: foundation, store (for project metadata)
+ * Depends on: foundation, store (for project metadata), discover
  */
 #ifndef CBM_WATCHER_H
 #define CBM_WATCHER_H
@@ -28,7 +30,8 @@ typedef struct cbm_watcher cbm_watcher_t;
  * commits the watcher's change baselines — a skipped or failed reindex keeps
  * the change pending so it is retried, never silently lost (#937).
  * project_name: project identifier
- * root_path: absolute path to the repository root */
+ * root_path: absolute path to the indexed project root (possibly a container
+ * of multiple Git repositories) */
 typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
 
 /* Optional daemon coordination for destructive stale-root pruning. begin is
@@ -70,7 +73,7 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
  * current poll snapshot is invalidated before this function returns. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
-/* Refresh a project's timestamp (resets adaptive backoff). */
+/* Reset adaptive backoff and request child repository discovery on next poll. */
 void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
 
 /* ── Polling ────────────────────────────────────────────────────── */
