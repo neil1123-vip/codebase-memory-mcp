@@ -170,6 +170,17 @@ cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
                                                  const cbm_discover_opts_t *opts, int max_files,
                                                  uint64_t deadline_ms, int *count_out);
 
+/* Discover Git roots using the directory filters above. A .git directory or
+ * regular file marks a root; its contents are not traversed or validated.
+ * Returns at most 1024 absolute paths, freed with cbm_discover_free_excluded().
+ * deadline_ms is an absolute cbm_now_ms() deadline (zero disables it).
+ * Cancellation, deadline, or incomplete traversal returns ERROR; exceeding
+ * the root cap returns LIMIT_EXCEEDED. Every non-OK result leaves NULL / 0
+ * outputs, so a partial scan cannot replace the caller's previous root set. */
+cbm_discover_status_t cbm_discover_git_roots(const char *root, const cbm_discover_opts_t *opts,
+                                             uint64_t deadline_ms, bool (*cancelled)(void *),
+                                             void *context, char ***roots_out, int *count_out);
+
 /* Like cbm_discover(), but also reports the directory subtrees that were
  * skipped during the walk (hardcoded ALWAYS_SKIP/FAST_SKIP dirs + gitignore
  * matches), so callers can surface which subtrees were dropped (#411).

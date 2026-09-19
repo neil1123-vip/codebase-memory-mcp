@@ -19,6 +19,7 @@
 #include "foundation/win_utf8.h"
 #endif
 #include <ctype.h>
+#include <errno.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -415,12 +416,16 @@ typedef struct {
     int max_files;
     uint64_t deadline_ms;
     bool count_only;
+    bool git_roots_only;
+    bool (*cancelled)(void *);
+    void *cancel_context;
     bool collect_excluded;
     bool limit_exceeded;
     bool failed;
-    /* Directories skipped during the walk (rel paths), so callers can surface
-     * which subtrees were dropped (#411). strdup'd; freed by the caller via
-     * cbm_discover_free_excluded or internally when not requested. */
+    /* In git_roots_only mode this stores absolute Git roots instead.
+     * Otherwise these are skipped directories (relative paths), so callers can
+     * surface which subtrees were dropped (#411). strdup'd; freed by the caller
+     * via cbm_discover_free_excluded or internally when not requested. */
     char **excluded;
     int excluded_count;
     int excluded_cap;
@@ -440,6 +445,9 @@ static bool file_list_should_stop(file_list_t *fl) {
         return true;
     }
     if (!fl->failed && fl->deadline_ms != 0 && cbm_now_ms() >= fl->deadline_ms) {
+        fl->failed = true;
+    }
+    if (!fl->failed && fl->cancelled && fl->cancelled(fl->cancel_context)) {
         fl->failed = true;
     }
     return fl->failed || fl->limit_exceeded;
@@ -831,6 +839,72 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
 #endif
 }
 
+/* Root-set discovery must not silently drop unreadable ignore rules. Keep
+ * these control-file reads bounded; source files are never opened in this mode.
+ * ponytail: 1 MiB ignore-file cap; stream parsing if larger rules are needed. */
+static cbm_gitignore_t *git_roots_load_ignore(const char *path, file_list_t *out) {
+    struct stat st;
+    bool is_symlink = false;
+    errno = 0;
+    if (safe_stat(path, &st, &is_symlink) != 0) {
+        if (is_symlink || errno != ENOENT) {
+            out->failed = true;
+        }
+        return NULL;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 1024 * 1024 ||
+        file_list_should_stop(out)) {
+        out->failed = true;
+        return NULL;
+    }
+    FILE *file = cbm_fopen(path, "rb");
+    char *content = file ? malloc((size_t)st.st_size + 1) : NULL;
+    cbm_gitignore_t *ignore = NULL;
+    if (content) {
+        size_t size = fread(content, 1, (size_t)st.st_size + 1, file);
+        if (size == (size_t)st.st_size && !ferror(file) && !file_list_should_stop(out)) {
+            content[size] = '\0';
+            ignore = cbm_gitignore_parse(content);
+        }
+    }
+    free(content);
+    if (file) {
+        (void)fclose(file);
+    }
+    if (!ignore) {
+        out->failed = true;
+    }
+    return ignore;
+}
+
+/* Return true when this frame is a root, so the walker stops at its boundary. */
+static bool walk_git_root(const char *directory, file_list_t *out) {
+    char marker[CBM_SZ_4K];
+    int length = snprintf(marker, sizeof(marker), "%s/.git", directory);
+    if (length <= 0 || (size_t)length >= sizeof(marker)) {
+        out->failed = true;
+        return false;
+    }
+    struct stat st;
+    bool is_symlink = false;
+    errno = 0;
+    if (safe_stat(marker, &st, &is_symlink) != 0) {
+        if (!is_symlink && errno != ENOENT) {
+            out->failed = true;
+        }
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (out->excluded_count >= 1024) {
+        out->limit_exceeded = true;
+    } else {
+        file_list_add_excluded(out, directory);
+    }
+    return true;
+}
+
 /* Process a single regular file entry during directory walk. */
 static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
                                   const cbm_discover_opts_t *opts,
@@ -878,12 +952,19 @@ typedef struct {
  * (an EMPTY storage/.gitignore hid storage/dump/.gitignore's "*", so thousands
  * of git-ignored dumps were discovered and indexed until the OOM killer hit).
  * The root's own .gitignore is loaded by cbm_discover (merged with info/exclude). */
-static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
+static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame, file_list_t *out) {
     if (frame->prefix[0] == '\0') {
         return NULL;
     }
     char gi_path[CBM_SZ_4K];
-    snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", frame->dir);
+    int length = snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", frame->dir);
+    if (out->git_roots_only) {
+        if (length <= 0 || (size_t)length >= sizeof(gi_path)) {
+            out->failed = true;
+            return NULL;
+        }
+        return git_roots_load_ignore(gi_path, out);
+    }
     struct stat gi_st;
     if (wide_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
         return cbm_gitignore_load(gi_path);
@@ -941,7 +1022,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     struct stat st;
     bool is_symlink = false;
     if (safe_stat(abs_path, &st, &is_symlink) != 0) {
-        if (out->count_only) {
+        if (out->count_only || (out->git_roots_only && !is_symlink)) {
             out->failed = true;
         } else if (is_symlink) {
             /* Deliberately not indexed (#963): record so callers can
@@ -957,11 +1038,11 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
             !should_skip_directory(entry->name, rel_path, opts, frame->ignore_chain, global_gi,
                                    cbmignore)) {
             walk_push_subdir(ws, abs_path, rel_path, frame, out);
-        } else {
+        } else if (!out->git_roots_only) {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
         }
-    } else if (S_ISREG(st.st_mode)) {
+    } else if (!out->git_roots_only && S_ISREG(st.st_mode)) {
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, frame->ignore_chain, global_gi,
                               cbmignore, st.st_size, out);
     }
@@ -1025,7 +1106,13 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
     while (ws.top > 0 && !file_list_should_stop(out)) {
         walk_frame_t frame = ws.frames[--ws.top];
 
-        cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame);
+        if (out->git_roots_only && walk_git_root(frame.dir, out)) {
+            continue;
+        }
+        if (file_list_should_stop(out)) {
+            break;
+        }
+        cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame, out);
         if (loaded) {
             if (!walk_owned_gitignore_append(&owned_gis, &owned_count, &owned_capacity, loaded)) {
                 cbm_gitignore_free(loaded);
@@ -1044,14 +1131,29 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 
         cbm_dir_t *d = cbm_opendir(frame.dir);
         if (!d) {
-            if (out->count_only) {
+            if (out->count_only || out->git_roots_only) {
                 out->failed = true;
             }
             continue;
         }
 
         cbm_dirent_t *entry;
-        while (!file_list_should_stop(out) && (entry = cbm_readdir(d)) != NULL) {
+        while (!file_list_should_stop(out)) {
+            errno = 0;
+#ifdef _WIN32
+            SetLastError(ERROR_SUCCESS);
+#endif
+            entry = cbm_readdir(d);
+            if (!entry) {
+                if (out->git_roots_only) {
+#ifdef _WIN32
+                    out->failed = GetLastError() != ERROR_NO_MORE_FILES;
+#else
+                    out->failed = errno != 0;
+#endif
+                }
+                break;
+            }
             walk_dir_process_entry(entry, &frame, opts, global_gi, cbmignore, &ws, out);
         }
         cbm_closedir(d);
@@ -1355,6 +1457,57 @@ cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
     cbm_discover_free(files, count);
     *count_out = status == CBM_DISCOVER_ERROR ? -1 : count;
     return status;
+}
+
+cbm_discover_status_t cbm_discover_git_roots(const char *root, const cbm_discover_opts_t *opts,
+                                             uint64_t deadline_ms, bool (*cancelled)(void *),
+                                             void *context, char ***roots_out, int *count_out) {
+    if (roots_out) {
+        *roots_out = NULL;
+    }
+    if (count_out) {
+        *count_out = 0;
+    }
+    if (!root || !roots_out || !count_out) {
+        return CBM_DISCOVER_ERROR;
+    }
+    file_list_t fl = {.max_files = -1,
+                      .deadline_ms = deadline_ms,
+                      .git_roots_only = true,
+                      .cancelled = cancelled,
+                      .cancel_context = context,
+                      .collect_excluded = true};
+    char absolute[CBM_SZ_4K];
+    struct stat st;
+    bool is_symlink = false;
+    if (file_list_should_stop(&fl) || safe_stat(root, &st, &is_symlink) != 0 ||
+        !S_ISDIR(st.st_mode) || !cbm_canonical_path(root, absolute, sizeof(absolute))) {
+        return CBM_DISCOVER_ERROR;
+    }
+    cbm_normalize_path_sep(absolute);
+    char path[CBM_SZ_4K];
+    int length = snprintf(path, sizeof(path), "%s/.gitignore", absolute);
+    if (length <= 0 || (size_t)length >= sizeof(path)) {
+        return CBM_DISCOVER_ERROR;
+    }
+    cbm_gitignore_t *gitignore = git_roots_load_ignore(path, &fl);
+    length = snprintf(path, sizeof(path), "%s/.cbmignore", absolute);
+    if (length <= 0 || (size_t)length >= sizeof(path)) {
+        fl.failed = true;
+    }
+    cbm_gitignore_t *cbmignore =
+        git_roots_load_ignore(opts && opts->ignore_file ? opts->ignore_file : path, &fl);
+    walk_cache_dir_snapshot();
+    walk_dir(absolute, "", opts, gitignore, NULL, cbmignore, &fl);
+    cbm_gitignore_free(gitignore);
+    cbm_gitignore_free(cbmignore);
+    if (file_list_should_stop(&fl)) {
+        cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
+        return fl.failed ? CBM_DISCOVER_ERROR : CBM_DISCOVER_LIMIT_EXCEEDED;
+    }
+    *roots_out = fl.excluded;
+    *count_out = fl.excluded_count;
+    return CBM_DISCOVER_OK;
 }
 
 void cbm_discover_free(cbm_file_info_t *files, int count) {

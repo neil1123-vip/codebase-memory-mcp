@@ -15,6 +15,7 @@
 #include <pipeline/artifact.h>
 #include <store/store.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <signal.h>
 #include <string.h>
@@ -35,8 +36,13 @@
 static int wt_git(const char *dir, const char *args) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
+#ifdef _WIN32
+             "\"\"C:/Program Files/Git/cmd/git.exe\" -C \"%s\" -c user.name=t -c user.email=t@t.io "
+             "-c init.defaultBranch=master -c commit.gpgsign=false %s\"",
+#else
              "git -C \"%s\" -c user.name=t -c user.email=t@t.io "
              "-c init.defaultBranch=master -c commit.gpgsign=false %s",
+#endif
              dir, args);
     return system(cmd);
 }
@@ -72,6 +78,8 @@ TEST(poll_interval_cap) {
     /* 100K files → capped at 60s */
     int ms = cbm_watcher_poll_interval_ms(100000);
     ASSERT_EQ(ms, 60000);
+    /* Aggregated child-repository counts must cap before narrowing to int. */
+    ASSERT_EQ(cbm_watcher_poll_interval_ms(INT_MAX), 60000);
     PASS();
 }
 
@@ -1935,8 +1943,8 @@ TEST(watcher_multiple_projects) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(watcher_non_git_skips) {
-    /* Non-git dir → baseline sets is_git=false → poll never reindexes.
-     * Port of TestProbeStrategyNonGit behavior. */
+    /* Without a Git repository at or below the root, ordinary file changes
+     * never trigger automatic indexing. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nongit_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -1983,6 +1991,259 @@ TEST(watcher_non_git_skips) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+static int wt_init_nested_repo(const char *path) {
+    char file[600];
+    if (!cbm_mkdir_p(path, 0755) || wt_git(path, "init -q") != 0 ||
+        th_write_file(wt_path(file, sizeof(file), path, "file.c"), "int value = 1;\n") != 0 ||
+        th_write_file(wt_path(file, sizeof(file), path, ".gitignore"), "*.ignored\n") != 0 ||
+        wt_git(path, "add -A") != 0) {
+        return -1;
+    }
+    return wt_git(path, "commit -q -m init");
+}
+
+typedef struct {
+    const char *root;
+    const char *edit_path;
+    int calls;
+    int result;
+    bool wrong_target;
+} nested_index_ctx_t;
+
+static int nested_index_callback(const char *name, const char *path, void *ud) {
+    nested_index_ctx_t *ctx = ud;
+    ctx->calls++;
+    ctx->wrong_target |= strcmp(name, "nested-project") != 0 || strcmp(path, ctx->root) != 0;
+    if (ctx->edit_path) {
+        int rc = th_append_file(ctx->edit_path, "int edited_during_index;\n");
+        ctx->edit_path = NULL;
+        if (rc != 0) {
+            return -1;
+        }
+    }
+    return ctx->result;
+}
+
+TEST(watcher_nested_repos_share_outer_project) {
+    char root[256] = "/tmp/cbm_watcher_nested_repos_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char first[400], second[400], ignored[400], file[600];
+    wt_path(first, sizeof(first), root, "first");
+    wt_path(second, sizeof(second), root, "deep/second repo");
+    wt_path(ignored, sizeof(ignored), root, "node_modules/ignored-repo");
+    ASSERT_EQ(wt_init_nested_repo(first), 0);
+    ASSERT_EQ(wt_init_nested_repo(second), 0);
+    ASSERT_EQ(wt_init_nested_repo(ignored), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_index_ctx_t ctx = {.root = root};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_index_callback, &ctx);
+    ASSERT_TRUE(cbm_watcher_watch(w, "nested-project", root));
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1); /* Refresh a potentially stale outer index once. */
+    ASSERT_EQ(ctx.calls, 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    /* Discovery must not turn files outside Git or ignored paths into triggers. */
+    ASSERT_EQ(th_write_file(wt_path(file, sizeof(file), root, "outside.c"), "int outside;\n"), 0);
+    ASSERT_EQ(th_write_file(wt_path(file, sizeof(file), first, "cache.ignored"), "ignored\n"), 0);
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), ignored, "file.c"), "int ignored;\n"), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 1);
+
+    /* A commit in one repo and dirty state in another coalesce into one callback. */
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), first, "file.c"), "int committed;\n"), 0);
+    ASSERT_EQ(wt_git(first, "add file.c"), 0);
+    ASSERT_EQ(wt_git(first, "commit -q -m update"), 0);
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), second, "file.c"), "int dirty;\n"), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 2);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 2);
+
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), second, "file.c"), "int dirty_again;\n"),
+              0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 3);
+
+    ASSERT_EQ(th_write_file(wt_path(file, sizeof(file), first, "new.c"), "int untracked;\n"), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 4);
+
+    ASSERT_EQ(cbm_unlink(wt_path(file, sizeof(file), second, "file.c")), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 5);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 5);
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
+TEST(watcher_nested_repo_membership_and_worktree) {
+    char root[256] = "/tmp/cbm_watcher_nested_set_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char repo[400], worktree[400], file[600], args[600];
+    wt_path(repo, sizeof(repo), root, "repo");
+    wt_path(worktree, sizeof(worktree), root, "linked");
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_index_ctx_t ctx = {.root = root};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_index_callback, &ctx);
+    ASSERT_TRUE(cbm_watcher_watch(w, "nested-project", root));
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+
+    /* Adding a clean repository changes the indexed scope even without dirt. */
+    ASSERT_EQ(wt_init_nested_repo(repo), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 1);
+    snprintf(args, sizeof(args), "worktree add -q -b nested-linked \"%s\"", worktree);
+    ASSERT_EQ(wt_git(repo, args), 0);
+    ASSERT_TRUE(cbm_file_exists(wt_path(file, sizeof(file), worktree, ".git")));
+    ASSERT_FALSE(cbm_is_dir(file)); /* Linked worktrees have a .git file. */
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 2);
+
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), worktree, "file.c"), "int linked_edit;\n"),
+              0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 3);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+
+    snprintf(args, sizeof(args), "worktree remove --force \"%s\"", worktree);
+    ASSERT_EQ(wt_git(repo, args), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 4);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1); /* Removal of the last child is still a change. */
+    ASSERT_EQ(ctx.calls, 5);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 5);
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
+TEST(watcher_nested_retries_and_preserves_callback_edits) {
+    char root[256] = "/tmp/cbm_watcher_nested_retry_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char repo[400], file[600];
+    wt_path(repo, sizeof(repo), root, "repo");
+    ASSERT_EQ(wt_init_nested_repo(repo), 0);
+    wt_path(file, sizeof(file), repo, "file.c");
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_index_ctx_t ctx = {.root = root};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_index_callback, &ctx);
+    ASSERT_TRUE(cbm_watcher_watch(w, "nested-project", root));
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 1);
+
+    ASSERT_EQ(th_append_file(file, "int before_index;\n"), 0);
+    ctx.result = -1;
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 2);
+    ctx.result = 1; /* Busy has the same retry requirement as failure. */
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 3);
+    ctx.result = 0;
+    ctx.edit_path = file;
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 4);
+
+    /* Success commits only the observed snapshot, not edits made by the callback. */
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 5);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 5);
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
+TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes) {
+    char root[256] = "/tmp/cbm_watcher_nested_broken_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char empty[400], sibling[400], file[600];
+    wt_path(empty, sizeof(empty), root, "empty");
+    wt_path(sibling, sizeof(sibling), root, "sibling");
+    ASSERT_TRUE(cbm_mkdir_p(empty, 0755));
+    ASSERT_EQ(wt_git(empty, "init -q"), 0);
+    ASSERT_EQ(th_write_file(wt_path(file, sizeof(file), root, "broken/.git"), "invalid\n"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_index_ctx_t ctx = {.root = root};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_index_callback, &ctx);
+    ASSERT_TRUE(cbm_watcher_watch(w, "nested-project", root));
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 1);
+
+    /* The first commit is a HEAD change even though the previous HEAD was empty. */
+    ASSERT_EQ(th_write_file(wt_path(file, sizeof(file), empty, "file.c"), "int first;\n"), 0);
+    ASSERT_EQ(wt_git(empty, "add file.c"), 0);
+    ASSERT_EQ(wt_git(empty, "commit -q -m first"), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 2);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+
+    ASSERT_EQ(wt_init_nested_repo(sibling), 0);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 3);
+
+    /* A known repository becoming invalid must not freeze its healthy sibling. */
+    ASSERT_EQ(th_rmtree(wt_path(file, sizeof(file), empty, ".git")), 0);
+    ASSERT_EQ(th_write_file(file, "invalid\n"), 0);
+    wt_path(file, sizeof(file), sibling, "file.c");
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(th_append_file(file, "int sibling_changed;\n"), 0);
+        cbm_watcher_touch(w, "nested-project");
+        ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+        ASSERT_EQ(ctx.calls, 4 + i);
+    }
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
     PASS();
 }
 
@@ -3311,6 +3572,10 @@ SUITE(watcher) {
 
     /* Non-git project */
     RUN_TEST(watcher_non_git_skips);
+    RUN_TEST(watcher_nested_repos_share_outer_project);
+    RUN_TEST(watcher_nested_repo_membership_and_worktree);
+    RUN_TEST(watcher_nested_retries_and_preserves_callback_edits);
+    RUN_TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes);
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);

@@ -434,6 +434,133 @@ TEST(discover_bounded_count_fails_closed_after_deadline) {
     PASS();
 }
 
+TEST(discover_git_roots_reuses_filters_and_stops_at_repositories) {
+    char *base = th_mktempdir("cbm_git_roots");
+    ASSERT(base != NULL);
+    th_mkdir_p(TH_PATH(base, "one/.git"));
+    th_mkdir_p(TH_PATH(base, "one/nested/.git"));
+    th_write_file(TH_PATH(base, "group/two/.git"), "gitdir: elsewhere\n");
+    th_write_file(TH_PATH(base, ".gitignore"), "root_ignored/\n");
+    th_write_file(TH_PATH(base, "group/.gitignore"), "ignored/\n");
+    th_write_file(TH_PATH(base, "group/deep/.gitignore"), "blocked/\n");
+    th_write_file(TH_PATH(base, ".cbmignore"), "private/\n!vendor/\n");
+    const char *excluded[] = {"root_ignored", "group/ignored", "group/deep/blocked", "private",
+                              "node_modules", ".worktrees",    ".codebase-memory"};
+    for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++) {
+        char rel[128];
+        snprintf(rel, sizeof(rel), "%s/repo/.git", excluded[i]);
+        th_mkdir_p(TH_PATH(base, rel));
+    }
+    th_mkdir_p(TH_PATH(base, "vendor/.git"));
+    th_write_file(TH_PATH(base, "loose/source.c"), "int unrelated;\n");
+#ifndef _WIN32
+    char link[512];
+    snprintf(link, sizeof(link), "%s/link", base);
+    ASSERT_EQ(symlink(TH_PATH(base, "one"), link), 0);
+#endif
+
+    char **roots = NULL;
+    int count = -1;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_discover_git_roots(base, &opts, cbm_now_ms() + 5000, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 3);
+    const char *expected[] = {"one", "group/two", "vendor"};
+    for (int i = 0; i < count; i++) {
+        char absolute[4096];
+        ASSERT_TRUE(cbm_canonical_path(TH_PATH(base, expected[i]), absolute, sizeof(absolute)));
+        cbm_normalize_path_sep(absolute);
+        bool found = false;
+        for (int j = 0; j < count; j++) {
+            found = found || strcmp(roots[j], absolute) == 0;
+        }
+        ASSERT_TRUE(found);
+    }
+    cbm_discover_free_excluded(roots, count);
+
+    /* An explicit ignore file uses the same overrides as source discovery. */
+    th_write_file(TH_PATH(base, "custom.ignore"), "one/\ngroup/\nprivate/\n");
+    opts.ignore_file = TH_PATH(base, "custom.ignore");
+    ASSERT_EQ(cbm_discover_git_roots(base, &opts, 0, NULL, NULL, &roots, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 0);
+    cbm_discover_free_excluded(roots, count);
+    th_cleanup(base);
+    PASS();
+}
+
+static bool cancel_git_root_discovery(void *context) {
+    int *checks = context;
+    return ++*checks >= 5;
+}
+
+TEST(discover_git_roots_empty_and_incomplete_results) {
+    char *base = th_mktempdir("cbm_git_roots_fail");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "loose/source.c"), "int unrelated;\n");
+    char **roots = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_discover_git_roots(base, NULL, 0, NULL, NULL, &roots, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT(roots == NULL);
+
+    th_mkdir_p(TH_PATH(base, "one/.git"));
+    int checks = 0;
+    ASSERT_EQ(
+        cbm_discover_git_roots(base, NULL, 0, cancel_git_root_discovery, &checks, &roots, &count),
+        CBM_DISCOVER_ERROR);
+    ASSERT(checks >= 5);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_discover_git_roots(base, NULL, 1, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_ERROR);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_discover_git_roots(TH_PATH(base, "missing"), NULL, 0, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_ERROR);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+
+#ifndef _WIN32
+    /* Unreadable/symlinked rules must not silently remove an existing root. */
+    th_write_file(TH_PATH(base, "rules"), "!vendor/\n");
+    char ignore_link[512];
+    snprintf(ignore_link, sizeof(ignore_link), "%s/.cbmignore", base);
+    ASSERT_EQ(symlink(TH_PATH(base, "rules"), ignore_link), 0);
+    ASSERT_EQ(cbm_discover_git_roots(base, NULL, 0, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_ERROR);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(unlink(ignore_link), 0);
+#endif
+
+    /* A malformed ignore control path cannot turn a failed scan into an empty set. */
+    th_mkdir_p(TH_PATH(base, "loose/.gitignore"));
+    ASSERT_EQ(cbm_discover_git_roots(base, NULL, 0, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_ERROR);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_git_roots_limit_discards_partial_results) {
+    char *base = th_mktempdir("cbm_git_roots_limit");
+    ASSERT(base != NULL);
+    for (int i = 0; i < 1025; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "repo%04d/.git", i);
+        ASSERT_EQ(th_write_file(TH_PATH(base, rel), "gitdir: elsewhere\n"), 0);
+    }
+    char **roots = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_discover_git_roots(base, NULL, 0, NULL, NULL, &roots, &count),
+              CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(roots == NULL);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
 /* The allocation-free bounded count must apply the same shebang fallback as
  * full discovery (issue #1199): extensionless scripts count, extensionless
  * plain text does not, and the limit boundary stays exact over that mix. */
@@ -1930,6 +2057,9 @@ SUITE(discover) {
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
+    RUN_TEST(discover_git_roots_reuses_filters_and_stops_at_repositories);
+    RUN_TEST(discover_git_roots_empty_and_incomplete_results);
+    RUN_TEST(discover_git_roots_limit_discards_partial_results);
     RUN_TEST(discover_bounded_count_matches_shebang_discovery);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
