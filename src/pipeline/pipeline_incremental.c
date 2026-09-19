@@ -45,6 +45,9 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdatomic.h>
 #include <stdint.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -382,28 +385,10 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
 static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
                                            const char *project, const char *abs_dir,
                                            const char *rel_dir, int depth, char **excluded_dirs,
-                                           int excluded_count, const char *name) {
+                                           int excluded_count, const cbm_dirent_t *entry) {
+    const char *name = entry->name;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         return 0;
-    char abs_path[CBM_SZ_4K], rel_path[CBM_SZ_4K];
-    int abs_n = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
-    int rel_n = rel_dir && rel_dir[0] ? snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name)
-                                      : snprintf(rel_path, sizeof(rel_path), "%s", name);
-    if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
-        (size_t)rel_n >= sizeof(rel_path))
-        return CBM_NOT_FOUND;
-    cbm_path_info_t info;
-    if (cbm_path_info_utf8(abs_path, &info) != 0)
-        return CBM_NOT_FOUND;
-    if (info.is_symlink)
-        return 0;
-    if (info.is_directory) {
-        if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
-            cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count))
-            return 0;
-        return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
-                                               excluded_dirs, excluded_count);
-    }
     bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
                                                       strcmp(name, ".codebase-memory.json") == 0);
     /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
@@ -415,6 +400,40 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
                         strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
     bool control = strcmp(name, ".gitignore") == 0 || root_control ||
                    semantic_manifest_package_control(name) || dockerignore;
+    /* Unrelated entries may have unreadable metadata (e.g. Windows device names). */
+    bool may_be_directory = entry->is_dir;
+#ifndef _WIN32
+    may_be_directory = may_be_directory || entry->d_type == DT_UNKNOWN;
+#endif
+    if (!may_be_directory && !control)
+        return 0;
+    char abs_path[CBM_SZ_4K], rel_path[CBM_SZ_4K];
+    int abs_n = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
+    int rel_n = rel_dir && rel_dir[0] ? snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name)
+                                      : snprintf(rel_path, sizeof(rel_path), "%s", name);
+    if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
+        (size_t)rel_n >= sizeof(rel_path)) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_path", "path", abs_dir,
+                      "entry", name);
+        return CBM_NOT_FOUND;
+    }
+    bool excluded_dir = cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+                        cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count);
+    if (entry->is_dir && excluded_dir)
+        return 0;
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(abs_path, &info) != 0) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_path_info", "path", abs_path);
+        return CBM_NOT_FOUND;
+    }
+    if (info.is_symlink)
+        return 0;
+    if (info.is_directory) {
+        if (excluded_dir)
+            return 0;
+        return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
+                                               excluded_dirs, excluded_count);
+    }
     return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
                                       : 0;
 }
@@ -428,18 +447,20 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
         return 0;
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_opendir", "path", abs_dir);
         /* A nested directory we can't open has no control files to
-         * contribute; skip it like discover.c's walk_dir already does.
-         * The root call (depth 0) still fails closed. */
+         * contribute; the root call still fails closed. */
         return depth == 0 ? CBM_NOT_FOUND : 0;
     }
     int rc = 0;
     cbm_dirent_t *entry;
     while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {
         rc = cbm_pipeline_frozen_checkpoint(builder->frozen);
-        if (rc == 0)
-            rc = semantic_manifest_control_entry(builder, project, abs_dir, rel_dir, depth,
-                                                 excluded_dirs, excluded_count, entry->name);
+        if (rc != 0) {
+            break;
+        }
+        rc = semantic_manifest_control_entry(builder, project, abs_dir, rel_dir, depth,
+                                             excluded_dirs, excluded_count, entry);
     }
     cbm_closedir(dir);
     return rc;
@@ -921,8 +942,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
          * made every file look changed on each incremental pass. */
         cbm_path_info_t path_info;
         if (cbm_path_info_utf8(files[i].path, &path_info) != CBM_PATH_INFO_OK ||
-            !path_info.is_regular ||
-            path_info.is_symlink) {
+            !path_info.is_regular || path_info.is_symlink) {
             changed[i] = true;
             n_changed++;
             continue;
