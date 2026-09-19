@@ -45,6 +45,9 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdatomic.h>
 #include <stdint.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -418,8 +421,11 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     int rel_n = rel_dir && rel_dir[0] ? snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name)
                                       : snprintf(rel_path, sizeof(rel_path), "%s", name);
     if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
-        (size_t)rel_n >= sizeof(rel_path))
+        (size_t)rel_n >= sizeof(rel_path)) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_path", "path", abs_dir,
+                      "entry", name);
         return CBM_NOT_FOUND;
+    }
     /* Only directories and control files contribute, so an entry the listing
      * already shows to be neither is skipped without reading its metadata.
      * That read can fail on such an entry: on Windows the plain path of a file
@@ -429,14 +435,19 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     if (!control && semantic_manifest_listed_non_directory(entry)) {
         return 0;
     }
+    bool excluded_dir = cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+                        cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count);
+    if (entry->is_dir && excluded_dir)
+        return 0;
     cbm_path_info_t info;
-    if (cbm_path_info_utf8(abs_path, &info) != 0)
+    if (cbm_path_info_utf8(abs_path, &info) != 0) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_path_info", "path", abs_path);
         return CBM_NOT_FOUND;
+    }
     if (info.is_symlink)
         return 0;
     if (info.is_directory) {
-        if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
-            cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count))
+        if (excluded_dir)
             return 0;
         return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
                                                excluded_dirs, excluded_count);
@@ -454,9 +465,9 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
         return 0;
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_opendir", "path", abs_dir);
         /* A nested directory we can't open has no control files to
-         * contribute; skip it like discover.c's walk_dir already does.
-         * The root call (depth 0) still fails closed. */
+         * contribute; the root call still fails closed. */
         return depth == 0 ? CBM_NOT_FOUND : 0;
     }
     int rc = 0;
@@ -947,8 +958,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
          * made every file look changed on each incremental pass. */
         cbm_path_info_t path_info;
         if (cbm_path_info_utf8(files[i].path, &path_info) != CBM_PATH_INFO_OK ||
-            !path_info.is_regular ||
-            path_info.is_symlink) {
+            !path_info.is_regular || path_info.is_symlink) {
             changed[i] = true;
             n_changed++;
             continue;
