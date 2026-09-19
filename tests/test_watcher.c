@@ -37,10 +37,10 @@ static int wt_git(const char *dir, const char *args) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
 #ifdef _WIN32
-             "\"\"C:/Program Files/Git/cmd/git.exe\" -C \"%s\" -c user.name=t -c user.email=t@t.io "
+             "\"\"C:/Program Files/Git/cmd/git.exe\" -C \"%s\" -c core.autocrlf=false -c user.name=t -c user.email=t@t.io "
              "-c init.defaultBranch=master -c commit.gpgsign=false %s\"",
 #else
-             "git -C \"%s\" -c user.name=t -c user.email=t@t.io "
+             "git -C \"%s\" -c core.autocrlf=false -c user.name=t -c user.email=t@t.io "
              "-c init.defaultBranch=master -c commit.gpgsign=false %s",
 #endif
              dir, args);
