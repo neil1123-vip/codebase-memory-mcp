@@ -37,6 +37,9 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -326,6 +329,7 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
+        cbm_log_error("semantic_manifest.err", "phase", "control_opendir", "path", abs_dir);
         return CBM_NOT_FOUND;
     }
     int rc = 0;
@@ -333,6 +337,20 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
     while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {
         const char *name = entry->name;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        bool root_control =
+            (!rel_dir || !rel_dir[0]) &&
+            (strcmp(name, ".cbmignore") == 0 || strcmp(name, ".codebase-memory.json") == 0);
+        bool control = strcmp(name, ".gitignore") == 0 || root_control ||
+                       semantic_manifest_package_control(name);
+        /* Unrelated entries may have unreadable metadata (e.g. Windows device names). */
+        bool may_be_directory = entry->is_dir;
+#ifndef _WIN32
+        /* An unresolved POSIX type may still be a directory with controls. */
+        may_be_directory = may_be_directory || entry->d_type == DT_UNKNOWN;
+#endif
+        if (!may_be_directory && !control) {
             continue;
         }
         char abs_path[CBM_SZ_4K];
@@ -343,11 +361,20 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
                         : snprintf(rel_path, sizeof(rel_path), "%s", name);
         if (abs_n < 0 || abs_n >= (int)sizeof(abs_path) || rel_n < 0 ||
             rel_n >= (int)sizeof(rel_path)) {
+            cbm_log_error("semantic_manifest.err", "phase", "control_path", "path", abs_dir,
+                          "entry", name);
             rc = CBM_NOT_FOUND;
             break;
         }
+        bool excluded_dir =
+            cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+            cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count);
+        if (entry->is_dir && excluded_dir) {
+            continue;
+        }
         cbm_path_info_t path_info;
         if (cbm_path_info_utf8(abs_path, &path_info) != 0) {
+            cbm_log_error("semantic_manifest.err", "phase", "control_path_info", "path", abs_path);
             rc = CBM_NOT_FOUND;
             break;
         }
@@ -355,19 +382,14 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
             continue;
         }
         if (path_info.is_directory) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
-                cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
+            if (excluded_dir) {
                 continue;
             }
             rc = semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
                                                  excluded_dirs, excluded_count);
             continue;
         }
-        bool root_control =
-            (!rel_dir || !rel_dir[0]) &&
-            (strcmp(name, ".cbmignore") == 0 || strcmp(name, ".codebase-memory.json") == 0);
-        if (path_info.is_regular && (strcmp(name, ".gitignore") == 0 || root_control ||
-                                     semantic_manifest_package_control(name))) {
+        if (path_info.is_regular && control) {
             rc = semantic_manifest_add(builder, project, rel_path, abs_path);
         }
     }

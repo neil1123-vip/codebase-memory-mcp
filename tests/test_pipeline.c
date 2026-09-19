@@ -4818,6 +4818,91 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     PASS();
 }
 
+TEST(pipeline_semantic_manifest_filters_control_walk) {
+    char tmp[256] = "/tmp/cbm_manifest_controls_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *controls[] = {
+        ".cbmignore",
+        "package.json",
+        "nested/.gitignore",
+        "nested/deep/go.mod",
+    };
+    write_temp_file(tmp, controls[0], "excluded/\n");
+    write_temp_file(tmp, controls[1], "{}\n");
+    write_temp_file(tmp, controls[2], "*.log\n");
+    write_temp_file(tmp, controls[3], "module example.test/nested\n");
+    write_temp_file(tmp, "node_modules/package.json", "{}\n");
+    write_temp_file(tmp, "excluded/package.json", "{}\n");
+    write_temp_file(tmp, "ordinary.txt", "not a semantic control\n");
+
+#ifdef _WIN32
+    /* A real NUL file makes the old walker fail during its unfiltered metadata lookup. */
+    wchar_t *wide_root = cbm_utf8_to_wide(tmp);
+    ASSERT_NOT_NULL(wide_root);
+    wchar_t absolute[512];
+    DWORD length = GetFullPathNameW(wide_root, 512, absolute, NULL);
+    free(wide_root);
+    ASSERT_TRUE(length > 0 && length < 512);
+    cbm_win_path_normalize_wide_separators(absolute);
+    wchar_t reserved[600];
+    if (absolute[0] == L'\\' && absolute[1] == L'\\') {
+        swprintf(reserved, 600, L"\\\\?\\UNC\\%ls\\NUL", absolute + 2);
+    } else {
+        swprintf(reserved, 600, L"\\\\?\\%ls\\NUL", absolute);
+    }
+    HANDLE handle =
+        CreateFileW(reserved, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    bool reserved_created = handle != INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    bool reserved_written = reserved_created && WriteFile(handle, "fixture\n", 8, &written, NULL);
+    if (reserved_created) {
+        CloseHandle(handle);
+    }
+    WIN32_FILE_ATTRIBUTE_DATA reserved_info = {0};
+    bool reserved_is_real = GetFileAttributesExW(reserved, GetFileExInfoStandard, &reserved_info) &&
+                            reserved_info.nFileSizeHigh == 0 && reserved_info.nFileSizeLow == 8;
+#endif
+
+    char *excluded[] = {"excluded"};
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = 0;
+    int rc = cbm_pipeline_build_semantic_manifest("manifest-controls", tmp, NULL, 0, excluded, 1,
+                                                  NULL, NULL, &manifest, &manifest_count);
+    bool found[4] = {false};
+    bool has_excluded = false;
+    bool has_unrelated = false;
+    for (int i = 0; i < manifest_count; i++) {
+        for (int j = 0; j < 4; j++) {
+            found[j] |= strcmp(manifest[i].rel_path, controls[j]) == 0;
+        }
+        has_excluded |= strcmp(manifest[i].rel_path, "node_modules/package.json") == 0 ||
+                        strcmp(manifest[i].rel_path, "excluded/package.json") == 0;
+        has_unrelated |= strcmp(manifest[i].rel_path, "NUL") == 0 ||
+                         strcmp(manifest[i].rel_path, "ordinary.txt") == 0;
+    }
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
+#ifdef _WIN32
+    bool reserved_deleted = reserved_created && DeleteFileW(reserved);
+#endif
+    int cleanup_rc = th_rmtree(tmp);
+
+#ifdef _WIN32
+    ASSERT_TRUE(reserved_created);
+    ASSERT_TRUE(reserved_written);
+    ASSERT_EQ(written, 8);
+    ASSERT_TRUE(reserved_is_real);
+    ASSERT_TRUE(reserved_deleted);
+#endif
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_TRUE(found[i]);
+    }
+    ASSERT_FALSE(has_excluded);
+    ASSERT_FALSE(has_unrelated);
+    PASS();
+}
+
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
  * quarantine. The replacement happens only after the corrupt bytes are moved. */
@@ -14917,6 +15002,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
     RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
+    RUN_TEST(pipeline_semantic_manifest_filters_control_walk);
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
 #endif
