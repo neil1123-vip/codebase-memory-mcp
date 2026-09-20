@@ -4362,6 +4362,18 @@ TEST(swift_labeled_call_string_arg_issue1892) {
  * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
+TEST(extract_ts_await_generic_call_issue2210) {
+    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
+                               "async function plain() { return await parseJsonBody(); }\n"
+                               "async function generic() { return await parseJsonBody<string>(); }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_ts_url_builder_issue1009) {
     CBMFileResult *r = extract("function thingDetail(id: string): string {\n"
                                "  return `/api/v1/things/${id}/detail`;\n"
@@ -7930,6 +7942,7 @@ SUITE(extraction) {
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);

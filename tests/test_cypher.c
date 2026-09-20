@@ -1744,6 +1744,35 @@ TEST(cypher_exec_count) {
     PASS();
 }
 
+TEST(cypher_exec_optional_bound_terminal_count_ignores_unbound) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) OPTIONAL MATCH (t)-[:CALLS]->(f) "
+                                "RETURN f.name, COUNT(t) AS cnt",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+
+    for (int i = 0; i < r.row_count; i++) {
+        const char *name = r.rows[i][0];
+        const char *count = r.rows[i][1];
+        if (strcmp(name, "HandleOrder") == 0) {
+            ASSERT_STR_EQ(count, "0");
+        } else if (strcmp(name, "ValidateOrder") == 0 || strcmp(name, "SubmitOrder") == 0 ||
+                   strcmp(name, "LogError") == 0) {
+            ASSERT_STR_EQ(count, "1");
+        } else {
+            ASSERT_TRUE(false);
+        }
+    }
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_limit) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4578,6 +4607,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_calls_with_where);
     RUN_TEST(cypher_exec_inbound);
     RUN_TEST(cypher_exec_count);
+    RUN_TEST(cypher_exec_optional_bound_terminal_count_ignores_unbound);
     RUN_TEST(cypher_exec_limit);
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);

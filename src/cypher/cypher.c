@@ -4450,9 +4450,31 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 }
 
 /* Accumulate a binding into RETURN aggregation */
+static bool binding_has_value(binding_t *b, const char *var, const char *prop) {
+    if (!var || strcmp(var, "*") == 0) {
+        return true;
+    }
+    char full[CBM_SZ_256];
+    if (prop) {
+        snprintf(full, sizeof(full), "%s.%s", var, prop);
+    } else {
+        snprintf(full, sizeof(full), "%s", var);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], full) == 0) {
+            return true;
+        }
+    }
+    return binding_get_edge(b, var) != NULL || binding_get(b, var) != NULL;
+}
+
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
         if (!is_aggregate_func(ret->items[ci].func)) {
+            continue;
+        }
+        if (strcmp(ret->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, ret->items[ci].variable, ret->items[ci].property)) {
             continue;
         }
         entry->counts[ci]++;
