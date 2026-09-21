@@ -11062,6 +11062,16 @@ static bool project_db_is_servable(const char *project, const char *db_path) {
     return servable;
 }
 
+/* The three heap strings handle_index_repository owns from
+ * cbm_mcp_get_string_arg / resolved_repo_path_from_project_arg. One release
+ * point keeps the dozen early-return paths in step; free(NULL) is a no-op, so
+ * a path may pass NULL for an argument it never obtained. */
+static void index_args_free(char *repo_path, char *mode_str, char *name_override) {
+    free(repo_path);
+    free(mode_str);
+    free(name_override);
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -11074,15 +11084,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (!repo_path) {
-        free(mode_str);
-        free(name_override);
+        index_args_free(NULL, mode_str, name_override);
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
     if (!resolve_session_repo_path(srv, &repo_path)) {
-        free(mode_str);
-        free(name_override);
-        free(repo_path);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result("failed to resolve repo_path", true);
     }
 
@@ -11102,26 +11109,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     if (repo_path && repo_path[0] &&
         !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
                                     allowed_root, boundary_err, sizeof(boundary_err))) {
-        free(mode_str);
-        free(name_override);
-        free(repo_path);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(boundary_err, true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
-        free(mode_str);
         char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
-        free(name_override);
-        free(repo_path);
+        index_args_free(repo_path, mode_str, name_override);
         return result;
     }
 
     cbm_index_resource_policy_t resource_policy;
     char policy_error[CBM_SZ_256] = {0};
     if (!load_index_policy(srv, args, &resource_policy, policy_error, sizeof(policy_error))) {
-        free(mode_str);
-        free(name_override);
-        free(repo_path);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(policy_error, true);
     }
 
@@ -11133,9 +11134,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
                         : NULL;
         free(worker_args);
-        free(repo_path);
-        free(mode_str);
-        free(name_override);
+        index_args_free(repo_path, mode_str, name_override);
         return coordinated ? coordinated
                            : cbm_mcp_text_result(
                                  "daemon index coordinator could not start the operation", true);
@@ -11148,9 +11147,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *mutation_project =
         cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
     if (!mutation_project) {
-        free(repo_path);
-        free(mode_str);
-        free(name_override);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result("could not resolve index project name", true);
     }
 
@@ -11163,24 +11160,18 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
         if (!worker_args) {
             free(mutation_project);
-            free(repo_path);
-            free(mode_str);
-            free(name_override);
+            index_args_free(repo_path, mode_str, name_override);
             return cbm_mcp_text_result("failed to prepare supervised index request", true);
         }
         char *supervised = index_run_supervised(srv, worker_args);
         free(worker_args);
         if (supervised) {
             free(mutation_project);
-            free(repo_path);
-            free(mode_str);
-            free(name_override);
+            index_args_free(repo_path, mode_str, name_override);
             return supervised;
         }
         free(mutation_project);
-        free(repo_path);
-        free(mode_str);
-        free(name_override);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result(
             "index supervision failed before a contained worker could start; no "
             "in-process fallback was attempted",
@@ -11189,18 +11180,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     if (!mcp_project_mutation_begin(srv, mutation_project)) {
         free(mutation_project);
-        free(repo_path);
-        free(mode_str);
-        free(name_override);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result("index operation blocked by another mutation for this project",
                                    true);
     }
     if (mcp_request_cancelled(srv)) {
         mcp_project_mutation_end(srv, mutation_project);
         free(mutation_project);
-        free(repo_path);
-        free(mode_str);
-        free(name_override);
+        index_args_free(repo_path, mode_str, name_override);
         return cbm_mcp_text_result("index operation cancelled for this request", true);
     }
 
