@@ -11123,6 +11123,11 @@ static void index_args_free(char *repo_path, char *mode_str, char *name_override
     free(name_override);
 }
 
+static bool auto_watch_enabled(cbm_mcp_server_t *srv);
+static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
+                                              const char *root);
+static bool index_response_is_success(const char *response);
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -11217,6 +11222,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         char *supervised = index_run_supervised(srv, worker_args);
         free(worker_args);
         if (supervised) {
+            if (index_response_is_success(supervised)) {
+                register_index_watcher_if_enabled(srv, mutation_project, repo_path);
+            }
             free(mutation_project);
             index_args_free(repo_path, mode_str, name_override);
             return supervised;
@@ -11447,6 +11455,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         cbm_log_info("index.worker.fast_exit", "skip", "pipeline_free");
     } else {
         cbm_pipeline_free(p);
+    }
+    if (rc == 0) {
+        register_index_watcher_if_enabled(srv, mutation_project, repo_path);
     }
     free(project_name);
     free(repo_path);
@@ -17600,6 +17611,29 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
         return;
     }
     cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+}
+
+static bool index_response_is_success(const char *response) {
+    yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *is_error = yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    bool success = yyjson_is_bool(is_error) && !yyjson_get_bool(is_error);
+    yyjson_doc_free(document);
+    return success;
+}
+
+/* Explicit index requests can target a project below the MCP session root.
+ * Keep that target live too; the daemon coordinator handles its own logical
+ * session ownership, while standalone embedders use the borrowed watcher. */
+static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
+                                              const char *root) {
+    if (!srv || !srv->watcher || !project || !project[0] || !root || !root[0] ||
+        !auto_watch_enabled(srv)) {
+        return;
+    }
+    if (!cbm_watcher_watch(srv->watcher, project, root)) {
+        cbm_log_warn("watcher.register.failed", "project", project, "path", root);
+    }
 }
 
 /* Background auto-index thread function */

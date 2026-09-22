@@ -1581,6 +1581,104 @@ static void app_fake_worker_destroy(void *opaque, cbm_daemon_application_worker_
     free(handle);
 }
 
+TEST(daemon_application_explicit_index_registers_and_releases_watch) {
+    static const char failed_response[] =
+        "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"status\\\":\\\"error\\\"}\"}],"
+        "\"isError\":true}";
+    char root[APP_TEST_PATH_CAP];
+    char child[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-explicit-watch-root-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-explicit-watch-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    (void)snprintf(child, sizeof(child), "%s/child", root);
+    bool child_ok = dirs_ok && cbm_mkdir_p(child, 0755);
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    bool env_ok = (!old_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.scripted, true);
+    fake.outcomes[0] = CBM_PROC_CLEAN;
+    fake.responses[0] = failed_response;
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.watcher = watcher, .worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 13) : NULL;
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    char args[APP_TEST_PATH_CAP + 64];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", child);
+    bool setup = child_ok && env_ok && session &&
+                 app_test_context_request(root, root, &context, &context_length) &&
+                 app_test_tool_request("index_repository", args, &tool, &tool_length);
+    bool requested =
+        setup && app_test_request(&callbacks, session, context, context_length, &response,
+                                  &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    requested = requested &&
+                app_test_request(&callbacks, session, tool, tool_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    bool failed_without_watch = requested && response && strstr((char *)response, "isError") &&
+                                cbm_watcher_watch_count(watcher) == 0;
+    free(response);
+    response = NULL;
+    requested = requested &&
+                app_test_request(&callbacks, session, tool, tool_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    bool registered = requested && response && strstr((char *)response, "indexed") &&
+                      cbm_watcher_watch_count(watcher) == 1;
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool released = watcher && cbm_watcher_watch_count(watcher) == 0;
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    free(context);
+    free(tool);
+    free(response);
+    (void)cbm_rmdir(child);
+    (void)cbm_rmdir(root);
+    (void)cbm_rmdir(cache);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else if (!old_cache) {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(requested);
+    ASSERT_TRUE(failed_without_watch);
+    ASSERT_TRUE(registered);
+    ASSERT_TRUE(released);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 typedef struct {
     cbm_daemon_runtime_application_callbacks_t callbacks;
     cbm_daemon_runtime_application_session_t *session;
@@ -5647,6 +5745,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
+    RUN_TEST(daemon_application_explicit_index_registers_and_releases_watch);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
