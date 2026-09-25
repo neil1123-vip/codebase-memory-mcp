@@ -16,6 +16,7 @@
 #include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "daemon/version_cohort.h"
+#include "cli/cli.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -1506,6 +1507,126 @@ TEST(daemon_host_early_coordination_failure_is_durable) {
     ASSERT_EQ(run_result, -1);
     ASSERT_TRUE(durable);
     ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+TEST(daemon_host_cache_db_candidate_filter) {
+    ASSERT_TRUE(cbm_daemon_host_cache_db_candidate_for_test("project.db"));
+    ASSERT_TRUE(cbm_daemon_host_cache_db_candidate_for_test("_custom_project.db"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("_config.db"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("_cross_repo.db"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("project.db-wal"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test(NULL));
+    PASS();
+}
+
+TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
+    char parent[RUNTIME_TEST_PATH_CAP] = {0};
+    if (!th_secure_runtime_parent_new(parent, sizeof(parent), "host-restore")) {
+        SKIP("安全运行时目录不可用");
+    }
+    char cache[RUNTIME_TEST_PATH_CAP];
+    char root[RUNTIME_TEST_PATH_CAP];
+    char outside_root[RUNTIME_TEST_PATH_CAP];
+    char missing_root[RUNTIME_TEST_PATH_CAP];
+    snprintf(cache, sizeof(cache), "%s/cache", parent);
+    snprintf(root, sizeof(root), "%s/project", parent);
+    snprintf(outside_root, sizeof(outside_root), "%s-outside", parent);
+    snprintf(missing_root, sizeof(missing_root), "%s/missing", parent);
+    bool dirs_ok = cbm_mkdir_p(cache, 0700) && cbm_mkdir_p(root, 0700);
+    bool outside_ok = cbm_mkdir_p(outside_root, 0700);
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_allowed = getenv("CBM_ALLOWED_ROOT");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char *saved_allowed = old_allowed ? cbm_strdup(old_allowed) : NULL;
+    bool env_ok = dirs_ok && (!old_cache || saved_cache) && (!old_allowed || saved_allowed) &&
+                  cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                  cbm_setenv("CBM_ALLOWED_ROOT", parent, 1) == 0;
+    cbm_config_t *config = env_ok ? cbm_config_open(cache) : NULL;
+    bool config_ok = config && cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+                     cbm_config_set(config, CBM_CONFIG_WATCHER_ENABLED, "true") == 0;
+    const char *project = "host-restore-project";
+    char db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = config_ok ? cbm_store_open_path(db_path) : NULL;
+    bool db_ok = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK &&
+                 cbm_store_upsert_project(store, "host-restore-project::missed", "") ==
+                     CBM_STORE_OK;
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_config_close(config);
+    char corrupt_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s/corrupt.db", cache);
+    FILE *corrupt = cbm_fopen(corrupt_path, "wb");
+    bool corrupt_ok = corrupt && fputs("not a sqlite database", corrupt) >= 0;
+    if (corrupt) {
+        fclose(corrupt);
+    }
+    char missing_db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(missing_db_path, sizeof(missing_db_path), "%s/missing-root.db", cache);
+    cbm_store_t *missing_store = cbm_store_open_path(missing_db_path);
+    bool missing_db_ok =
+        missing_store &&
+        cbm_store_upsert_project(missing_store, "missing-root", missing_root) == CBM_STORE_OK;
+    cbm_store_close(missing_store);
+    char outside_db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(outside_db_path, sizeof(outside_db_path), "%s/outside-root.db", cache);
+    cbm_store_t *outside_store = cbm_store_open_path(outside_db_path);
+    bool outside_db_ok = outside_store &&
+                         cbm_store_upsert_project(outside_store, "outside-root", outside_root) ==
+                             CBM_STORE_OK;
+    cbm_store_close(outside_store);
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        env_ok ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
+    int watch_count = -1;
+    bool prepared_disabled = endpoint && config_ok &&
+                             cbm_daemon_host_state_prepare_watch_count_for_test(endpoint,
+                                                                                 &watch_count);
+    bool auto_watch_disabled = prepared_disabled && watch_count == 0;
+
+    config = cbm_config_open(cache);
+    bool enabled_config_ok = config && cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "true") == 0 &&
+                             cbm_config_set(config, CBM_CONFIG_WATCHER_ENABLED, "true") == 0;
+    cbm_config_close(config);
+    watch_count = -1;
+    bool prepared_enabled = endpoint && enabled_config_ok &&
+                            cbm_daemon_host_state_prepare_watch_count_for_test(endpoint,
+                                                                                &watch_count);
+    bool auto_watch_enabled = prepared_enabled && watch_count == 1;
+
+    config = cbm_config_open(cache);
+    bool watcher_disabled_config_ok =
+        config && cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "true") == 0 &&
+        cbm_config_set(config, CBM_CONFIG_WATCHER_ENABLED, "false") == 0;
+    cbm_config_close(config);
+    watch_count = -1;
+    bool prepared_watcher_disabled =
+        endpoint && watcher_disabled_config_ok &&
+        cbm_daemon_host_state_prepare_watch_count_for_test(endpoint, &watch_count);
+    bool watcher_disabled = prepared_watcher_disabled && watch_count == 0;
+
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, old_cache != NULL);
+    runtime_test_restore_environment("CBM_ALLOWED_ROOT", saved_allowed, old_allowed != NULL);
+    free(saved_cache);
+    free(saved_allowed);
+    bool cleaned = th_rmtree(parent) == 0;
+    bool outside_cleaned = !outside_ok || th_rmtree(outside_root) == 0;
+
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(config_ok);
+    ASSERT_TRUE(db_ok);
+    ASSERT_TRUE(missing_db_ok);
+    ASSERT_TRUE(outside_ok);
+    ASSERT_TRUE(outside_db_ok);
+    ASSERT_TRUE(corrupt_ok);
+    ASSERT_TRUE(auto_watch_disabled);
+    ASSERT_TRUE(auto_watch_enabled);
+    ASSERT_TRUE(watcher_disabled);
+    ASSERT_TRUE(cleaned);
+    ASSERT_TRUE(outside_cleaned);
     PASS();
 }
 
@@ -5094,6 +5215,8 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
+    RUN_TEST(daemon_host_cache_db_candidate_filter);
+    RUN_TEST(daemon_host_restores_cached_watch_respects_runtime_gates);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);
     RUN_TEST(daemon_host_http_retry_backoff_is_bounded);

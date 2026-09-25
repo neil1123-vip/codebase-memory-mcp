@@ -76,6 +76,9 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 /* Reset adaptive backoff and request child repository discovery on next poll. */
 void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
 
+/* 安排一次不依赖文件变更的后台刷新，通常用于 daemon 重启恢复 watcher。 */
+void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name);
+
 /* ── Polling ────────────────────────────────────────────────────── */
 
 /* Run a single poll cycle — check each watched project for changes.

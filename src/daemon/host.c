@@ -19,7 +19,9 @@
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h"
 #include "mcp/index_supervisor.h"
+#include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
@@ -312,12 +314,116 @@ static int host_watcher_index(const char *project_name, const char *root_path, v
                : -1;
 }
 
+static bool host_cache_db_candidate(const char *name) {
+    if (!name) {
+        return false;
+    }
+    size_t length = strlen(name);
+    if (length < 4 || strcmp(name + length - 3, ".db") != 0) {
+        return false;
+    }
+    /* 只排除内部库的固定文件名，保留下划线开头的合法项目名。 */
+    return strcmp(name, "_config.db") != 0 && strcmp(name, "_cross_repo.db") != 0;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS)
+bool cbm_daemon_host_cache_db_candidate_for_test(const char *name) {
+    return host_cache_db_candidate(name);
+}
+#endif
+
+static void host_restore_cached_watches(host_state_t *host) {
+    if (!host || !host->watcher || !host->application || !host->runtime_config ||
+        !cbm_config_get_bool(host->runtime_config, CBM_CONFIG_AUTO_WATCH, true)) {
+        return;
+    }
+    const char *cache = cbm_resolve_cache_dir();
+    cbm_dir_t *directory = cache ? cbm_opendir(cache) : NULL;
+    if (!directory) {
+        return;
+    }
+    int restored = 0;
+    cbm_dirent_t *entry = NULL;
+    while ((entry = cbm_readdir(directory)) != NULL) {
+        if (!host_cache_db_candidate(entry->name)) {
+            continue;
+        }
+        char db_path[HOST_PATH_CAP];
+        int written = snprintf(db_path, sizeof(db_path), "%s/%s", cache, entry->name);
+        if (written <= 0 || (size_t)written >= sizeof(db_path)) {
+            continue;
+        }
+        cbm_path_info_t info = {0};
+        if (cbm_path_info_utf8(db_path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+            info.is_symlink) {
+            continue;
+        }
+        cbm_store_t *store = cbm_store_open_path_query(db_path);
+        if (!store) {
+            continue;
+        }
+        cbm_project_t *projects = NULL;
+        int count = 0;
+        if (cbm_store_check_integrity(store) &&
+            cbm_store_list_projects(store, &projects, &count) == CBM_STORE_OK) {
+            cbm_project_t *primary_project = NULL;
+            int primary_count = 0;
+            for (int i = 0; i < count; i++) {
+                cbm_project_t *project = &projects[i];
+                if (project->name && strstr(project->name, "::")) {
+                    continue;
+                }
+                primary_project = project;
+                primary_count++;
+            }
+            if (primary_count == 1 && primary_project && primary_project->name &&
+                primary_project->name[0] && cbm_validate_project_name(primary_project->name) &&
+                primary_project->root_path && primary_project->root_path[0] &&
+                cbm_daemon_application_register_project_watch(
+                    host->application, primary_project->name, primary_project->root_path, true)) {
+                restored++;
+            }
+        }
+        cbm_store_free_projects(projects, count);
+        cbm_store_close(store);
+    }
+    cbm_closedir(directory);
+    if (restored > 0) {
+        cbm_log_info("watcher.restore", "projects", "one_or_more");
+    }
+}
+
 static int host_ui_index(void *opaque, const char *root_path, const char *project_name) {
     host_state_t *host = opaque;
-    return host && host->application
-               ? cbm_daemon_application_index(host->application, project_name ? project_name : "",
-                                              root_path)
-               : -1;
+    if (!host || !host->application) {
+        return -1;
+    }
+    int result = cbm_daemon_application_index(host->application, project_name ? project_name : "",
+                                              root_path);
+    if (result == 0) {
+        char canonical_root[HOST_PATH_CAP];
+        if (cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
+            const char *watch_project = project_name;
+            char *derived_project = NULL;
+            if (!watch_project || !watch_project[0]) {
+                derived_project = cbm_project_name_from_path(canonical_root);
+                watch_project = derived_project;
+            }
+            if (watch_project && watch_project[0]) {
+                (void)cbm_daemon_application_register_project_watch(
+                    host->application, watch_project, canonical_root, false);
+            }
+            free(derived_project);
+        }
+    }
+    return result;
+}
+
+static void host_ui_project_deleted(void *opaque, const char *project_name) {
+    host_state_t *host = opaque;
+    if (host && host->application) {
+        cbm_daemon_application_project_deleted(host->application, project_name);
+    }
 }
 
 static bool host_ui_mutation_begin(void *opaque, const char *project) {
@@ -347,6 +453,7 @@ static void host_http_server_configure_default(void *context, cbm_http_server_t 
                                                host_state_t *host) {
     (void)context;
     cbm_http_server_set_watcher(server, host->watcher);
+    cbm_http_server_set_project_deleted_callback(server, host_ui_project_deleted, host);
     cbm_http_server_set_index_executor(server, host_ui_index, host);
     cbm_http_server_set_project_mutation_guard(server, host_ui_mutation_begin, host_ui_mutation_end,
                                                host);
@@ -632,6 +739,8 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
     if (watcher_enabled && (!host->watch_store || !host->watcher)) {
         return false;
     }
+    /* auto_watch=false 时不恢复旧 watcher；恢复前仍校验根目录边界。 */
+    host_restore_cached_watches(host);
     return true;
 }
 
@@ -641,6 +750,23 @@ bool cbm_daemon_host_state_prepare_for_test(const cbm_daemon_ipc_endpoint_t *end
     }
     host_state_t host = {0};
     bool prepared = host_state_prepare(&host, endpoint);
+    host_state_free(&host);
+    return prepared;
+}
+
+bool cbm_daemon_host_state_prepare_watch_count_for_test(
+    const cbm_daemon_ipc_endpoint_t *endpoint, int *watch_count_out) {
+    if (watch_count_out) {
+        *watch_count_out = 0;
+    }
+    if (!endpoint) {
+        return false;
+    }
+    host_state_t host = {0};
+    bool prepared = host_state_prepare(&host, endpoint);
+    if (watch_count_out && host.watcher) {
+        *watch_count_out = cbm_watcher_watch_count(host.watcher);
+    }
     host_state_free(&host);
     return prepared;
 }
