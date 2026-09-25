@@ -253,16 +253,15 @@ Enable automatic indexing on MCP session start:
 codebase-memory-mcp config set auto_index true
 ```
 
-`auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched through `auto_watch` (on by default), subject to its global setting and session ownership.
+`auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched independently through `auto_watch` (on by default), as described below.
 
-Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. While `auto_watch` is enabled, these watches belong to the registering sessions and remain while at least one owning session is connected; closing the last owner removes the watch. An async index registers its target only after success and while its requesting session remains connected. CLI indexing and failed MCP indexes do not register watches. Global `auto_watch` controls registration and removes all watches on the next refresh or registration request when set to `false`. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. Session watches are removed when their last owner disconnects; successfully indexed projects are promoted to daemon-owned watches and survive session closure. Cached projects are restored when the daemon starts if `auto_watch` is enabled. An async index registers its target only after success. Failed indexes do not create watches. `index_status` reports the current watcher in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
 
-Watcher registration is controlled globally by `auto_watch` (default `true`). On the next refresh or registration request, `true` allows MCP sessions to register their root on connect and their successful `index_repository` targets; `false` removes all watches. CLI indexing and failed MCP indexes do not add watches.
+Watcher registration is controlled globally by `auto_watch` (default `true`). Set `config set auto_watch false` to disable session registration and startup restoration of cached project watchers; existing watches are removed on the next refresh or registration request.
 
-To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered or restored, while `auto_index` and manual `index_repository` keep working. `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
-The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
-When a watched project root is not Git-managed, the watcher discovers Git repositories below it using the indexer's directory exclusions, including `.gitignore` and `.cbmignore`. Each child repository (including linked worktrees) is checked for HEAD and working-tree changes, and changes are combined into one refresh of the original enclosing project. Repository discovery is repeated every minute; the first discovery of a repository also refreshes a potentially stale index. Ordinary files outside those repositories do not trigger refreshes. If no repositories are found, `watcher.repositories` logs `auto_refresh=disabled_no_git`; manual indexing remains available. Discovery errors preserve the previous repository set for retry.
+The watcher uses Git change detection by default, including the child repositories of a non-Git root. To have ordinary files in non-Git roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
 ### Keeping Up to Date
 
@@ -403,7 +402,7 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes in projects registered by active MCP sessions, including successful explicit `index_repository` targets, and re-indexes them automatically.
+- **Auto-sync**: Background watcher detects changes in session projects and retained indexed projects and re-indexes them automatically (`index_status` shows `watch`)
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern ".*Handler.*"`
 - **Available on**: npm, PyPI, Homebrew, Scoop, AUR, `go install`
@@ -905,7 +904,7 @@ Tools requiring arguments accept JSON piped on stdin. Tools with only optional a
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected, subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `index_repository` | Index a repository into the graph. Successfully indexed projects retain a daemon watcher when auto-watch is enabled (`index_status` shows `watch`). Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List indexed projects with paging; use `detail: "stats"` for node/edge counts and database sizes. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
