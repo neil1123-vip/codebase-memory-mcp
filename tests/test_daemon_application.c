@@ -805,6 +805,13 @@ static int app_test_index_noop(const char *project_name, const char *root_path, 
     return 0;
 }
 
+static int app_test_index_count(const char *project_name, const char *root_path, void *context) {
+    (void)project_name;
+    (void)root_path;
+    atomic_fetch_add((atomic_int *)context, 1);
+    return 0;
+}
+
 static bool app_test_create_empty_file(const char *path) {
     FILE *file = path ? cbm_fopen(path, "wb") : NULL;
     return file && fclose(file) == 0;
@@ -1161,10 +1168,7 @@ TEST(daemon_application_free_releases_live_watch_once) {
                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool watch_live = requested && cbm_watcher_watch_count(watcher) == 1;
 
-    /* Keep one watcher entry outside the application's subscription table.
-     * It survives application teardown and then enters the destructive prune
-     * path. If application_free leaves its borrowed callbacks installed, the
-     * third poll calls through the freed application context (caught by ASan). */
+    /* 留一个不属于应用订阅表的 watcher；应用释放后轮询应安全解除它，并保留缓存库。 */
     if (watch_live) {
         cbm_watcher_watch(watcher, survivor_project, survivor_root);
     }
@@ -1181,7 +1185,7 @@ TEST(daemon_application_free_releases_live_watch_once) {
         (void)cbm_watcher_poll_once(watcher);
     }
     bool post_free_poll_safe = survivor_removed && cbm_watcher_watch_count(watcher) == 0 &&
-                               !cbm_file_exists(survivor_db_path);
+                               cbm_file_exists(survivor_db_path);
     cbm_watcher_stop(watcher);
     cbm_watcher_free(watcher);
     cbm_store_close(store);
@@ -1280,8 +1284,8 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
         (void)cbm_watcher_poll_once(watcher);
     }
     bool pruned = root_removed && cbm_watcher_watch_count(watcher) == 0 &&
-                  !cbm_file_exists(db_path) && !cbm_file_exists(wal_path) &&
-                  !cbm_file_exists(shm_path);
+                  cbm_file_exists(db_path) && cbm_file_exists(wal_path) &&
+                  cbm_file_exists(shm_path);
 
     bool restored = pruned && cbm_mkdir_p(root, 0755) && app_test_create_empty_file(db_path);
     if (restored) {
@@ -2052,6 +2056,126 @@ TEST(daemon_application_restore_watch_honors_auto_watch) {
     ASSERT_TRUE(root_restored);
     ASSERT_TRUE(root_removed);
     ASSERT_TRUE(cache_removed);
+    PASS();
+}
+
+TEST(daemon_application_restores_daemon_watch_without_session) {
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-pending-watch-root-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-pending-watch-cache-XXXXXX", cbm_tmpdir());
+    bool root_created = cbm_mkdtemp(root) != NULL;
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    bool dirs_ok = root_created && cache_created;
+    char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
+    char canonical_root[APP_TEST_PATH_CAP] = {0};
+    bool canonical_root_ok = dirs_ok &&
+                             cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    if (project) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    }
+
+    app_env_backup_t cache_environment = {0};
+    app_env_backup_t root_environment = {0};
+    app_env_backup_t grace_environment = {0};
+    bool cache_backup_ok = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool root_backup_ok = app_env_backup_capture(&root_environment, "CBM_ALLOWED_ROOT");
+    bool grace_backup_ok = app_env_backup_capture(&grace_environment, "CBM_WATCHER_PRUNE_GRACE_S");
+    bool backups_ok = cache_backup_ok && root_backup_ok && grace_backup_ok;
+    bool env_ok = backups_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                  cbm_setenv("CBM_ALLOWED_ROOT", canonical_root, 1) == 0 &&
+                  cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1) == 0;
+    bool db_created = project && app_test_create_empty_file(db_path);
+
+    atomic_int refresh_count;
+    atomic_init(&refresh_count, 0);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_count, &refresh_count);
+    cbm_daemon_application_config_t config = {.watcher = watcher};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+
+    bool root_missing = root_created && canonical_root_ok && cbm_rmdir(root) == 0;
+    bool pending = false;
+    bool accepted_pending = env_ok && db_created && watcher && application &&
+                            cbm_daemon_application_restore_project_watch(
+                                application, project, canonical_root, &pending) &&
+                            pending && cbm_watcher_watch_count(watcher) == 0;
+
+    bool root_restored = accepted_pending && cbm_mkdir_p(root, 0755);
+    size_t restored = root_restored
+                          ? cbm_daemon_application_retry_pending_project_watches(application)
+                          : 0;
+    int first_poll = restored == 1 ? cbm_watcher_poll_once(watcher) : -1;
+    bool refreshed_after_restore = first_poll > 0 && atomic_load(&refresh_count) == 1 &&
+                                   cbm_watcher_watch_count(watcher) == 1;
+
+    bool root_missing_again = refreshed_after_restore && cbm_rmdir(root) == 0;
+    bool duplicate_pending = true;
+    bool still_watched = root_missing_again &&
+                         cbm_daemon_application_restore_project_watch(
+                             application, project, canonical_root, &duplicate_pending) &&
+                         !duplicate_pending && cbm_watcher_watch_count(watcher) == 1;
+    for (int miss = 0; still_watched && miss < 3; miss++) {
+        cbm_watcher_touch(watcher, project);
+        (void)cbm_watcher_poll_once(watcher);
+    }
+    bool pruned_without_session = still_watched && cbm_watcher_watch_count(watcher) == 0;
+
+    bool root_restored_again = pruned_without_session && cbm_mkdir_p(root, 0755);
+    size_t restored_again = root_restored_again
+                                ? cbm_daemon_application_retry_pending_project_watches(application)
+                                : 0;
+    int second_poll = restored_again == 1 ? cbm_watcher_poll_once(watcher) : -1;
+    bool refreshed_after_prune = second_poll > 0 && atomic_load(&refresh_count) == 2 &&
+                                 cbm_watcher_watch_count(watcher) == 1;
+
+    bool db_deleted = refreshed_after_prune && cbm_unlink(db_path) == 0;
+    if (application && project) {
+        cbm_daemon_application_project_deleted(application, project);
+    }
+    size_t restored_after_delete =
+        application ? cbm_daemon_application_retry_pending_project_watches(application) : 0;
+    bool deletion_stays_final = db_deleted && restored_after_delete == 0 &&
+                                cbm_watcher_watch_count(watcher) == 0;
+
+    bool stopped = !application ||
+                   cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    free(project);
+    if (db_path[0]) {
+        (void)cbm_unlink(db_path);
+    }
+    cbm_path_info_t root_info = {0};
+    bool root_clean = !root_created || cbm_path_info_utf8(root, &root_info) == CBM_PATH_INFO_ABSENT ||
+                      th_rmtree(root) == 0;
+    bool cache_clean = !cache_created || th_rmtree(cache) == 0;
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool root_restored_env = app_env_backup_restore(&root_environment);
+    bool grace_restored = app_env_backup_restore(&grace_environment);
+
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(db_created);
+    ASSERT_TRUE(canonical_root_ok);
+    ASSERT_TRUE(root_missing);
+    ASSERT_TRUE(accepted_pending);
+    ASSERT_TRUE(refreshed_after_restore);
+    ASSERT_TRUE(still_watched);
+    ASSERT_TRUE(pruned_without_session);
+    ASSERT_TRUE(refreshed_after_prune);
+    ASSERT_TRUE(deletion_stays_final);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(root_clean);
+    ASSERT_TRUE(cache_clean);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(root_restored_env);
+    ASSERT_TRUE(grace_restored);
     PASS();
 }
 
@@ -5889,4 +6013,5 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
     RUN_TEST(daemon_application_restore_watch_honors_auto_watch);
+    RUN_TEST(daemon_application_restores_daemon_watch_without_session);
 }

@@ -34,11 +34,8 @@ typedef struct cbm_watcher cbm_watcher_t;
  * of multiple Git repositories) */
 typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
 
-/* Optional daemon coordination for destructive stale-root pruning. begin is
- * non-blocking: a false result preserves the watch and retries on a later
- * poll. A successful begin is paired with end. pruned is called after the
- * physical watch and cached DB have been removed so the daemon can invalidate
- * its logical subscriptions. All callbacks use the same borrowed context. */
+/* daemon 用于协调 root 缺失后的物理 watcher 卸载。begin 非阻塞失败时保留 watcher 并重试；
+ * 成功 begin 必须配对 end。pruned 在物理 watcher 移除后调用，缓存数据库始终保留。 */
 typedef bool (*cbm_watcher_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_mutation_end_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_pruned_fn)(void *context, const char *project);

@@ -151,11 +151,11 @@ codebase-memory-mcp config set auto_index true
 
 When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
 
-Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
+Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to prevent session registration and startup restoration of cached project watchers. It does not stop the watcher subsystem or tear down every owner in an already-running daemon; restart the daemon to apply the setting to restored projects.
 
 When a watched project root is not Git-managed, the watcher discovers Git repositories below it using the indexer's directory exclusions, including `.gitignore` and `.cbmignore`. Each child repository (including linked worktrees) is checked for HEAD and working-tree changes, and changes are combined into one refresh of the original enclosing project. Repository discovery is repeated every minute; the first discovery of a repository also refreshes a potentially stale index. Ordinary files outside those repositories do not trigger refreshes. If no repositories are found, `watcher.repositories` logs `auto_refresh=disabled_no_git`; manual indexing remains available. Discovery errors preserve the previous repository set for retry.
 
-To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch` — which is consulted per session — `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered or restored, while `auto_index` and manual `index_repository` keep working. `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
 ### Keeping Up to Date
 

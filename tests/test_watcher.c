@@ -407,8 +407,7 @@ static void prune_guard_probe_pruned(void *context, const char *project) {
 }
 
 TEST(watcher_prunes_sustained_missing_root) {
-    /* Positive prune path. Grace window 0s isolates the streak-threshold
-     * logic; the time gate is guarded by watcher_grace_window_blocks_prune. */
+    /* 缺失 root 达到阈值后只解除 watcher，缓存数据库仍保留。 */
     prune_fixture_t f;
     if (!prune_fixture_setup(&f, "0")) {
         FAIL("prune fixture setup failed");
@@ -435,14 +434,13 @@ TEST(watcher_prunes_sustained_missing_root) {
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
     ASSERT_EQ(access(f.db_path, F_OK), 0);
 
-    /* Miss #3 with the grace window already satisfied: prune the watch
-     * entry and the cached DB files. */
+    /* 第三次缺失满足宽限条件后移除 watcher，但保留数据库及 sidecar。 */
     cbm_watcher_touch(w, "stale-project");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(cbm_watcher_watch_count(w), 0);
-    ASSERT_NEQ(access(f.db_path, F_OK), 0);
-    ASSERT_NEQ(access(f.wal_path, F_OK), 0);
-    ASSERT_NEQ(access(f.shm_path, F_OK), 0);
+    ASSERT_EQ(access(f.db_path, F_OK), 0);
+    ASSERT_EQ(access(f.wal_path, F_OK), 0);
+    ASSERT_EQ(access(f.shm_path, F_OK), 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -451,10 +449,7 @@ TEST(watcher_prunes_sustained_missing_root) {
 }
 
 TEST(watcher_prune_waits_for_daemon_project_mutation) {
-    /* The daemon application owns project-operation coordination. Supplying
-     * its watcher must route destructive stale-root pruning through that
-     * coordination boundary: a busy project is retained and retried after
-     * the active operation releases its lease, never unlinked directly. */
+    /* daemon application 协调 root watcher 移除；项目繁忙时保留并在操作结束后重试。 */
     prune_fixture_t f;
     if (!prune_fixture_setup(&f, "0")) {
         FAIL("prune fixture setup failed");
@@ -495,8 +490,8 @@ TEST(watcher_prune_waits_for_daemon_project_mutation) {
         cbm_watcher_touch(w, "stale-project");
         cbm_watcher_poll_once(w);
     }
-    bool pruned_after_release = cbm_watcher_watch_count(w) == 0 && access(f.db_path, F_OK) != 0 &&
-                                access(f.wal_path, F_OK) != 0 && access(f.shm_path, F_OK) != 0;
+    bool pruned_after_release = cbm_watcher_watch_count(w) == 0 && access(f.db_path, F_OK) == 0 &&
+                                access(f.wal_path, F_OK) == 0 && access(f.shm_path, F_OK) == 0;
 
     cbm_daemon_application_free(application);
     cbm_watcher_free(w);
@@ -533,7 +528,7 @@ TEST(watcher_prune_guard_denial_and_success_are_balanced) {
     probe.allow = true;
     cbm_watcher_touch(w, "stale-project");
     cbm_watcher_poll_once(w);
-    bool success_balanced = cbm_watcher_watch_count(w) == 0 && access(f.db_path, F_OK) != 0 &&
+    bool success_balanced = cbm_watcher_watch_count(w) == 0 && access(f.db_path, F_OK) == 0 &&
                             probe.begins == 2 && probe.ends == 1 && probe.pruned == 1;
 
     cbm_watcher_set_project_mutation_guard(w, NULL, NULL, NULL, NULL);
@@ -578,38 +573,6 @@ TEST(watcher_prune_restats_root_after_guard_acquisition) {
     ASSERT_TRUE(restored);
     ASSERT_TRUE(retained);
     ASSERT_TRUE(balanced);
-    PASS();
-}
-
-TEST(watcher_prune_delete_failure_retains_watch_for_retry) {
-    prune_fixture_t f;
-    if (!prune_fixture_setup(&f, "0")) {
-        FAIL("prune fixture setup failed");
-    }
-    cbm_store_t *store = cbm_store_open_memory();
-    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
-    cbm_watcher_watch(w, "stale-project", f.rootdir);
-    cbm_watcher_poll_once(w);
-    th_rmtree(f.rootdir);
-
-    /* A directory at the main DB path makes unlink fail deterministically on
-     * POSIX and Windows. The watcher must remain registered for a later retry
-     * and must not delete recoverable sidecars after that failure. */
-    bool failure_ready = cbm_unlink(f.db_path) == 0 && cbm_mkdir_p(f.db_path, 0755);
-    for (int miss = 0; failure_ready && miss < 3; miss++) {
-        cbm_watcher_touch(w, "stale-project");
-        cbm_watcher_poll_once(w);
-    }
-    bool watch_retained = cbm_watcher_watch_count(w) == 1;
-    bool artifacts_retained = access(f.db_path, F_OK) == 0 && access(f.wal_path, F_OK) == 0 &&
-                              access(f.shm_path, F_OK) == 0;
-
-    cbm_watcher_free(w);
-    cbm_store_close(store);
-    prune_fixture_teardown(&f);
-    ASSERT_TRUE(failure_ready);
-    ASSERT_TRUE(watch_retained);
-    ASSERT_TRUE(artifacts_retained);
     PASS();
 }
 
@@ -702,11 +665,11 @@ TEST(watcher_root_restore_resets_prune_streak) {
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
     ASSERT_EQ(access(f.db_path, F_OK), 0);
 
-    /* Miss #3 of the new streak → prune. */
+    /* 新一轮第三次缺失只解除 watcher，缓存数据库仍保留。 */
     cbm_watcher_touch(w, "stale-project");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(cbm_watcher_watch_count(w), 0);
-    ASSERT_NEQ(access(f.db_path, F_OK), 0);
+    ASSERT_EQ(access(f.db_path, F_OK), 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -1690,12 +1653,18 @@ TEST(watcher_scheduled_refresh_reindexes_clean_repository) {
     cbm_watcher_watch(watcher, "refresh-repo", tmpdir);
     index_call_count = 0;
 
-    /* 先建立停机前基线，再模拟停机期间产生一个 clean commit。 */
+    /* 第一代 daemon 建立基线后停止。 */
     ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+    cbm_watcher_free(watcher);
+
+    /* daemon 停机期间出现 clean commit；第二代从缓存恢复 watcher。 */
     th_write_file(wt_path(path, sizeof(path), tmpdir, "second.txt"), "second\n");
     wt_git(tmpdir, "add second.txt");
     wt_git(tmpdir, "commit -q -m second");
 
+    watcher = cbm_watcher_new(store, index_callback, NULL);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "refresh-repo", tmpdir));
     cbm_watcher_schedule_refresh(watcher, "refresh-repo");
     int reindexed = cbm_watcher_poll_once(watcher);
     ASSERT_EQ(reindexed, 1);
@@ -1715,9 +1684,9 @@ TEST(watcher_parent_and_independent_child_callbacks_are_isolated) {
     char parent[256];
     char child[256];
     snprintf(parent, sizeof(parent), "/tmp/cbm_watcher_parent_XXXXXX");
-    snprintf(child, sizeof(child), "/tmp/cbm_watcher_child_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(parent));
-    ASSERT_NOT_NULL(cbm_mkdtemp(child));
+    snprintf(child, sizeof(child), "%s/child", parent);
+    ASSERT_TRUE(cbm_mkdir_p(child, 0755));
     ASSERT_EQ(wt_git(parent, "init -q"), 0);
     ASSERT_EQ(wt_git(child, "init -q"), 0);
 
@@ -1751,8 +1720,8 @@ TEST(watcher_parent_and_independent_child_callbacks_are_isolated) {
 
     cbm_watcher_free(watcher);
     cbm_store_close(store);
-    th_rmtree(parent);
     th_rmtree(child);
+    th_rmtree(parent);
     PASS();
 }
 
@@ -2437,6 +2406,13 @@ static int nested_index_callback(const char *name, const char *path, void *ud) {
     return ctx->result;
 }
 
+static int nested_retry_log_hits = 0;
+static void nested_retry_log_sink(const char *line) {
+    if (line && strstr(line, "watcher.index.retry") != NULL) {
+        nested_retry_log_hits++;
+    }
+}
+
 TEST(watcher_nested_repos_share_outer_project) {
     char root[256] = "/tmp/cbm_watcher_nested_repos_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(root));
@@ -2581,22 +2557,48 @@ TEST(watcher_nested_retries_and_preserves_callback_edits) {
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
     ASSERT_EQ(ctx.calls, 2);
     ctx.result = 1; /* Busy has the same retry requirement as failure. */
+    nested_retry_log_hits = 0;
+    cbm_log_set_sink(nested_retry_log_sink);
     cbm_watcher_touch(w, "nested-project");
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
     ASSERT_EQ(ctx.calls, 3);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 4);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(nested_retry_log_hits, 1);
+
     ctx.result = 0;
     ctx.edit_path = file;
     cbm_watcher_touch(w, "nested-project");
     ASSERT_EQ(cbm_watcher_poll_once(w), 1);
-    ASSERT_EQ(ctx.calls, 4);
+    ASSERT_EQ(ctx.calls, 5);
 
     /* Success commits only the observed snapshot, not edits made by the callback. */
     cbm_watcher_touch(w, "nested-project");
     ASSERT_EQ(cbm_watcher_poll_once(w), 1);
-    ASSERT_EQ(ctx.calls, 5);
+    ASSERT_EQ(ctx.calls, 6);
+
+    ASSERT_EQ(th_append_file(file, "int after_index;\n"), 0);
+    ctx.result = 1;
+    nested_retry_log_hits = 0;
+    cbm_log_set_sink(nested_retry_log_sink);
     cbm_watcher_touch(w, "nested-project");
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
-    ASSERT_EQ(ctx.calls, 5);
+    ASSERT_EQ(ctx.calls, 7);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 8);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(nested_retry_log_hits, 1);
+
+    ctx.result = 0;
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.calls, 9);
+    cbm_watcher_touch(w, "nested-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.calls, 9);
     ASSERT_FALSE(ctx.wrong_target);
 
     cbm_watcher_free(w);
@@ -3968,7 +3970,6 @@ SUITE(watcher) {
     RUN_TEST(watcher_prune_waits_for_daemon_project_mutation);
     RUN_TEST(watcher_prune_guard_denial_and_success_are_balanced);
     RUN_TEST(watcher_prune_restats_root_after_guard_acquisition);
-    RUN_TEST(watcher_prune_delete_failure_retains_watch_for_retry);
     RUN_TEST(watcher_grace_window_blocks_prune);
     RUN_TEST(watcher_root_missing_errno_classification);
     RUN_TEST(watcher_root_restore_resets_prune_streak);

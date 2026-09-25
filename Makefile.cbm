@@ -1113,6 +1113,7 @@ test-tsan: $(BUILD_DIR)/test-runner-tsan
 # silently skipping an occupied one. Deterministic C tests cover Windows IPC.
 test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
 	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_watcher_restore.py $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Production binary ────────────────────────────────────────────
 

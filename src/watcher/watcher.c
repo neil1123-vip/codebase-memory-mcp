@@ -68,6 +68,7 @@ typedef struct project_state {
     atomic_bool refresh_pending; /* 启动恢复要求的一次强制刷新 */
     int missing_root_count;     /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms;  /* cbm_now_ms() of the streak's first miss (0 = no streak) */
+    int last_root_stat_errno;
     int file_count;             /* approximate, for interval calc */
     int interval_ms;            /* adaptive poll interval */
     atomic_int_fast64_t next_poll_ns; /* 单调时钟的下次轮询时间（纳秒） */
@@ -87,6 +88,7 @@ typedef struct project_state {
      * decays the retry cadence so "never lost" does not also mean "retried
      * forever". Reset to 0 by any successful reindex. */
     int index_failures;
+    bool index_retry_logged; /* 同一轮忙碌重试只记录一次，成功后复位。 */
     /* Hop from root_path up to the repository root ("" when they are the same),
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
@@ -148,12 +150,8 @@ struct cbm_watcher {
  * daemon log names the stuck project instead of only repeating the warning. */
 #define INDEX_FAIL_SUSTAINED 10
 
-/* Stale-root pruning (#286): a watched project whose root directory stays
- * missing is pruned — its cached DB is deleted and the watch entry removed.
- * Deletion is destructive (the DB can hold user-authored data such as the
- * ADR), so it requires BOTH a streak of consecutive missing polls AND a
- * sustained-absence grace window measured from the streak's first miss. */
-#define MISSING_ROOT_DELETE_AFTER 3
+/* 根目录持续不存在时只解除 watcher；缓存库可能含 ADR 等用户数据，必须保留。 */
+#define MISSING_ROOT_UNWATCH_AFTER 3
 #define PRUNE_GRACE_DEFAULT_S 600 /* 10 min; override: CBM_WATCHER_PRUNE_GRACE_S */
 
 /* Sleep chunk for responsive shutdown (ms) */
@@ -989,62 +987,6 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
-static bool watcher_unlink_cached_file(const char *project_name, const char *path,
-                                       const char *artifact) {
-    if (cbm_unlink(path) == 0 || errno == ENOENT) {
-        return true;
-    }
-    int unlink_errno = errno;
-    char errno_text[CBM_SZ_32];
-    snprintf(errno_text, sizeof(errno_text), "%d", unlink_errno);
-    cbm_log_warn("watcher.root_prune_delete_failed", "project", project_name, "artifact", artifact,
-                 "path", path, "errno", errno_text);
-    return false;
-}
-
-static bool delete_cached_project_db(const char *project_name) {
-    if (!cbm_validate_project_name(project_name)) {
-        return false;
-    }
-
-    const char *cache_dir = cbm_resolve_cache_dir();
-    if (!cache_dir) {
-        return false;
-    }
-
-    size_t cache_length = strlen(cache_dir);
-    size_t project_length = strlen(project_name);
-    if (cache_length > SIZE_MAX - project_length - sizeof("/.db")) {
-        return false;
-    }
-    size_t path_capacity = cache_length + project_length + sizeof("/.db");
-    char *path = malloc(path_capacity);
-    char *sidecar = malloc(path_capacity + sizeof("-wal"));
-    if (!path || !sidecar) {
-        free(path);
-        free(sidecar);
-        return false;
-    }
-    int written = snprintf(path, path_capacity, "%s/%s.db", cache_dir, project_name);
-    bool formatted = written > 0 && (size_t)written < path_capacity;
-    bool removed = formatted && watcher_unlink_cached_file(project_name, path, "database");
-    /* If the main DB could not be removed, preserve WAL/SHM: together they
-     * may be the only recoverable committed generation. */
-    if (removed) {
-        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-wal", path);
-        removed = written > 0 && (size_t)written < path_capacity + sizeof("-wal") &&
-                  watcher_unlink_cached_file(project_name, sidecar, "wal");
-    }
-    if (removed) {
-        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-shm", path);
-        removed = written > 0 && (size_t)written < path_capacity + sizeof("-wal") &&
-                  watcher_unlink_cached_file(project_name, sidecar, "shm");
-    }
-    free(path);
-    free(sidecar);
-    return removed;
-}
-
 /* Hash table foreach callback to free state entries */
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
@@ -1583,19 +1525,13 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     uint64_t now_ms = cbm_now_ms();
     bool still_eligible =
         current == s && strcmp(current->root_path, root_path) == 0 &&
-        current->missing_root_count >= MISSING_ROOT_DELETE_AFTER && current->first_missing_ms > 0 &&
+        current->missing_root_count >= MISSING_ROOT_UNWATCH_AFTER && current->first_missing_ms > 0 &&
         now_ms - current->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC &&
         root_status(root_path, &stat_errno) == ROOT_MISSING;
     if (still_eligible && defer_state_free(w, s)) {
-        if (delete_cached_project_db(project_name)) {
-            atomic_store_explicit(&s->registered, false, memory_order_release);
-            cbm_ht_delete(w->projects, project_name);
-            removed = true;
-        } else {
-            /* The state stays registered; undo the just-added deferred-free
-             * entry so the next poll can safely retry the failed deletion. */
-            w->pending_free[--w->pending_free_count] = NULL;
-        }
+        atomic_store_explicit(&s->registered, false, memory_order_release);
+        cbm_ht_delete(w->projects, project_name);
+        removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
 
@@ -1608,7 +1544,8 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     cbm_mutex_unlock(&w->coordination_lock);
 
     if (removed) {
-        cbm_log_info("watcher.root_pruned", "project", project_name);
+        cbm_log_info("watcher.root_unwatched", "project", project_name,
+                     "reason", "root_missing");
     }
     free(project_name);
     free(root_path);
@@ -1622,33 +1559,32 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
 
-    /* Stale-root pruning (#286): classify the root BEFORE the baseline /
-     * is_git / interval gates so vanished roots are noticed even for
-     * non-git projects and regardless of adaptive backoff. */
+    /* 先于基线、Git 类型和退避检查根目录，确保非 Git 项目也能及时解除失效 watcher。 */
     int stat_errno = 0;
     root_status_t rs = root_status(s->root_path, &stat_errno);
     if (rs == ROOT_UNCERTAIN) {
-        /* EACCES / EIO / network blip / TCC revocation — the root may still
-         * exist. Never count toward pruning; restart the streak so only an
-         * uninterrupted run of genuine ENOENT/ENOTDIR observations can
-         * delete user data. */
+        /* 权限、I/O 或挂载错误不能证明目录已删除；清空缺失计数，并按错误码抑制重复日志。 */
         if (s->missing_root_count > 0) {
             s->missing_root_count = 0;
             s->first_missing_ms = 0;
         }
-        cbm_log_warn("watcher.root_stat_error", "project", s->project_name, "path", s->root_path,
-                     "errno", itoa_buf(stat_errno));
+        if (s->last_root_stat_errno != stat_errno) {
+            cbm_log_warn("watcher.root_stat_error", "project", s->project_name, "path",
+                         s->root_path, "errno", itoa_buf(stat_errno));
+            s->last_root_stat_errno = stat_errno;
+        }
         return;
     }
+    s->last_root_stat_errno = 0;
     if (rs == ROOT_MISSING) {
         uint64_t now_ms = cbm_now_ms();
         if (s->missing_root_count == 0) {
             s->first_missing_ms = now_ms;
+            cbm_log_warn("watcher.root_missing", "project", s->project_name, "path",
+                         s->root_path, "polls", "1");
         }
         s->missing_root_count++;
-        cbm_log_warn("watcher.root_missing", "project", s->project_name, "path", s->root_path,
-                     "polls", itoa_buf(s->missing_root_count));
-        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER &&
+        if (s->missing_root_count >= MISSING_ROOT_UNWATCH_AFTER &&
             now_ms - s->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC) {
             prune_missing_project(ctx->w, s);
         }
@@ -1695,6 +1631,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
     if (!changed) {
+        s->index_retry_logged = false;
         atomic_store_explicit(&s->next_poll_ns,
                               ctx->now + ((int64_t)s->interval_ms * US_PER_MS),
                               memory_order_release);
@@ -1716,6 +1653,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
+            s->index_retry_logged = false;
             atomic_store_explicit(&s->refresh_pending, false, memory_order_release);
             /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
              * reindex just succeeded. A commit/edit landing during the
@@ -1739,8 +1677,12 @@ static void poll_project(const char *key, void *val, void *ud) {
             }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
-            cbm_log_info("watcher.index.retry", "project", s->project_name);
+            if (!s->index_retry_logged) {
+                cbm_log_info("watcher.index.retry", "project", s->project_name);
+                s->index_retry_logged = true;
+            }
         } else {
+            s->index_retry_logged = false;
             /* itoa_buf returns one shared per-thread buffer, so two of them
              * in one call would print the same value twice. */
             char rc_text[CBM_SZ_32];
