@@ -65,7 +65,8 @@ static const char *FAST_SKIP_DIRS[] = {
 /* ── Ignored suffixes ───────────────────────────────── */
 
 static const char *ALWAYS_IGNORED_SUFFIXES[] = {
-    ".tmp",    "~",        ".pyc",  ".pyo",   ".o",   ".a",   ".so",  ".dll",
+    ".tmp",    "~",       ".pyc",  ".pyo",  ".pkl", ".pickle",
+    ".o",      ".a",      ".so",   ".dll",
     ".class",  ".png",     ".jpg",  ".jpeg",  ".gif", ".ico", ".bmp", ".tiff",
     ".webp",   ".svg",     ".wasm", ".node",  ".exe", ".bin", ".dat", ".db",
     ".sqlite", ".sqlite3", ".woff", ".woff2", ".ttf", ".eot", ".otf", NULL};
