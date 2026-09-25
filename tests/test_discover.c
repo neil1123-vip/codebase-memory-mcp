@@ -196,6 +196,11 @@ TEST(suffix_tilde) {
     ASSERT_TRUE(cbm_has_ignored_suffix("file~", CBM_MODE_FULL));
     PASS();
 }
+TEST(suffix_pickle) {
+    ASSERT_TRUE(cbm_has_ignored_suffix("cache.pkl", CBM_MODE_FULL));
+    ASSERT_TRUE(cbm_has_ignored_suffix("cache.pickle", CBM_MODE_FULL));
+    PASS();
+}
 
 /* Not ignored */
 TEST(suffix_go) {
@@ -2163,6 +2168,7 @@ SUITE(discover) {
     RUN_TEST(suffix_sqlite);
     RUN_TEST(suffix_tmp);
     RUN_TEST(suffix_tilde);
+    RUN_TEST(suffix_pickle);
     RUN_TEST(suffix_go);
     RUN_TEST(suffix_py);
     RUN_TEST(suffix_c);
