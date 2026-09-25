@@ -107,6 +107,10 @@ struct cbm_daemon_application_watch {
     bool has_doc_candidates;
     bool doc_candidates;
     size_t subscribers;
+    bool daemon_owned;
+    cbm_daemon_application_job_t *refresh_job;
+    bool refresh_completed;
+    int refresh_result;
     cbm_daemon_application_watch_t *next;
 };
 
@@ -247,10 +251,14 @@ struct cbm_daemon_application {
 };
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
+static void application_watch_job_unsubscribe_job_locked(
+    cbm_daemon_application_t *application, cbm_daemon_application_job_t *job);
 static void application_watch_job_unsubscribe_session_locked(
     cbm_daemon_application_session_t *session, const cbm_daemon_application_watch_t *watch);
 static bool application_watch_job_subscribe_late_session_locked(
     cbm_daemon_application_session_t *session, cbm_daemon_application_watch_t *watch);
+static void application_promote_watch_locked(cbm_daemon_application_session_t *session,
+                                             const char *project, const char *root);
 static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], const char *kind);
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
@@ -513,6 +521,18 @@ static cbm_daemon_application_watch_t *application_find_watch_locked(
     return NULL;
 }
 
+static void application_watch_release_refresh_job_locked(cbm_daemon_application_watch_t *watch) {
+    cbm_daemon_application_job_t *job = watch ? watch->refresh_job : NULL;
+    if (!job) {
+        return;
+    }
+    watch->refresh_job = NULL;
+    if (job->watcher_waiters > 0) {
+        job->watcher_waiters--;
+    }
+    application_job_unsubscribe_locked(job);
+}
+
 static void application_remove_watch_entry_locked(cbm_daemon_application_t *application,
                                                   cbm_daemon_application_watch_t *watch,
                                                   bool unregister_physical_watch) {
@@ -524,6 +544,7 @@ static void application_remove_watch_entry_locked(cbm_daemon_application_t *appl
         return;
     }
     *cursor = watch->next;
+    application_watch_release_refresh_job_locked(watch);
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         application_watch_membership_t **membership = &session->watches;
@@ -573,9 +594,9 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
         cbm_free(CBM_MEM_CLASS_OTHER, membership);
         if (watch->subscribers > 0) {
             watch->subscribers--;
-            if (watch->subscribers == 0) {
-                application_remove_watch_locked(session->application, watch);
-            }
+        }
+        if (watch->subscribers == 0 && !watch->daemon_owned) {
+            application_remove_watch_locked(session->application, watch);
         }
     }
 }
@@ -594,6 +615,10 @@ static bool application_session_workspace_allowed(const cbm_daemon_application_s
                      root && root[0] ? boundary_error : "session root is unavailable");
     }
     return allowed;
+}
+
+static void application_mcp_project_deleted(void *context, const char *project) {
+    cbm_daemon_application_project_deleted((cbm_daemon_application_t *)context, project);
 }
 
 /* Caller holds application->mutex. */
@@ -851,6 +876,19 @@ static void application_refresh_watch(cbm_daemon_application_session_t *session)
     cbm_mutex_unlock(&session->application->mutex);
 }
 
+/* Successful indexes can keep their project watch after the owning session closes. */
+static void application_promote_watch_locked(cbm_daemon_application_session_t *session,
+                                             const char *project, const char *root) {
+    if (!session || !session->application || !project || !project[0] || !root || !root[0]) {
+        return;
+    }
+    cbm_daemon_application_watch_t *watch =
+        application_find_watch_locked(session->application, project);
+    if (watch && application_watch_root_matches(watch->root, root) &&
+        application_session_has_watch_locked(session, watch)) {
+        watch->daemon_owned = true;
+    }
+}
 static void application_job_free(cbm_daemon_application_job_t *job) {
     if (!job) {
         return;
@@ -1976,6 +2014,24 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         job->async_owned = false;
         application_job_unsubscribe_locked(job);
     }
+    /* daemon-owned watcher 的回调不等待下一次文件变化才释放 waiter，
+     * 否则 clean 项目在无后续变化时会阻塞 daemon 停止；结果暂存到下次回调消费。 */
+    for (cbm_daemon_application_watch_t *watch = application->watches; watch;
+         watch = watch->next) {
+        if (watch->refresh_job == job) {
+            watch->refresh_job = NULL;
+            watch->refresh_completed = true;
+            watch->refresh_result = job->successful
+                                        ? 0
+                                        : (job->cancelled ? 1 : -1);
+            if (job->watcher_waiters > 0) {
+                job->watcher_waiters--;
+            }
+            /* watcher 提交时暂借的普通 subscriber 也在终态释放，避免 shutdown 永久等待。 */
+            application_job_unsubscribe_locked(job);
+            break;
+        }
+    }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         if (session->auto_index_job != job || !session->auto_index_subscribed) {
@@ -1986,6 +2042,9 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         application_job_unsubscribe_locked(job);
         if (job->successful) {
             application_refresh_watch_locked(session);
+            application_promote_watch_locked(
+                session, cbm_mcp_server_session_project(session->mcp),
+                cbm_mcp_server_session_root(session->mcp));
         }
     }
     application_auto_index_retry_pending_locked(application);
@@ -2805,6 +2864,12 @@ static char *application_job_wait_for_session(cbm_daemon_application_session_t *
         }
         if (job->terminal) {
             char *response = job->response ? strdup(job->response) : NULL;
+            if (job->successful && !session->one_shot_request &&
+                session->background_eligible && !session->session_cancelled) {
+                application_register_watch_locked(session, job->project_key, job->root_path,
+                                                  job->args_json);
+                application_promote_watch_locked(session, job->project_key, job->root_path);
+            }
             session->active_job = NULL;
             session->active_job_subscribed = false;
             application_job_unsubscribe_locked(job);
@@ -3141,6 +3206,8 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
     cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
+    cbm_mcp_server_set_project_deleted_callback(session->mcp, application_mcp_project_deleted,
+                                                application);
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_index_status_provider(session->mcp, application_index_status, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
@@ -4270,20 +4337,59 @@ static cbm_daemon_application_job_t *application_background_index_admit(
     }
     cbm_daemon_application_watch_t *watch =
         require_live_watch ? application_find_watch_locked(application, project_name) : NULL;
-    bool watch_live =
-        !require_live_watch || (watch && watch->subscribers > 0 &&
-                                application_watch_root_matches(watch->root, canonical_root));
+    bool watch_root_matches =
+        watch && application_watch_root_matches(watch->root, canonical_root);
+    bool daemon_owned_watch = watch_root_matches && watch->daemon_owned;
+    bool session_watch_required = require_live_watch && !daemon_owned_watch;
+    bool watch_live = !require_live_watch ||
+                      (watch_root_matches && (daemon_owned_watch || watch->subscribers > 0));
     if (require_live_watch && watch_live) {
         application_watch_encode_index_args_locked(watch, document, root, args);
     }
     size_t watch_owner_count = 0;
     bool watch_subscriptions_ok = true;
-    cbm_daemon_application_job_t *job =
-        watch_live && *args
-            ? application_job_subscribe_locked(application, project_key, canonical_root, *args,
-                                               &subscribe_status)
-            : NULL;
-    if (job && require_live_watch) {
+    cbm_daemon_application_job_t *job = NULL;
+    if (require_live_watch && daemon_owned_watch && watch->refresh_completed) {
+        *no_job_result = watch->refresh_result;
+        watch->refresh_completed = false;
+        cbm_mutex_unlock(&application->mutex);
+        return NULL;
+    }
+    if (require_live_watch && daemon_owned_watch && watch->refresh_job) {
+        job = watch->refresh_job;
+        if (!job->terminal) {
+            *no_job_result = APPLICATION_BACKGROUND_INDEX_SKIPPED;
+            cbm_mutex_unlock(&application->mutex);
+            return NULL;
+        }
+        bool successful = job->successful;
+        bool cancelled = job->cancelled;
+        watch->refresh_job = NULL;
+        if (job->watcher_waiters > 0) {
+            job->watcher_waiters--;
+        }
+        application_job_unsubscribe_locked(job);
+        cbm_mutex_unlock(&application->mutex);
+        *no_job_result = successful ? APPLICATION_BACKGROUND_INDEX_SUCCESS
+                                    : (cancelled ? APPLICATION_BACKGROUND_INDEX_SKIPPED
+                                                 : APPLICATION_BACKGROUND_INDEX_FAILED);
+        application_jobs_reap_completed(application);
+        return NULL;
+    }
+    job = watch_live && *args
+              ? application_job_subscribe_locked(application, project_key, canonical_root, *args,
+                                                  &subscribe_status)
+              : NULL;
+    if (job && require_live_watch && daemon_owned_watch) {
+        watch->refresh_job = job;
+        watch->refresh_completed = false;
+        job->watcher_waiters++;
+        *no_job_result = APPLICATION_BACKGROUND_INDEX_SKIPPED;
+        job = NULL;
+        cbm_mutex_unlock(&application->mutex);
+        return NULL;
+    }
+    if (job && session_watch_required) {
         watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
             application, watch, job, &watch_owner_count);
         if (watch_subscriptions_ok && watch_owner_count > 0) {
@@ -4301,7 +4407,7 @@ static cbm_daemon_application_job_t *application_background_index_admit(
     }
     cbm_mutex_unlock(&application->mutex);
     if (!job) {
-        if (require_live_watch &&
+        if (session_watch_required &&
             (!watch_live || (watch_subscriptions_ok && watch_owner_count == 0))) {
             /* The physical watcher can retain a poll snapshot after the last
              * owning session unwatches it. Treat that stale callback as a
@@ -4407,6 +4513,83 @@ int cbm_daemon_application_index(cbm_daemon_application_t *application, const ch
 int cbm_daemon_application_watcher_index(const char *project_name, const char *root_path,
                                          void *context) {
     return application_background_index(context, project_name, root_path, true);
+}
+
+bool cbm_daemon_application_register_project_watch(cbm_daemon_application_t *application,
+                                                   const char *project_name, const char *root_path,
+                                                   bool refresh_after_registration) {
+    if (!application || !project_name || !project_name[0] || !root_path || !root_path[0] ||
+        !application->watcher ||
+        (application->config &&
+         !cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_WATCH, true))) {
+        return false;
+    }
+    char canonical_root[APPLICATION_PATH_CAP];
+    if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
+        !application_canonical_directory_exists(canonical_root)) {
+        return false;
+    }
+    char boundary_error[CBM_SZ_1K];
+    const char *configured_root = getenv("CBM_ALLOWED_ROOT");
+    if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), configured_root, boundary_error,
+                                    sizeof(boundary_error))) {
+        cbm_log_warn("daemon.watch.restore_skipped", "project", project_name, "detail",
+                     boundary_error);
+        return false;
+    }
+
+    bool registered = false;
+    cbm_mutex_lock(&application->mutex);
+    if (!application->stopping) {
+        cbm_daemon_application_watch_t *watch =
+            application_find_watch_locked(application, project_name);
+        if (watch) {
+            if (strcmp(watch->root, canonical_root) == 0) {
+                watch->daemon_owned = true;
+                registered = true;
+            }
+        } else {
+            watch = calloc(1, sizeof(*watch));
+            if (watch) {
+                watch->project = strdup(project_name);
+                watch->root = strdup(canonical_root);
+            }
+            if (watch && watch->project && watch->root &&
+                cbm_watcher_watch(application->watcher, project_name, canonical_root)) {
+                watch->daemon_owned = true;
+                watch->next = application->watches;
+                application->watches = watch;
+                registered = true;
+            } else if (watch) {
+                free(watch->project);
+                free(watch->root);
+                free(watch);
+            }
+        }
+    }
+    cbm_mutex_unlock(&application->mutex);
+    if (registered && refresh_after_registration) {
+        /* 物理 watcher 首次 baseline 只记录当前 HEAD，必须显式安排一次刷新。 */
+        cbm_watcher_schedule_refresh(application->watcher, project_name);
+    }
+    return registered;
+}
+
+void cbm_daemon_application_project_deleted(cbm_daemon_application_t *application,
+                                            const char *project_name) {
+    if (!application || !project_name || !project_name[0]) {
+        return;
+    }
+    cbm_mutex_lock(&application->mutex);
+    cbm_daemon_application_watch_t *watch =
+        application_find_watch_locked(application, project_name);
+    if (watch) {
+        application_remove_watch_locked(application, watch);
+    } else if (application->watcher) {
+        cbm_watcher_unwatch(application->watcher, project_name);
+    }
+    cbm_mutex_unlock(&application->mutex);
 }
 
 size_t cbm_daemon_application_active_jobs(cbm_daemon_application_t *application) {
