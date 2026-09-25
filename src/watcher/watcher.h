@@ -1,9 +1,9 @@
 /*
  * watcher.h — File change watcher for auto-reindexing.
  *
- * Polls indexed projects for git changes (HEAD movement or dirty working tree).
- * Non-git roots discover child repositories and coalesce their changes into
- * one refresh of the enclosing project. Files outside Git are not monitored.
+ * 轮询已索引项目的 Git 变化（HEAD 移动或工作区变更）。非 Git 根会发现子仓库，
+ * 为子仓库建立独立图谱和 watcher，同时在子仓库变化时刷新外层项目。
+ * Git 仓库之外的普通文件不触发监控。
  * Uses adaptive polling intervals based on project size
  * (5s base + 1s per 500 files, capped at 60s).
  *
@@ -39,6 +39,9 @@ typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, voi
 typedef bool (*cbm_watcher_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_mutation_end_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_pruned_fn)(void *context, const char *project);
+/* 发现新的子 Git 仓库时登记独立项目；返回 false 表示稍后重试。 */
+typedef bool (*cbm_watcher_repository_discovered_fn)(const char *enclosing_project,
+                                                     const char *repository_root, void *context);
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
@@ -58,6 +61,11 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
                                             cbm_watcher_project_mutation_begin_fn begin,
                                             cbm_watcher_project_mutation_end_fn end,
                                             cbm_watcher_project_pruned_fn pruned, void *context);
+
+/* 安装子仓库登记回调；daemon 在 watcher 开始轮询前设置。 */
+void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
+                                              cbm_watcher_repository_discovered_fn discovered,
+                                              void *context);
 
 /* ── Watch list management ──────────────────────────────────────── */
 

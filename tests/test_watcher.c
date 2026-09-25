@@ -2413,6 +2413,47 @@ static void nested_retry_log_sink(const char *line) {
     }
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    const char *outer_root;
+    const char *child_root;
+    int registration_attempts;
+    int outer_indexes;
+    int child_indexes;
+    bool wrong_target;
+} nested_registration_ctx_t;
+
+static int nested_registration_index(const char *name, const char *path, void *opaque) {
+    nested_registration_ctx_t *ctx = opaque;
+    if (strcmp(name, "outer-project") == 0 && strcmp(path, ctx->outer_root) == 0) {
+        ctx->outer_indexes++;
+    } else if (strcmp(name, "child-project") == 0 && strcmp(path, ctx->child_root) == 0) {
+        ctx->child_indexes++;
+    } else {
+        ctx->wrong_target = true;
+    }
+    return 0;
+}
+
+static bool nested_registration_discovered(const char *outer_project, const char *repository_root,
+                                           void *opaque) {
+    nested_registration_ctx_t *ctx = opaque;
+    ctx->registration_attempts++;
+    if (strcmp(outer_project, "outer-project") != 0 ||
+        strcmp(repository_root, ctx->child_root) != 0) {
+        ctx->wrong_target = true;
+        return false;
+    }
+    if (ctx->registration_attempts == 1) {
+        return false;
+    }
+    if (!cbm_watcher_watch(ctx->watcher, "child-project", repository_root)) {
+        return false;
+    }
+    cbm_watcher_schedule_refresh(ctx->watcher, "child-project");
+    return true;
+}
+
 TEST(watcher_nested_repos_share_outer_project) {
     char root[256] = "/tmp/cbm_watcher_nested_repos_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(root));
@@ -2527,6 +2568,50 @@ TEST(watcher_nested_repo_membership_and_worktree) {
     cbm_watcher_touch(w, "nested-project");
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
     ASSERT_EQ(ctx.calls, 5);
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
+TEST(watcher_registers_nested_repo_as_independent_project) {
+    char root[256] = "/tmp/cbm_watcher_nested_register_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char child[400], file[600];
+    wt_path(child, sizeof(child), root, "child");
+    ASSERT_EQ(wt_init_nested_repo(child), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_registration_ctx_t ctx = {.outer_root = root, .child_root = child};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_registration_index, &ctx);
+    ASSERT_NOT_NULL(w);
+    ctx.watcher = w;
+    cbm_watcher_set_repository_discovered_fn(w, nested_registration_discovered, &ctx);
+    ASSERT_TRUE(cbm_watcher_watch(w, "outer-project", root));
+
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_touch(w, "outer-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.registration_attempts, 1);
+    ASSERT_EQ(ctx.outer_indexes, 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+
+    cbm_watcher_touch(w, "outer-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ctx.registration_attempts, 2);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 2);
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(ctx.child_indexes, 1);
+
+    ASSERT_EQ(th_append_file(wt_path(file, sizeof(file), child, "file.c"), "int child_edit;\n"),
+              0);
+    cbm_watcher_touch(w, "outer-project");
+    cbm_watcher_touch(w, "child-project");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 2);
+    ASSERT_EQ(ctx.outer_indexes, 2);
+    ASSERT_EQ(ctx.child_indexes, 2);
     ASSERT_FALSE(ctx.wrong_target);
 
     cbm_watcher_free(w);
@@ -3997,6 +4082,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_non_git_skips);
     RUN_TEST(watcher_nested_repos_share_outer_project);
     RUN_TEST(watcher_nested_repo_membership_and_worktree);
+    RUN_TEST(watcher_registers_nested_repo_as_independent_project);
     RUN_TEST(watcher_nested_retries_and_preserves_callback_edits);
     RUN_TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes);
 

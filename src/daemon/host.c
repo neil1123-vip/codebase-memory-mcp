@@ -21,6 +21,7 @@
 #include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "ui/config.h"
@@ -313,6 +314,49 @@ static int host_watcher_index(const char *project_name, const char *root_path, v
     return host && host->application
                ? cbm_daemon_application_watcher_index(project_name, root_path, host->application)
                : -1;
+}
+
+static bool host_watcher_register_repository(const char *enclosing_project,
+                                             const char *repository_root, void *opaque) {
+    host_state_t *host = opaque;
+    if (!host || !host->application || !repository_root || !repository_root[0]) {
+        return false;
+    }
+    if (host->runtime_config &&
+        !cbm_config_get_bool(host->runtime_config, CBM_CONFIG_AUTO_WATCH, true)) {
+        return true;
+    }
+
+    char canonical_root[HOST_PATH_CAP];
+    if (!cbm_canonical_path(repository_root, canonical_root, sizeof(canonical_root))) {
+        return false;
+    }
+    int file_limit = host->runtime_config
+                         ? cbm_config_get_int(host->runtime_config, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                              CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT)
+                         : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
+    int file_count = -1;
+    if (!cbm_mcp_auto_index_within_file_limit(canonical_root, file_limit, &file_count)) {
+        if (file_count >= 0) {
+            cbm_log_info("watcher.repository.skipped", "project", enclosing_project,
+                         "path", canonical_root, "reason", "auto_index_limit");
+            return true;
+        }
+        return false;
+    }
+
+    char *project = cbm_project_name_from_path(canonical_root);
+    if (!project) {
+        return false;
+    }
+    bool registered = cbm_daemon_application_register_project_watch(
+        host->application, project, canonical_root, true);
+    if (registered) {
+        cbm_log_info("watcher.repository.registered", "parent", enclosing_project, "project",
+                     project, "path", canonical_root);
+    }
+    free(project);
+    return registered;
 }
 
 static bool host_cache_db_candidate(const char *name) {
@@ -782,6 +826,10 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
      * startup failure; an allocation failure while it is enabled still is. */
     if (watcher_enabled && (!host->watch_store || !host->watcher)) {
         return false;
+    }
+    if (host->watcher) {
+        cbm_watcher_set_repository_discovered_fn(host->watcher,
+                                                 host_watcher_register_repository, host);
     }
     /* auto_watch=false 时不恢复旧 watcher；恢复前仍校验根目录边界。 */
     host_restore_cached_watches(host);
