@@ -163,12 +163,9 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_hook_augme
     cbm_daemon_runtime_client_t *client, const char *input_json, uint8_t **response_out,
     uint32_t *response_length_out, uint32_t timeout_ms);
 
-/* Watcher callback: atomically validates project/root ownership and subscribes
- * the shared physical job to every exact live session watch. The callback is
- * only a result waiter, so disconnecting the final matching owner cancels the
- * job even while unrelated daemon sessions remain. Returns 0 on success,
- * positive when stale, cancelled, or busy (retry), and negative on a terminal
- * worker error. */
+/* watcher 回调会校验项目/root。daemon-owned 项目可在无 session 时直接进入共享 job；
+ * session-only 项目仍必须有精确匹配的 live owner。返回值：0 成功，正数表示可重试，
+ * 负数表示终止错误。 */
 int cbm_daemon_application_watcher_index(const char *project_name, const char *root_path,
                                          void *context);
 
@@ -176,6 +173,15 @@ int cbm_daemon_application_watcher_index(const char *project_name, const char *r
 bool cbm_daemon_application_register_project_watch(cbm_daemon_application_t *application,
                                                    const char *project_name, const char *root_path,
                                                    bool refresh_after_registration);
+
+/* 从缓存项目记录恢复 watcher；root 暂缺时保留内存中的待恢复意图。 */
+bool cbm_daemon_application_restore_project_watch(cbm_daemon_application_t *application,
+                                                  const char *project_name, const char *root_path,
+                                                  bool *pending_out);
+
+/* 重试待恢复项目。成功挂载的项目会安排一次后台强制刷新。 */
+size_t cbm_daemon_application_retry_pending_project_watches(
+    cbm_daemon_application_t *application);
 
 /* 项目删除后清理 application 与物理 watcher 中的项目状态。 */
 void cbm_daemon_application_project_deleted(cbm_daemon_application_t *application,
