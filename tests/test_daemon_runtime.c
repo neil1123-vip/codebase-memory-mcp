@@ -1516,6 +1516,8 @@ TEST(daemon_host_cache_db_candidate_filter) {
     ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("_config.db"));
     ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("_cross_repo.db"));
     ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("project.db-wal"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("project.db.corrupt"));
+    ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test("project.db.tmp"));
     ASSERT_FALSE(cbm_daemon_host_cache_db_candidate_for_test(NULL));
     PASS();
 }
@@ -1563,6 +1565,25 @@ TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
     if (corrupt) {
         fclose(corrupt);
     }
+    char empty_db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(empty_db_path, sizeof(empty_db_path), "%s/empty.db", cache);
+    cbm_store_t *empty_store = cbm_store_open_path(empty_db_path);
+    bool empty_db_ok = empty_store != NULL;
+    cbm_store_close(empty_store);
+    char multiple_db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(multiple_db_path, sizeof(multiple_db_path), "%s/multiple.db", cache);
+    cbm_store_t *multiple_store = cbm_store_open_path(multiple_db_path);
+    bool multiple_db_ok =
+        multiple_store &&
+        cbm_store_upsert_project(multiple_store, "multiple-first", root) == CBM_STORE_OK &&
+        cbm_store_upsert_project(multiple_store, "multiple-second", root) == CBM_STORE_OK;
+    cbm_store_close(multiple_store);
+    char backup_db_path[RUNTIME_TEST_PATH_CAP];
+    snprintf(backup_db_path, sizeof(backup_db_path), "%s/backup-copy.db", cache);
+    cbm_store_t *backup_store = cbm_store_open_path(backup_db_path);
+    bool backup_db_ok = backup_store &&
+                        cbm_store_upsert_project(backup_store, project, root) == CBM_STORE_OK;
+    cbm_store_close(backup_store);
     char missing_db_path[RUNTIME_TEST_PATH_CAP];
     snprintf(missing_db_path, sizeof(missing_db_path), "%s/missing-root.db", cache);
     cbm_store_t *missing_store = cbm_store_open_path(missing_db_path);
@@ -1622,6 +1643,9 @@ TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
     ASSERT_TRUE(outside_ok);
     ASSERT_TRUE(outside_db_ok);
     ASSERT_TRUE(corrupt_ok);
+    ASSERT_TRUE(empty_db_ok);
+    ASSERT_TRUE(multiple_db_ok);
+    ASSERT_TRUE(backup_db_ok);
     ASSERT_TRUE(auto_watch_disabled);
     ASSERT_TRUE(auto_watch_enabled);
     ASSERT_TRUE(watcher_disabled);

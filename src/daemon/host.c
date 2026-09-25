@@ -54,6 +54,7 @@ enum {
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
     HOST_WATCH_INTERVAL_MS = 5000,
+    HOST_WATCH_RESTORE_RETRY_MS = 60000,
     HOST_CONFLICT_LOG_CAP = 1024 * 1024,
     HOST_OPERATION_LOG_CAP = 5 * 1024 * 1024,
     HOST_PATH_CAP = 4096,
@@ -340,32 +341,48 @@ static void host_restore_cached_watches(host_state_t *host) {
     const char *cache = cbm_resolve_cache_dir();
     cbm_dir_t *directory = cache ? cbm_opendir(cache) : NULL;
     if (!directory) {
+        cbm_log_warn("watcher.restore.skipped", "reason", "cache_unavailable");
         return;
     }
-    int restored = 0;
+    size_t candidates = 0;
+    size_t restored = 0;
+    size_t skipped_path = 0;
+    size_t skipped_open = 0;
+    size_t skipped_integrity = 0;
+    size_t skipped_project = 0;
+    size_t skipped_name = 0;
+    size_t rejected = 0;
+    size_t pending = 0;
     cbm_dirent_t *entry = NULL;
     while ((entry = cbm_readdir(directory)) != NULL) {
         if (!host_cache_db_candidate(entry->name)) {
             continue;
         }
+        candidates++;
         char db_path[HOST_PATH_CAP];
         int written = snprintf(db_path, sizeof(db_path), "%s/%s", cache, entry->name);
         if (written <= 0 || (size_t)written >= sizeof(db_path)) {
+            skipped_path++;
             continue;
         }
         cbm_path_info_t info = {0};
         if (cbm_path_info_utf8(db_path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
             info.is_symlink) {
+            skipped_path++;
             continue;
         }
         cbm_store_t *store = cbm_store_open_path_query(db_path);
         if (!store) {
+            skipped_open++;
             continue;
         }
         cbm_project_t *projects = NULL;
         int count = 0;
-        if (cbm_store_check_integrity(store) &&
-            cbm_store_list_projects(store, &projects, &count) == CBM_STORE_OK) {
+        if (!cbm_store_check_integrity(store)) {
+            skipped_integrity++;
+        } else if (cbm_store_list_projects(store, &projects, &count) != CBM_STORE_OK) {
+            skipped_project++;
+        } else {
             cbm_project_t *primary_project = NULL;
             int primary_count = 0;
             for (int i = 0; i < count; i++) {
@@ -376,21 +393,48 @@ static void host_restore_cached_watches(host_state_t *host) {
                 primary_project = project;
                 primary_count++;
             }
-            if (primary_count == 1 && primary_project && primary_project->name &&
-                primary_project->name[0] && cbm_validate_project_name(primary_project->name) &&
-                primary_project->root_path && primary_project->root_path[0] &&
-                cbm_daemon_application_register_project_watch(
-                    host->application, primary_project->name, primary_project->root_path, true)) {
-                restored++;
+            size_t filename_project_length = strlen(entry->name) - 3;
+            bool project_name_matches_file =
+                primary_count == 1 && primary_project && primary_project->name &&
+                strlen(primary_project->name) == filename_project_length &&
+                memcmp(primary_project->name, entry->name, filename_project_length) == 0;
+            if (primary_count != 1 || !primary_project || !primary_project->name ||
+                !cbm_validate_project_name(primary_project->name) || !primary_project->root_path ||
+                !primary_project->root_path[0]) {
+                skipped_project++;
+            } else if (!project_name_matches_file) {
+                skipped_name++;
+            } else {
+                bool is_pending = false;
+                if (cbm_daemon_application_restore_project_watch(
+                        host->application, primary_project->name, primary_project->root_path,
+                        &is_pending)) {
+                    if (is_pending) {
+                        pending++;
+                    } else {
+                        restored++;
+                    }
+                } else {
+                    rejected++;
+                }
             }
         }
         cbm_store_free_projects(projects, count);
         cbm_store_close(store);
     }
     cbm_closedir(directory);
-    if (restored > 0) {
-        cbm_log_info("watcher.restore", "projects", "one_or_more");
-    }
+    char values[8][32];
+    (void)snprintf(values[0], sizeof(values[0]), "%zu", candidates);
+    (void)snprintf(values[1], sizeof(values[1]), "%zu", restored);
+    (void)snprintf(values[2], sizeof(values[2]), "%zu", skipped_path);
+    (void)snprintf(values[3], sizeof(values[3]), "%zu", skipped_open);
+    (void)snprintf(values[4], sizeof(values[4]), "%zu", skipped_integrity);
+    (void)snprintf(values[5], sizeof(values[5]), "%zu", skipped_project + skipped_name);
+    (void)snprintf(values[6], sizeof(values[6]), "%zu", rejected);
+    (void)snprintf(values[7], sizeof(values[7]), "%zu", pending);
+    cbm_log_info("watcher.restore.summary", "candidates", values[0], "restored", values[1],
+                 "invalid_path", values[2], "unreadable", values[3], "damaged", values[4],
+                 "invalid_project", values[5], "rejected", values[6], "pending_root", values[7]);
 }
 
 static int host_ui_index(void *opaque, const char *root_path, const char *project_name) {
@@ -997,6 +1041,7 @@ static bool host_background_start(host_state_t *host) {
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
                                    atomic_int *stop_requested, host_state_t *host, bool permanent) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
+    uint64_t next_watch_restore_ms = cbm_now_ms() + HOST_WATCH_RESTORE_RETRY_MS;
     uint64_t stopping_deadline = 0;
     for (;;) {
         cbm_daemon_runtime_service_state_t state = cbm_daemon_runtime_service_state(service);
@@ -1028,6 +1073,17 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
             cbm_log_info("daemon.lifetime_end", "reason",
                          stop ? "stop_requested" : "initial_window_expired");
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
+        }
+        uint64_t now = cbm_now_ms();
+        if (now >= next_watch_restore_ms) {
+            size_t restored =
+                cbm_daemon_application_retry_pending_project_watches(host->application);
+            next_watch_restore_ms = now + HOST_WATCH_RESTORE_RETRY_MS;
+            if (restored > 0) {
+                char restored_text[32];
+                (void)snprintf(restored_text, sizeof(restored_text), "%zu", restored);
+                cbm_log_info("watcher.restore.retry", "restored", restored_text);
+            }
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
         /* Retire an ephemeral generation that lingered for cold-storm cohort
