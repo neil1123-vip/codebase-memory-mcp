@@ -28,6 +28,14 @@ _Noreturn void cbm_daemon_host_force_terminate_for_test(const char *component);
  * verbatim so tests can make the runtime config database unavailable. */
 bool cbm_daemon_host_state_prepare_for_test(const struct cbm_daemon_ipc_endpoint *endpoint);
 
+/* 使用真实启动恢复路径准备 host，并返回恢复的物理 watcher 数量。 */
+bool cbm_daemon_host_state_prepare_watch_count_for_test(
+    const struct cbm_daemon_ipc_endpoint *endpoint, int *watch_count_out);
+
+#if defined(CBM_ENABLE_TEST_SEAMS)
+bool cbm_daemon_host_cache_db_candidate_for_test(const char *name);
+#endif
+
 typedef struct {
     size_t config_loads;
     size_t server_create_attempts;

@@ -139,6 +139,9 @@ typedef char *(*cbm_mcp_index_executor_fn)(void *context, const char *repo_path,
 typedef bool (*cbm_mcp_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_mcp_project_mutation_end_fn)(void *context, const char *project);
 
+/* 项目库删除或确认不存在后通知 daemon 清理项目所有权 watcher。 */
+typedef void (*cbm_mcp_project_deleted_fn)(void *context, const char *project);
+
 /* Nonblocking counterpart for opportunistic writes during a read request. A
  * successful call is released through the primary mutation guard's end hook. */
 typedef bool (*cbm_mcp_project_mutation_try_begin_fn)(void *context, const char *project);
@@ -194,6 +197,10 @@ void cbm_mcp_server_set_project_mutation_guard(cbm_mcp_server_t *srv,
  * configuration error rather than invoking the blocking begin callback. */
 void cbm_mcp_server_set_project_mutation_try_guard(cbm_mcp_server_t *srv,
                                                    cbm_mcp_project_mutation_try_begin_fn try_begin);
+
+void cbm_mcp_server_set_project_deleted_callback(cbm_mcp_server_t *srv,
+                                                 cbm_mcp_project_deleted_fn callback,
+                                                 void *context);
 
 /* Read one complete MCP message from in. Supports newline-delimited JSON and
  * Content-Length framing, including additional headers. Returns 1 on success,

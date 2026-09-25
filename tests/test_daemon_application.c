@@ -1466,6 +1466,8 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
 }
 
 static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected);
+static bool app_wait_for_atomic_int_at_least(atomic_int *value, int minimum);
+static bool app_wait_for_active_jobs(cbm_daemon_application_t *application, size_t expected);
 
 static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, int attempt,
                                           const char *max_files, const char *max_source_mb) {
@@ -1581,7 +1583,7 @@ static void app_fake_worker_destroy(void *opaque, cbm_daemon_application_worker_
     free(handle);
 }
 
-TEST(daemon_application_explicit_index_registers_and_releases_watch) {
+TEST(daemon_application_explicit_index_persists_watch_without_session) {
     static const char failed_response[] =
         "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"status\\\":\\\"error\\\"}\"}],"
         "\"isError\":true}";
@@ -1590,9 +1592,12 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
     char cache[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-explicit-watch-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-explicit-watch-cache-XXXXXX", cbm_tmpdir());
-    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool root_created = cbm_mkdtemp(root) != NULL;
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    bool dirs_ok = root_created && cache_created;
     (void)snprintf(child, sizeof(child), "%s/child", root);
     bool child_ok = dirs_ok && cbm_mkdir_p(child, 0755);
+    char *project = child_ok ? cbm_project_name_from_path(child) : NULL;
     const char *old_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool env_ok = (!old_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
@@ -1604,6 +1609,8 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
     atomic_store(&fake.scripted, true);
     fake.outcomes[0] = CBM_PROC_CLEAN;
     fake.responses[0] = failed_response;
+    fake.outcomes[2] = CBM_PROC_CLEAN;
+    fake.outcomes[3] = CBM_PROC_CLEAN;
     cbm_daemon_application_worker_ops_t worker_ops = {
         .context = &fake,
         .start = app_fake_worker_start,
@@ -1626,7 +1633,7 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
     uint32_t response_length = 0;
     char args[APP_TEST_PATH_CAP + 64];
     (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", child);
-    bool setup = child_ok && env_ok && session &&
+    bool setup = child_ok && project && env_ok && session &&
                  app_test_context_request(root, root, &context, &context_length) &&
                  app_test_tool_request("index_repository", args, &tool, &tool_length);
     bool requested =
@@ -1634,23 +1641,41 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
                                   &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     free(response);
     response = NULL;
-    requested = requested &&
-                app_test_request(&callbacks, session, tool, tool_length, &response,
-                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    requested =
+        requested && app_test_request(&callbacks, session, tool, tool_length, &response,
+                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool failed_without_watch = requested && response && strstr((char *)response, "isError") &&
                                 cbm_watcher_watch_count(watcher) == 0;
     free(response);
     response = NULL;
-    requested = requested &&
-                app_test_request(&callbacks, session, tool, tool_length, &response,
-                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    requested =
+        requested && app_test_request(&callbacks, session, tool, tool_length, &response,
+                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool registered = requested && response && strstr((char *)response, "indexed") &&
                       cbm_watcher_watch_count(watcher) == 1;
     if (session) {
         callbacks.session_close(callbacks.context, session);
     }
-    bool released = watcher && cbm_watcher_watch_count(watcher) == 0;
-    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    bool persisted = watcher && cbm_watcher_watch_count(watcher) == 1;
+    int watcher_index_status =
+        persisted ? cbm_daemon_application_watcher_index(project, child, application) : -99;
+    bool watcher_refresh_submitted = watcher_index_status == 1 &&
+                                     app_wait_for_atomic_int_at_least(&fake.starts, 3);
+    bool watcher_refresh_finished =
+        watcher_refresh_submitted && app_wait_for_active_jobs(application, 0);
+    int watcher_refresh_status = watcher_refresh_finished
+                                     ? cbm_daemon_application_watcher_index(project, child, application)
+                                     : -99;
+    int second_refresh_status = watcher_refresh_status == 0
+                                    ? cbm_daemon_application_watcher_index(project, child, application)
+                                    : -99;
+    bool second_refresh_finished =
+        second_refresh_status == 1 && app_wait_for_atomic_int_at_least(&fake.starts, 4) &&
+        app_wait_for_active_jobs(application, 0);
+    bool stopped = second_refresh_finished &&
+                   cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_project_deleted(application, project);
+    bool deleted = watcher && cbm_watcher_watch_count(watcher) == 0;
     cbm_daemon_application_free(application);
     if (watcher) {
         cbm_watcher_stop(watcher);
@@ -1660,6 +1685,7 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
     free(context);
     free(tool);
     free(response);
+    free(project);
     (void)cbm_rmdir(child);
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
@@ -1674,7 +1700,15 @@ TEST(daemon_application_explicit_index_registers_and_releases_watch) {
     ASSERT_TRUE(requested);
     ASSERT_TRUE(failed_without_watch);
     ASSERT_TRUE(registered);
-    ASSERT_TRUE(released);
+    ASSERT_TRUE(persisted);
+    ASSERT_EQ(watcher_index_status, 1);
+    ASSERT_TRUE(watcher_refresh_submitted);
+    ASSERT_TRUE(watcher_refresh_finished);
+    ASSERT_EQ(watcher_refresh_status, 0);
+    ASSERT_EQ(second_refresh_status, 1);
+    ASSERT_TRUE(second_refresh_finished);
+    ASSERT_EQ(atomic_load(&fake.starts), 4);
+    ASSERT_TRUE(deleted);
     ASSERT_TRUE(stopped);
     PASS();
 }
@@ -1955,6 +1989,70 @@ static bool app_env_backup_restore(app_env_backup_t *backup) {
     backup->value = NULL;
     backup->name = NULL;
     return status == 0;
+}
+
+TEST(daemon_application_restore_watch_honors_auto_watch) {
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-restore-root-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-restore-cache-XXXXXX", cbm_tmpdir());
+    bool root_created = cbm_mkdtemp(root) != NULL;
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    bool dirs_ok = root_created && cache_created;
+    char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
+    app_env_backup_t cache_environment;
+    app_env_backup_t root_environment;
+    bool cache_backup_ok = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool root_backup_ok = app_env_backup_capture(&root_environment, "CBM_ALLOWED_ROOT");
+    bool env_backups_ok = cache_backup_ok && root_backup_ok;
+    bool env_ok = env_backups_ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                  cbm_setenv("CBM_ALLOWED_ROOT", root, 1) == 0;
+    cbm_config_t *runtime_config = env_ok ? cbm_config_open(cache) : NULL;
+    bool config_ok =
+        runtime_config && cbm_config_set(runtime_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    cbm_daemon_application_config_t config = {.watcher = watcher, .config = runtime_config};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+
+    bool disabled =
+        config_ok && application && project &&
+        !cbm_daemon_application_register_project_watch(application, project, root, true) &&
+        cbm_watcher_watch_count(watcher) == 0;
+    bool enabled =
+        config_ok && cbm_config_set(runtime_config, CBM_CONFIG_AUTO_WATCH, "true") == 0 &&
+        cbm_daemon_application_register_project_watch(application, project, root, true) &&
+        cbm_watcher_watch_count(watcher) == 1;
+    if (application) {
+        cbm_daemon_application_project_deleted(application, project);
+    }
+    bool deleted = watcher && cbm_watcher_watch_count(watcher) == 0;
+
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    cbm_config_close(runtime_config);
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool root_restored = app_env_backup_restore(&root_environment);
+    free(project);
+    bool root_removed = !root_created || th_rmtree(root) == 0;
+    bool cache_removed = !cache_created || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(disabled);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(deleted);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(root_restored);
+    ASSERT_TRUE(root_removed);
+    ASSERT_TRUE(cache_removed);
+    PASS();
 }
 
 typedef struct {
@@ -5745,7 +5843,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
-    RUN_TEST(daemon_application_explicit_index_registers_and_releases_watch);
+    RUN_TEST(daemon_application_explicit_index_persists_watch_without_session);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
@@ -5790,4 +5888,5 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
+    RUN_TEST(daemon_application_restore_watch_honors_auto_watch);
 }

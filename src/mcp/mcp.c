@@ -1666,6 +1666,8 @@ struct cbm_mcp_server {
     cbm_mcp_project_mutation_try_begin_fn mutation_try_begin;
     cbm_mcp_project_mutation_end_fn mutation_end;
     void *mutation_context;
+    cbm_mcp_project_deleted_fn project_deleted;
+    void *project_deleted_context;
     cbm_mcp_quarantine_test_hook_fn quarantine_test_hook;
     void *quarantine_test_context;
     cbm_mcp_command_test_hook_fn command_test_hook;
@@ -1844,6 +1846,15 @@ void cbm_mcp_server_set_project_mutation_try_guard(
     cbm_mcp_server_t *srv, cbm_mcp_project_mutation_try_begin_fn try_begin) {
     if (srv && srv->mutation_begin) {
         srv->mutation_try_begin = try_begin;
+    }
+}
+
+void cbm_mcp_server_set_project_deleted_callback(cbm_mcp_server_t *srv,
+                                                 cbm_mcp_project_deleted_fn callback,
+                                                 void *context) {
+    if (srv) {
+        srv->project_deleted = callback;
+        srv->project_deleted_context = callback ? context : NULL;
     }
 }
 
@@ -6866,6 +6877,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
+    bool project_removed = !exists;
 
     if (exists) {
         int rc = cbm_unlink(path);
@@ -6873,6 +6885,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         (void)cbm_unlink(shm);
         if (rc == 0) {
             status = "deleted";
+            project_removed = true;
         } else {
             status = "delete_failed";
             error_detail = strerror(errno);
@@ -6884,8 +6897,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_unlock();
 
-    if (srv->watcher) {
-        cbm_watcher_unwatch(srv->watcher, name);
+    if (project_removed) {
+        if (srv->project_deleted) {
+            srv->project_deleted(srv->project_deleted_context, name);
+        } else if (srv->watcher) {
+            cbm_watcher_unwatch(srv->watcher, name);
+        }
     }
 
     cbm_mem_collect(); /* return freed pages to OS after closing database */

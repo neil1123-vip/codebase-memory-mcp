@@ -263,6 +263,27 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+typedef struct {
+    int parent_calls;
+    int child_calls;
+} watcher_project_probe_t;
+
+static int watcher_project_probe_callback(const char *name, const char *path, void *ud) {
+    watcher_project_probe_t *probe = ud;
+    (void)path;
+    if (!probe || !name) {
+        return -1;
+    }
+    if (strcmp(name, "parent-project") == 0) {
+        probe->parent_calls++;
+    } else if (strcmp(name, "child-project") == 0) {
+        probe->child_calls++;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
 TEST(watcher_poll_no_projects) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1646,6 +1667,92 @@ TEST(watcher_no_change_no_reindex) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_scheduled_refresh_reindexes_clean_repository) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_refresh_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    char path[300];
+    th_write_file(wt_path(path, sizeof(path), tmpdir, "file.txt"), "hello\n");
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(watcher, "refresh-repo", tmpdir);
+    index_call_count = 0;
+
+    /* 先建立停机前基线，再模拟停机期间产生一个 clean commit。 */
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+    th_write_file(wt_path(path, sizeof(path), tmpdir, "second.txt"), "second\n");
+    wt_git(tmpdir, "add second.txt");
+    wt_git(tmpdir, "commit -q -m second");
+
+    cbm_watcher_schedule_refresh(watcher, "refresh-repo");
+    int reindexed = cbm_watcher_poll_once(watcher);
+    ASSERT_EQ(reindexed, 1);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(watcher, "refresh-repo");
+    (void)cbm_watcher_poll_once(watcher);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_parent_and_independent_child_callbacks_are_isolated) {
+    char parent[256];
+    char child[256];
+    snprintf(parent, sizeof(parent), "/tmp/cbm_watcher_parent_XXXXXX");
+    snprintf(child, sizeof(child), "/tmp/cbm_watcher_child_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(parent));
+    ASSERT_NOT_NULL(cbm_mkdtemp(child));
+    ASSERT_EQ(wt_git(parent, "init -q"), 0);
+    ASSERT_EQ(wt_git(child, "init -q"), 0);
+
+    char path[300];
+    th_write_file(wt_path(path, sizeof(path), parent, "parent.txt"), "parent\n");
+    ASSERT_EQ(wt_git(parent, "add parent.txt"), 0);
+    ASSERT_EQ(wt_git(parent, "commit -q -m parent"), 0);
+    th_write_file(wt_path(path, sizeof(path), child, "child.txt"), "child\n");
+    ASSERT_EQ(wt_git(child, "add child.txt"), 0);
+    ASSERT_EQ(wt_git(child, "commit -q -m child"), 0);
+
+    watcher_project_probe_t probe = {0};
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, watcher_project_probe_callback, &probe);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "parent-project", parent));
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "child-project", child));
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+
+    th_append_file(wt_path(path, sizeof(path), parent, "parent.txt"), "change\n");
+    cbm_watcher_touch(watcher, "parent-project");
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
+    ASSERT_EQ(probe.parent_calls, 1);
+    ASSERT_EQ(probe.child_calls, 0);
+
+    th_append_file(wt_path(path, sizeof(path), child, "child.txt"), "change\n");
+    cbm_watcher_touch(watcher, "child-project");
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
+    ASSERT_EQ(probe.parent_calls, 1);
+    ASSERT_EQ(probe.child_calls, 1);
+
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(parent);
+    th_rmtree(child);
     PASS();
 }
 
@@ -3878,6 +3985,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_identical_watch_preserves_dirty_baseline);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
+    RUN_TEST(watcher_scheduled_refresh_reindexes_clean_repository);
+    RUN_TEST(watcher_parent_and_independent_child_callbacks_are_isolated);
     RUN_TEST(watcher_own_artifact_export_does_not_retrigger_issue1953);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
     RUN_TEST(watcher_failed_reindex_retries_issue937);

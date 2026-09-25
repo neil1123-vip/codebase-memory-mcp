@@ -172,6 +172,15 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_hook_augme
 int cbm_daemon_application_watcher_index(const char *project_name, const char *root_path,
                                          void *context);
 
+/* 注册 daemon 持有的 watcher；启动恢复传 true，刚完成索引时传 false。 */
+bool cbm_daemon_application_register_project_watch(cbm_daemon_application_t *application,
+                                                   const char *project_name, const char *root_path,
+                                                   bool refresh_after_registration);
+
+/* 项目删除后清理 application 与物理 watcher 中的项目状态。 */
+void cbm_daemon_application_project_deleted(cbm_daemon_application_t *application,
+                                            const char *project_name);
+
 /* Shared daemon/UI entry point for a default full index operation. */
 int cbm_daemon_application_index(cbm_daemon_application_t *application, const char *project_name,
                                  const char *root_path);

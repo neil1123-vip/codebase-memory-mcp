@@ -864,6 +864,22 @@ static bool ui_adr_equals(const ui_delete_fixture_t *fx, const char *project,
     return equal;
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    const char *db_path;
+    int calls;
+    bool database_deleted;
+    char project[256];
+} ui_delete_callback_ctx_t;
+
+static void ui_delete_project_callback(void *opaque, const char *project) {
+    ui_delete_callback_ctx_t *ctx = opaque;
+    ctx->calls++;
+    (void)snprintf(ctx->project, sizeof(ctx->project), "%s", project);
+    ctx->database_deleted = !cbm_file_exists(ctx->db_path);
+    cbm_watcher_unwatch(ctx->watcher, project);
+}
+
 TEST(ui_server_readiness_proof_is_exact_and_generation_bound) {
     static const char challenge[] =
         "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
@@ -1440,6 +1456,11 @@ TEST(ui_server_delete_project_unwatches_after_delete) {
 
     th_server_t ts;
     ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    ui_delete_callback_ctx_t callback = {.watcher = fx.watcher};
+    char callback_db[1024];
+    ui_delete_db_path(&fx, "ui-delete-watch", callback_db, sizeof(callback_db));
+    callback.db_path = callback_db;
+    cbm_http_server_set_project_deleted_callback(ts.srv, ui_delete_project_callback, &callback);
     char resp[4096];
     int n = ui_delete_request(&ts, "/api/project?name=ui-delete-watch", resp, sizeof(resp));
     ASSERT_GT(n, 0);
@@ -1453,6 +1474,9 @@ TEST(ui_server_delete_project_unwatches_after_delete) {
     ASSERT_FALSE(cbm_file_exists(db));
     ASSERT_FALSE(cbm_file_exists(wal));
     ASSERT_FALSE(cbm_file_exists(shm));
+    ASSERT_EQ(callback.calls, 1);
+    ASSERT_STR_EQ(callback.project, "ui-delete-watch");
+    ASSERT_TRUE(callback.database_deleted);
     ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
 
     th_server_stop(&ts);

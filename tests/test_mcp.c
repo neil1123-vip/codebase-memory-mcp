@@ -7937,6 +7937,74 @@ TEST(tool_delete_project_not_found) {
     PASS();
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    int calls;
+    char project[CBM_SZ_256];
+} mcp_project_deleted_probe_t;
+
+static void mcp_project_deleted_probe(void *opaque, const char *project) {
+    mcp_project_deleted_probe_t *probe = opaque;
+    if (!probe) {
+        return;
+    }
+    probe->calls++;
+    snprintf(probe->project, sizeof(probe->project), "%s", project ? project : "");
+    if (probe->watcher) {
+        cbm_watcher_unwatch(probe->watcher, project);
+    }
+}
+
+TEST(tool_delete_project_notifies_daemon_watch_lifecycle) {
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-delete-watch-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_TRUE(!saved_cache || saved_cache_copy);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    const char *project = "delete-watch-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, cache), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    cbm_store_t *watch_store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(watch_store, NULL, NULL);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, project, cache));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_watcher(srv, watcher);
+    mcp_project_deleted_probe_t probe = {.watcher = watcher};
+    cbm_mcp_server_set_project_deleted_callback(srv, mcp_project_deleted_probe, &probe);
+
+    char *response = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"delete-watch-project\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "deleted"));
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_STR_EQ(probe.project, project);
+    ASSERT_EQ(cbm_watcher_watch_count(watcher), 0);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    cbm_watcher_stop(watcher);
+    cbm_watcher_free(watcher);
+    cbm_store_close(watch_store);
+    cbm_rmdir(cache);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
+    PASS();
+}
+
 TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
     char cache[256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-guard-XXXXXX");
@@ -20587,6 +20655,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
+    RUN_TEST(tool_delete_project_notifies_daemon_watch_lifecycle);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);

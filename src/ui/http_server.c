@@ -188,6 +188,8 @@ struct cbm_http_server {
     cbm_http_project_mutation_begin_fn mutation_begin;
     cbm_http_project_mutation_end_fn mutation_end;
     void *mutation_context;
+    cbm_http_project_deleted_fn project_deleted;
+    void *project_deleted_context;
     index_job_t index_jobs[MAX_INDEX_JOBS];
     atomic_int stop_flag;
     atomic_int run_state;
@@ -1284,7 +1286,9 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
 }
 
 static void unwatch_project(cbm_http_server_t *srv, const char *name) {
-    if (srv && srv->watcher) {
+    if (srv && srv->project_deleted) {
+        srv->project_deleted(srv->project_deleted_context, name);
+    } else if (srv && srv->watcher) {
         cbm_watcher_unwatch(srv->watcher, name);
     }
 }
@@ -2227,6 +2231,19 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
     if (srv) {
         srv->watcher = watcher;
+        /* HTTP API 与 /rpc 共用同一份 watcher 生命周期。 */
+        cbm_mcp_server_set_watcher(srv->mcp, watcher);
+    }
+}
+
+void cbm_http_server_set_project_deleted_callback(cbm_http_server_t *srv,
+                                                  cbm_http_project_deleted_fn callback,
+                                                  void *context) {
+    if (srv) {
+        srv->project_deleted = callback;
+        srv->project_deleted_context = callback ? context : NULL;
+        /* /rpc 的 delete_project 必须通知 daemon，而不是只清理 HTTP API 状态。 */
+        cbm_mcp_server_set_project_deleted_callback(srv->mcp, callback, callback ? context : NULL);
     }
 }
 
