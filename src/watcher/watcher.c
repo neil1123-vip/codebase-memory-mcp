@@ -1,10 +1,11 @@
 /*
  * watcher.c — Git-based file change watcher.
  *
- * Strategy: git status + HEAD tracking (the most reliable approach).
- * Non-git roots discover child Git repositories. With the opt-in
+ * 策略：通过 git status 和 HEAD 检查变化。非 Git 项目根会发现子仓库，为每个
+ * 子仓库建立独立图谱和 watcher；子仓库变更也会刷新外层项目。
+ * Git 仓库之外的普通文件默认不触发监控。With the opt-in
  * cbm_watcher_set_poll_non_git(w, true) (config key `watch_non_git`, #1948)
- * they are polled with a tree signature instead: the indexer's own discovery
+ * they are also polled with a tree signature: the indexer's own discovery
  * walk (same ignore rules), folded over (relative path, size, mtime).
  *
  *
@@ -36,7 +37,6 @@
 #include "foundation/subprocess.h"
 #include "discover/discover.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
-#include "discover/discover.h" /* cbm_discover: the non-git tree signature (#1948) */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -103,22 +103,23 @@ typedef struct project_state {
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
     char repo_cdup[CBM_SZ_4K];
+    /* 子仓库探测复用外层项目的取消/进程槽；独立 watcher 由发现回调登记。 */
+    struct project_state *owner;
+    struct project_state **repositories;
+    int repository_count;
+    bool repositories_discovered;
+    bool repositories_changed;
+    bool independent_watch_pending;
+    bool independent_watch_retry_logged;
+    bool pending_valid;
+    int64_t next_discovery_ns;
+    atomic_bool rediscover;
     /* Published status for cbm_watcher_project_info (#2167). The poll path
      * writes these while index_status reads them from a session thread, so
      * they are atomics: the diagnostic read is never a data race. */
     atomic_int status_strategy;         /* cbm_watcher_strategy_t */
     atomic_int status_interval_ms;      /* mirrors interval_ms */
     _Atomic int64_t status_last_scan_s; /* wall-clock seconds; 0 = none yet */
-    /* Child probes borrow the enclosing project's cancellation/process slot.
-     * They never register independent watches or index separate projects. */
-    struct project_state *owner;
-    struct project_state **repositories;
-    int repository_count;
-    bool repositories_discovered;
-    bool repositories_changed;
-    bool pending_valid;
-    int64_t next_discovery_ns;
-    atomic_bool rediscover;
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -136,10 +137,12 @@ struct cbm_watcher {
     cbm_watcher_project_mutation_end_fn mutation_end;
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
+    cbm_watcher_repository_discovered_fn repository_discovered;
+    void *repository_context;
     atomic_int stopped;
     atomic_bool running;
-    /* Opt-in (#1948): poll non-git roots by tree signature. Default false —
-     * non-git roots are not watched. Read at each project's baseline. */
+    /* Opt-in (#1948): poll ordinary non-git files by tree signature. Default
+     * false; child Git repositories are still watched. Read at baseline. */
     atomic_bool poll_non_git;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
@@ -1143,6 +1146,18 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
     cbm_mutex_unlock(&w->coordination_lock);
 }
 
+void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
+                                              cbm_watcher_repository_discovered_fn discovered,
+                                              void *context) {
+    if (!w) {
+        return;
+    }
+    cbm_mutex_lock(&w->coordination_lock);
+    w->repository_discovered = discovered;
+    w->repository_context = discovered ? context : NULL;
+    cbm_mutex_unlock(&w->coordination_lock);
+}
+
 /* ── Watch list management ──────────────────────────────────────── */
 
 bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
@@ -1251,6 +1266,20 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_lock);
 }
 
+void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        /* 首次 poll 先建立基线，再执行一次强制刷新，避免 clean commit 被基线吞掉。 */
+        atomic_store_explicit(&s->refresh_pending, true, memory_order_release);
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+}
+
 cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
                                                         const char *project_name) {
     cbm_watcher_project_status_t status = {0};
@@ -1264,20 +1293,6 @@ cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
                      !atomic_load_explicit(&w->stopped, memory_order_acquire);
     cbm_mutex_unlock(&w->projects_lock);
     return status;
-}
-
-void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name) {
-    if (!w || !project_name) {
-        return;
-    }
-    cbm_mutex_lock(&w->projects_lock);
-    project_state_t *s = cbm_ht_get(w->projects, project_name);
-    if (s) {
-        /* 首次 poll 先建立基线，再执行一次强制刷新，避免 clean commit 被基线吞掉。 */
-        atomic_store_explicit(&s->refresh_pending, true, memory_order_release);
-        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
-    }
-    cbm_mutex_unlock(&w->projects_lock);
 }
 
 int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) {
@@ -1572,6 +1587,7 @@ static bool refresh_repositories(cbm_watcher_t *w, project_state_t *s) {
                 state_free(repository);
                 continue;
             }
+            repository->independent_watch_pending = true;
             changed = true;
         }
         next[next_count++] = repository;
@@ -1608,6 +1624,26 @@ static bool refresh_repositories(cbm_watcher_t *w, project_state_t *s) {
     s->repositories_changed |= changed;
     s->file_count = file_count;
     s->interval_ms = cbm_watcher_poll_interval_ms(file_count);
+    for (int i = 0; i < s->repository_count; i++) {
+        project_state_t *repository = s->repositories[i];
+        if (!repository->owner || !repository->independent_watch_pending) {
+            continue;
+        }
+        cbm_mutex_lock(&w->coordination_lock);
+        cbm_watcher_repository_discovered_fn discovered = w->repository_discovered;
+        void *context = w->repository_context;
+        bool registered = discovered &&
+                          discovered(s->project_name, repository->root_path, context);
+        cbm_mutex_unlock(&w->coordination_lock);
+        if (registered) {
+            repository->independent_watch_pending = false;
+            repository->independent_watch_retry_logged = false;
+        } else if (discovered && !repository->independent_watch_retry_logged) {
+            cbm_log_warn("watcher.repository.register_failed", "project", s->project_name,
+                         "path", repository->root_path, "action", "retry");
+            repository->independent_watch_retry_logged = true;
+        }
+    }
     if (!s->repositories_discovered || changed) {
         cbm_log_info("watcher.repositories", "project", s->project_name, "count",
                      itoa_buf(next_count), "auto_refresh",
@@ -1740,10 +1776,7 @@ static void commit_baselines(cbm_watcher_t *w, project_state_t *s) {
         s->repositories_changed = false;
         return;
     }
-    if (s->pending_head[0] != '\0') {
-        snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
-    }
-    s->last_dirty_sig = s->pending_dirty_sig;
+    commit_git_baseline(s);
     /* Refresh file count for interval */
     int file_count = 0;
     if (git_file_count(w, s, &file_count) == WATCHER_GIT_OK) {
