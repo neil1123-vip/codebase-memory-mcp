@@ -1,9 +1,9 @@
 /*
  * watcher.c — Git-based file change watcher.
  *
- * Strategy: git status + HEAD tracking (the most reliable approach).
- * Non-git project roots discover Git repositories below them. Their changes
- * refresh the enclosing project; ordinary files outside Git are not watched.
+ * 策略：通过 git status 和 HEAD 检查变化。非 Git 项目根会发现子仓库，为每个
+ * 子仓库建立独立图谱和 watcher；子仓库变更也会刷新外层项目。
+ * Git 仓库之外的普通文件不触发监控。
  *
  *
  * Per-project state tracks:
@@ -93,13 +93,14 @@ typedef struct project_state {
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
     char repo_cdup[CBM_SZ_4K];
-    /* Child probes borrow the enclosing project's cancellation/process slot.
-     * They never register independent watches or index separate projects. */
+    /* 子仓库探测复用外层项目的取消/进程槽；独立 watcher 由发现回调登记。 */
     struct project_state *owner;
     struct project_state **repositories;
     int repository_count;
     bool repositories_discovered;
     bool repositories_changed;
+    bool independent_watch_pending;
+    bool independent_watch_retry_logged;
     bool pending_valid;
     int64_t next_discovery_ns;
     atomic_bool rediscover;
@@ -120,6 +121,8 @@ struct cbm_watcher {
     cbm_watcher_project_mutation_end_fn mutation_end;
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
+    cbm_watcher_repository_discovered_fn repository_discovered;
+    void *repository_context;
     atomic_int stopped;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
@@ -1053,6 +1056,18 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
     cbm_mutex_unlock(&w->coordination_lock);
 }
 
+void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
+                                              cbm_watcher_repository_discovered_fn discovered,
+                                              void *context) {
+    if (!w) {
+        return;
+    }
+    cbm_mutex_lock(&w->coordination_lock);
+    w->repository_discovered = discovered;
+    w->repository_context = discovered ? context : NULL;
+    cbm_mutex_unlock(&w->coordination_lock);
+}
+
 /* ── Watch list management ──────────────────────────────────────── */
 
 bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
@@ -1401,6 +1416,7 @@ static bool refresh_repositories(cbm_watcher_t *w, project_state_t *s) {
                 state_free(repository);
                 continue;
             }
+            repository->independent_watch_pending = true;
             changed = true;
         }
         next[next_count++] = repository;
@@ -1437,6 +1453,26 @@ static bool refresh_repositories(cbm_watcher_t *w, project_state_t *s) {
     s->repositories_changed |= changed;
     s->file_count = file_count;
     s->interval_ms = cbm_watcher_poll_interval_ms(file_count);
+    for (int i = 0; i < s->repository_count; i++) {
+        project_state_t *repository = s->repositories[i];
+        if (!repository->owner || !repository->independent_watch_pending) {
+            continue;
+        }
+        cbm_mutex_lock(&w->coordination_lock);
+        cbm_watcher_repository_discovered_fn discovered = w->repository_discovered;
+        void *context = w->repository_context;
+        bool registered = discovered &&
+                          discovered(s->project_name, repository->root_path, context);
+        cbm_mutex_unlock(&w->coordination_lock);
+        if (registered) {
+            repository->independent_watch_pending = false;
+            repository->independent_watch_retry_logged = false;
+        } else if (discovered && !repository->independent_watch_retry_logged) {
+            cbm_log_warn("watcher.repository.register_failed", "project", s->project_name,
+                         "path", repository->root_path, "action", "retry");
+            repository->independent_watch_retry_logged = true;
+        }
+    }
     if (!s->repositories_discovered || changed) {
         cbm_log_info("watcher.repositories", "project", s->project_name, "count",
                      itoa_buf(next_count), "auto_refresh",
