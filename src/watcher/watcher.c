@@ -69,11 +69,12 @@ typedef struct project_state {
     bool is_git;                /* false → discover child Git repositories */
     bool tree_poll;             /* non-git root polled by tree signature (#1948) */
     bool baseline_done;         /* true after first poll */
+    atomic_bool refresh_pending; /* 启动恢复要求的一次强制刷新 */
     int missing_root_count;     /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms;  /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;             /* approximate, for interval calc */
     int interval_ms;            /* adaptive poll interval */
-    int64_t next_poll_ns;       /* next poll time (monotonic ns) */
+    atomic_int_fast64_t next_poll_ns; /* 单调时钟的下次轮询时间（纳秒） */
     /* Dirty-state signature (#937): a persistently dirty worktree must
      * reindex once per DISTINCT dirty state, not on every poll. Baselines
      * are committed only after a SUCCESSFUL reindex (busy-skips and failed
@@ -963,6 +964,8 @@ static project_state_t *state_new(const char *name, const char *root_path) {
     }
     atomic_init(&s->registered, true);
     atomic_init(&s->rediscover, true);
+    atomic_init(&s->refresh_pending, false);
+    atomic_init(&s->next_poll_ns, 0);
     s->interval_ms = POLL_BASE_MS;
     atomic_init(&s->status_strategy, CBM_WATCHER_STRATEGY_PENDING);
     atomic_init(&s->status_interval_ms, POLL_BASE_MS);
@@ -1300,7 +1303,7 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
-        s->next_poll_ns = 0;
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
         atomic_store_explicit(&s->rediscover, true, memory_order_release);
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -1319,6 +1322,20 @@ cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
                      !atomic_load_explicit(&w->stopped, memory_order_acquire);
     cbm_mutex_unlock(&w->projects_lock);
     return status;
+}
+
+void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        /* 首次 poll 先建立基线，再执行一次强制刷新，避免 clean commit 被基线吞掉。 */
+        atomic_store_explicit(&s->refresh_pending, true, memory_order_release);
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
 }
 
 int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) {
@@ -1465,7 +1482,9 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
                      "status", "discovering");
     }
 
-    s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+    atomic_store_explicit(&s->next_poll_ns,
+                          now_ns() + ((int64_t)s->interval_ms * US_PER_MS),
+                          memory_order_release);
     publish_status(s, true);
     return true;
 }
@@ -1843,14 +1862,24 @@ static void poll_project(const char *key, void *val, void *ud) {
         s->first_missing_ms = 0;
     }
 
+    bool refresh_pending = atomic_load_explicit(&s->refresh_pending, memory_order_acquire);
+    int64_t next_poll_ns = atomic_load_explicit(&s->next_poll_ns, memory_order_acquire);
+    bool force_refresh = refresh_pending && ctx->now >= next_poll_ns;
+    bool baseline_refresh = refresh_pending && !s->baseline_done;
+
     /* Initialize baseline on first poll */
     if (!s->baseline_done) {
         (void)init_baseline(ctx->w, s);
-        return;
+        if (!s->baseline_done || (!force_refresh && !baseline_refresh)) {
+            return;
+        }
+        force_refresh = true;
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
     }
 
     /* Respect adaptive interval */
-    if (ctx->now < s->next_poll_ns) {
+    if (!force_refresh &&
+        ctx->now < atomic_load_explicit(&s->next_poll_ns, memory_order_acquire)) {
         return;
     }
 
@@ -1863,13 +1892,20 @@ static void poll_project(const char *key, void *val, void *ud) {
         checked = check_tree_changes(s, &tree_changed);
         changed |= tree_changed;
     }
+    if (force_refresh) {
+        changed = true;
+    }
     if (!checked) {
-        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+        atomic_store_explicit(&s->next_poll_ns,
+                              ctx->now + ((int64_t)s->interval_ms * US_PER_MS),
+                              memory_order_release);
         return;
     }
     publish_status(s, true);
     if (!changed) {
-        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+        atomic_store_explicit(&s->next_poll_ns,
+                              ctx->now + ((int64_t)s->interval_ms * US_PER_MS),
+                              memory_order_release);
         return;
     }
 
@@ -1888,6 +1924,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
+            atomic_store_explicit(&s->refresh_pending, false, memory_order_release);
             commit_baselines(ctx->w, s);
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
@@ -1912,9 +1949,11 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Failures back off; success and busy-skip keep the adaptive cadence. */
-    s->next_poll_ns =
+    atomic_store_explicit(
+        &s->next_poll_ns,
         ctx->now +
-        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
+            ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS),
+        memory_order_release);
 }
 
 /* Callback to snapshot project state pointers into an array. */
