@@ -986,6 +986,31 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+TEST(grammar_dialect_extensions_are_not_parse_gaps) {
+    CBMFileResult *css = do_extract("@custom-variant dark (&:is(.dark *));\n"
+                                    ":root { --color-primary: #2563eb; }\n",
+                                    CBM_LANG_CSS, "tailwind.css");
+    ASSERT_NOT_NULL(css);
+    ASSERT_FALSE(css->parse_incomplete);
+    cbm_free_result(css);
+
+    CBMFileResult *scss = do_extract("$primary: #6366F1 !default;\n"
+                                     "$line-height-root: 1.6 !default;\n"
+                                     "@use 'vuetify/settings';\n",
+                                     CBM_LANG_SCSS, "settings.scss");
+    ASSERT_NOT_NULL(scss);
+    ASSERT_FALSE(scss->parse_incomplete);
+    cbm_free_result(scss);
+
+    CBMFileResult *powershell =
+        do_extract("$sizeMiB = [math]::Round((Get-Item -LiteralPath $SourceExe).Length / 1MB, 2)\n",
+                    CBM_LANG_POWERSHELL, "replace.ps1");
+    ASSERT_NOT_NULL(powershell);
+    ASSERT_FALSE(powershell->parse_incomplete);
+    cbm_free_result(powershell);
+    PASS();
+}
+
 /* ── #1735: SQL data dumps ───────────────────────────────────────────────────
  * A mysqldump file is a few CREATE TABLEs followed by megabytes of literal
  * INSERT rows. Tree-sitter built a full tree for every row until the parse
@@ -1477,6 +1502,7 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(grammar_dialect_extensions_are_not_parse_gaps);
     RUN_TEST(sql_values_scanner_excludes_only_literal_rows_issue1735);
     RUN_TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735);
     RUN_TEST(sql_dump_literal_rows_leave_the_graph_unchanged_issue1735);

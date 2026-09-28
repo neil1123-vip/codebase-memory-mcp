@@ -1304,6 +1304,98 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const 
     }
 }
 
+/* A few widely-used dialect extensions are valid source but are not accepted
+ * by the pinned grammars. Keep byte offsets stable while hiding only the
+ * offending token/statement from tree-sitter; extraction still reads the
+ * original source. */
+static void cbm_mask_compat_bytes(char *source, uint32_t start, uint32_t end) {
+    for (uint32_t i = start; i < end; i++) {
+        if (source[i] != '\n' && source[i] != '\r') {
+            source[i] = ' ';
+        }
+    }
+}
+
+static bool cbm_mask_grammar_compat_error(TSNode node, CBMLanguage language, const char *source,
+                                          int source_len, char *masked) {
+    const char *type = ts_node_type(node);
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (strcmp(type, "ERROR") != 0 || end > (uint32_t)source_len || start >= end) {
+        return false;
+    }
+
+    if (language == CBM_LANG_CSS) {
+        uint32_t line_start = start;
+        while (line_start > 0 && source[line_start - 1] != '\n') {
+            line_start--;
+        }
+        uint32_t first = line_start;
+        while (first < (uint32_t)source_len &&
+               (source[first] == ' ' || source[first] == '\t')) {
+            first++;
+        }
+        static const char custom_variant[] = "@custom-variant";
+        size_t keyword_len = sizeof(custom_variant) - 1;
+        if (first + keyword_len <= (uint32_t)source_len &&
+            memcmp(source + first, custom_variant, keyword_len) == 0) {
+            for (uint32_t i = first; i < (uint32_t)source_len && source[i] != '\n'; i++) {
+                if (source[i] == ';') {
+                    cbm_mask_compat_bytes(masked, line_start, i + 1);
+                    return true;
+                }
+            }
+        }
+    } else if (language == CBM_LANG_SCSS && end - start == 8 &&
+               memcmp(source + start, "!default", 8) == 0) {
+        cbm_mask_compat_bytes(masked, start, end);
+        return true;
+    } else if (language == CBM_LANG_POWERSHELL && end - start == 2 && start > 0 &&
+               isdigit((unsigned char)source[start - 1])) {
+        char unit[3] = {(char)toupper((unsigned char)source[start]),
+                        (char)toupper((unsigned char)source[start + 1]), '\0'};
+        if (strcmp(unit, "KB") == 0 || strcmp(unit, "MB") == 0 ||
+            strcmp(unit, "GB") == 0 || strcmp(unit, "TB") == 0) {
+            cbm_mask_compat_bytes(masked, start, end);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cbm_collect_grammar_compat_errors(TSNode node, CBMLanguage language,
+                                               const char *source, int source_len, char *masked) {
+    bool changed = cbm_mask_grammar_compat_error(node, language, source, source_len, masked);
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (cbm_collect_grammar_compat_errors(ts_node_child(node, i), language, source, source_len,
+                                               masked)) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static char *cbm_grammar_compat_source(TSNode root, CBMLanguage language, const char *source,
+                                       int source_len) {
+    if (!source || source_len <= 0 ||
+        (language != CBM_LANG_CSS && language != CBM_LANG_SCSS &&
+         language != CBM_LANG_POWERSHELL)) {
+        return NULL;
+    }
+    char *masked = (char *)malloc((size_t)source_len + 1);
+    if (!masked) {
+        return NULL;
+    }
+    memcpy(masked, source, (size_t)source_len);
+    masked[source_len] = '\0';
+    if (!cbm_collect_grammar_compat_errors(root, language, source, source_len, masked)) {
+        free(masked);
+        return NULL;
+    }
+    return masked;
+}
+
 /* ── Phase 2 line map: what the preprocessed parse already explained ───────
  *
  * The raw parse is preprocessor-blind. When an #ifdef splits a brace it sees
@@ -2262,9 +2354,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
     cbm_sql_kept_ranges_free(&sql_kept);
-    uint64_t t1 = now_ns();
 #ifdef CBM_ENABLE_TEST_SEAMS
-    t1 += tl_parse_wall_seam_offset_ns; /* the stall seam inflates every wall reading */
+    uint64_t parse_wall_offset_ns = tl_parse_wall_seam_offset_ns;
+#else
+    uint64_t parse_wall_offset_ns = 0;
 #endif
 
     if (!tree) {
@@ -2278,6 +2371,29 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     TSNode root = ts_tree_root_node(tree);
+    char *compat_source = NULL;
+    if (ts_node_has_error(root)) {
+        compat_source = cbm_grammar_compat_source(root, language, source, source_len);
+        if (compat_source) {
+            ts_parser_reset(parser);
+            CBMStringInput compat_input = {compat_source, (uint32_t)source_len};
+            TSInput compat_ts_input = {
+                &compat_input,
+                cbm_string_read,
+                TSInputEncodingUTF8,
+                NULL,
+            };
+            TSTree *compat_tree =
+                ts_parser_parse_with_options(parser, NULL, compat_ts_input, opts);
+            if (compat_tree) {
+                ts_tree_delete(tree);
+                tree = compat_tree;
+                root = ts_tree_root_node(tree);
+            }
+            free(compat_source);
+        }
+    }
+    uint64_t t1 = now_ns() + parse_wall_offset_ns;
 
     /* No file is disqualified from the LSP walks by how long its parse took.
      *
