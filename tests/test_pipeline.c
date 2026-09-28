@@ -345,6 +345,165 @@ TEST(pipeline_doclinks_edge_lands_in_store) {
     PASS();
 }
 
+/* #1735: every node and edge of a stored index, one sorted line each. */
+static void graph_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
+                                 size_t *len) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *row = (const char *)sqlite3_column_text(stmt, 0);
+        size_t n = row ? strlen(row) : 0;
+        char *grown = realloc(*buf, *len + n + 2);
+        if (!grown) {
+            break;
+        }
+        *buf = grown;
+        memcpy(*buf + *len, row ? row : "", n);
+        (*buf)[*len + n] = '\n';
+        *len += n + 1;
+        (*buf)[*len] = '\0';
+    }
+    sqlite3_finalize(stmt);
+}
+
+static char *graph_listing(const char *db_path, const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    char *buf = calloc(1, 1);
+    size_t len = 0;
+    graph_listing_append(db,
+                         "SELECT label||'|'||name||'|'||qualified_name||'|'||file_path||'|'||"
+                         "start_line||'|'||end_line||'|'||properties FROM nodes "
+                         "WHERE project=?1 ORDER BY 1",
+                         project, &buf, &len);
+    graph_listing_append(db,
+                         "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||"
+                         "e.properties FROM edges e JOIN nodes s ON s.id=e.source_id "
+                         "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 ORDER BY 1",
+                         project, &buf, &len);
+    sqlite3_close(db);
+    return buf;
+}
+
+static char *index_and_list(const char *repo, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return NULL;
+    }
+    char *listing =
+        cbm_pipeline_run(p) == 0 ? graph_listing(db_path, cbm_pipeline_project_name(p)) : NULL;
+    cbm_pipeline_free(p);
+    return listing;
+}
+
+/* True if every line of `sub` is a line of `super`. */
+static bool listing_lines_within(const char *sub, const char *super) {
+    for (const char *line = sub; *line;) {
+        const char *nl = strchr(line, '\n');
+        size_t n = nl ? (size_t)(nl - line) : strlen(line);
+        bool found = false;
+        for (const char *p = super; *p && !found;) {
+            const char *pnl = strchr(p, '\n');
+            size_t pn = pnl ? (size_t)(pnl - p) : strlen(p);
+            found = pn == n && memcmp(p, line, n) == 0;
+            p = pnl ? pnl + 1 : p + pn;
+        }
+        if (!found) {
+            fprintf(stderr, "  missing from the cut index: %.*s\n", (int)n, line);
+            return false;
+        }
+        line = nl ? nl + 1 : line + n;
+    }
+    return true;
+}
+
+/* A small dump: two tables, a view, three INSERTs of 200 rows, each with one
+ * subquery row and one function-call row among literal rows. */
+static char *sql_dump_small(bool mysql_esc) {
+    size_t cap = 256 * 1024;
+    char *src = malloc(cap);
+    if (!src) {
+        return NULL;
+    }
+    const char *quoted = mysql_esc ? "(%d,'O\\'Brien',DEFAULT)" : "(%d,'O''Brien',DEFAULT)";
+    size_t len = (size_t)snprintf(src, cap,
+                                  "CREATE TABLE city (ID int, Name char(35), Population int);\n"
+                                  "CREATE TABLE country (Code char(3), Name char(52));\n"
+                                  "CREATE VIEW big_cities AS SELECT Name FROM city "
+                                  "WHERE Population > 1000000;\n");
+    for (int s = 0; s < 3; s++) {
+        len += (size_t)snprintf(src + len, cap - len, "INSERT INTO `city` VALUES ");
+        for (int r = 0; r < 200; r++) {
+            if (r) {
+                src[len++] = ',';
+            }
+            int id = s * 1000 + r;
+            if (r == 100) {
+                len += (size_t)snprintf(src + len, cap - len,
+                                        "((SELECT MAX(Code) FROM country),'x',1)");
+            } else if (r == 101) {
+                len += (size_t)snprintf(src + len, cap - len, "(%d,UPPER('y'),2)", id);
+            } else if (r % 3) {
+                len += (size_t)snprintf(src + len, cap - len, quoted, id);
+            } else {
+                len += (size_t)snprintf(src + len, cap - len, "(%d,_binary 'ab',NULL)", id);
+            }
+        }
+        len += (size_t)snprintf(src + len, cap - len, ";\n");
+    }
+    return src;
+}
+
+/* #1735: leaving a dump's literal INSERT rows out of the parse must not change
+ * the graph. The same repository is indexed twice — once as shipped and once
+ * with the full parse (test seam) — and the stored nodes and edges compared.
+ * Standard '' escapes, which the SQL grammar reads correctly: identical.
+ * MySQL \' escapes, which it misreads: the full parse's error recovery swallows
+ * neighbouring rows, so the cut index must hold everything the full one has
+ * (and may hold more — the rows the full parse lost). */
+TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735) {
+    for (int esc = 0; esc < 2; esc++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_dump_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char *src = sql_dump_small(esc == 1);
+        ASSERT_NOT_NULL(src);
+        write_temp_file(tmp, "dump.sql", src);
+        free(src);
+
+        char *cut = index_and_list(tmp, "cut.db");
+        cbm_setenv("CBM_TEST_SQL_FULL_PARSE_ON", "dump.sql", 1);
+        char *full = index_and_list(tmp, "full.db");
+        cbm_unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+        th_rmtree(tmp);
+        ASSERT_NOT_NULL(cut);
+        ASSERT_NOT_NULL(full);
+        /* Not vacuous: the tables, the view and its lineage are there. */
+        ASSERT_NOT_NULL(strstr(cut, "Table|city|"));
+        ASSERT_NOT_NULL(strstr(cut, "View|big_cities|"));
+        ASSERT_NOT_NULL(strstr(cut, "USAGE|"));
+        if (esc == 0 && strcmp(cut, full) != 0) {
+            fprintf(stderr, "--- cut ---\n%s--- full ---\n%s", cut, full);
+        }
+        if (esc == 0) {
+            ASSERT_STR_EQ(cut, full);
+        } else {
+            ASSERT_TRUE(listing_lines_within(full, cut));
+        }
+        free(cut);
+        free(full);
+    }
+    PASS();
+}
+
 /* Spilling must be invisible in the OUTPUT: the same repository indexed with
  * results parked on disk must produce the same graph as one indexed entirely in
  * memory. It did not. The namespace map that `use`/`using`/package imports
@@ -478,6 +637,71 @@ TEST(pipeline_structure_nodes) {
  * ADR before the delete and restores it after the rebuild. Reproduce-first:
  * index, store an ADR, force a full re-index by adding files, assert the ADR
  * is still present and unchanged. */
+/* #1665: a persistence artifact export failure must not be reported as a
+ * repo_path problem. Create the artifact directory as a regular FILE so
+ * cbm_mkdir_p(.codebase-memory) fails deterministically (works as root too),
+ * run with persistence enabled, and assert: the run fails, the DB was
+ * published (publish happens before export), the pipeline snapshots the export
+ * error, and a clean re-run leaves the snapshot empty. */
+TEST(pipeline_export_error_snapshot_on_artifact_failure) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_export1665_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+
+    /* Block the artifact directory: a FILE at .codebase-memory makes the
+     * export's mkdir_p fail with a deterministic error on every platform. */
+    char art_block[512];
+    snprintf(art_block, sizeof(art_block), "%s/.codebase-memory", tmp);
+    f = fopen(art_block, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "block\n");
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+
+    int rc = cbm_pipeline_run(p);
+    ASSERT_NEQ(rc, 0);
+
+    /* The export runs after publish, so the DB must exist despite the failure. */
+    struct stat db_st;
+    ASSERT_EQ(stat(db_path, &db_st), 0);
+
+    const char *export_error = cbm_pipeline_export_error(p);
+    ASSERT_NOT_NULL(export_error);
+    ASSERT_TRUE(export_error[0] != '\0');
+    ASSERT_NOT_NULL(strstr(export_error, "prepare_artifact_dir"));
+    cbm_pipeline_free(p);
+
+    /* Control: remove the blocker; a fresh run succeeds and leaves no snapshot. */
+    (void)cbm_unlink(art_block);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    cbm_pipeline_set_persistence(p2, true);
+    rc = cbm_pipeline_run(p2);
+    ASSERT_EQ(rc, 0);
+    const char *export_error2 = cbm_pipeline_export_error(p2);
+    ASSERT_NOT_NULL(export_error2);
+    ASSERT_TRUE(export_error2[0] == '\0');
+    cbm_pipeline_free(p2);
+
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_adr_survives_full_reindex) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_XXXXXX");
@@ -1148,6 +1372,60 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
     PASS();
 }
 
+/* Terraform reference resolution, end to end.
+ *
+ * An HCL block names itself with its labels appended -- find_hcl_block_name
+ * mints "resource.aws_instance.web" -- while its QN's last dot segment is
+ * bare "web", and a reference written `aws_instance.web.id` reaches the
+ * by-name index through that tail. HCL is therefore a language where the
+ * definition name and the QN tail are different strings, and an index keyed on
+ * either one alone drops every cross-resource reference in the file.
+ *
+ * This has to be a pipeline test: the registry is shared by every language
+ * and nothing in the HCL extractor mentions the index key, so the two halves
+ * can disagree with every extraction-level assertion still green.
+ */
+TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char tf_path[512];
+    snprintf(tf_path, sizeof(tf_path), "%s/main.tf", g_tmpdir);
+    FILE *tf = fopen(tf_path, "w");
+    if (!tf) {
+        teardown_test_repo();
+        FAIL("failed to write terraform fixture");
+    }
+    fprintf(tf, "resource \"aws_instance\" \"web\" {\n"
+                "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
+                "  instance_type = \"t2.micro\"\n"
+                "}\n"
+                "\n"
+                "resource \"aws_eip\" \"ip\" {\n"
+                "  instance = aws_instance.web.id\n"
+                "}\n");
+    fclose(tf);
+
+    char tf_db[512];
+    snprintf(tf_db, sizeof(tf_db), "%s/test_hcl_refs.db", g_tmpdir);
+
+    cbm_pipeline_t *tp = cbm_pipeline_new(g_tmpdir, tf_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(tp);
+    ASSERT_EQ(cbm_pipeline_run(tp), 0);
+
+    cbm_store_t *ts = cbm_store_open_path(tf_db);
+    ASSERT_NOT_NULL(ts);
+    const char *tf_project = cbm_pipeline_project_name(tp);
+
+    ASSERT(cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
+
+    cbm_store_close(ts);
+    cbm_pipeline_free(tp);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -1361,6 +1639,26 @@ static int named_node_count(cbm_store_t *s, const char *project, const char *nam
         cbm_store_free_nodes(nodes, count);
     }
     return count;
+}
+
+static int fixture_node_count(cbm_store_t *store, const char *project, const char *path,
+                              const char *name, const char *label) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].file_path && nodes[i].label && strcmp(nodes[i].file_path, path) == 0 &&
+            strcmp(nodes[i].label, label) == 0) {
+            found++;
+        }
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, count);
+    }
+    return found;
 }
 
 typedef struct {
@@ -5666,6 +5964,8 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     ASSERT_NOT_NULL(s);
 
     /* (1) The false edge is suppressed (reproduce-first: RED before the fix). */
+    ASSERT_GTE(fixture_node_count(s, project, "src/caller.ts", "checkFormat", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/client.ts", "test", "Method"), 1);
     ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
     /* (2) The type-resolved receiver call survives (LSP wins before the guard). */
     ASSERT_TRUE(cross_file_call_exists(s, project, "runTyped", "test"));
@@ -5727,6 +6027,8 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     ASSERT_NOT_NULL(s);
 
     /* NEGATIVE: `accelerator` is a parameter — Worker.backward must not bind. */
+    ASSERT_GTE(fixture_node_count(s, project, "caller.py", "external_call", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "worker.py", "backward", "Method"), 1);
     ASSERT_FALSE(cross_file_call_exists(s, project, "external_call", "backward"));
     /* POSITIVE: import-bound receiver and bare local call both survive. */
     ASSERT_TRUE(cross_file_call_exists(s, project, "imported_call", "compute"));
@@ -5864,18 +6166,19 @@ TEST(pipeline_html_embedded_member_call_stays_unbound) {
  * path and both must consult the guard. */
 static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "go.mod", "module example.com/fxguard\n\ngo 1.22\n");
-    /* The C probe: a local named `event` and a file-scope function `handle`,
-     * the two shapes Go identifiers collide with. */
+    /* C targets must be indexed: block-local C variables are not emitted,
+     * so keep event at file scope for the cross-language reference guard. */
     write_temp_file(tmp, "probe/probe.c",
                     "static int total_events = 0;\n"
+                    "static int event = 0;\n"
                     "\n"
                     "static int handle(void) {\n"
-                    "    int event = 0;\n"
+                    "    event = 0;\n"
                     "    total_events += event;\n"
                     "    return event;\n"
                     "}\n");
-    /* Go: a local write named like the C local, and a value use named like
-     * the C function. Neither can touch anything in a C translation unit. */
+    /* Go local writes and value uses must not bind to the C variables or
+     * functions in this fixture. */
     write_temp_file(tmp, "app/app.go",
                     "package app\n"
                     "\n"
@@ -5942,6 +6245,12 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
 
     /* Reproduce-first: RED before the fix — the Go local write binds the C
      * probe's global, and the Go value use binds the C `handle`. */
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "TrackEvent", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "UsesHandle", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "WriteTotal", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "handle", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "event", "Variable"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "total_events", "Variable"), 1);
     ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
@@ -5982,6 +6291,12 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "TrackEvent", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "UsesHandle", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "WriteTotal", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "handle", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "event", "Variable"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "probe/probe.c", "total_events", "Variable"), 1);
     ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
@@ -6067,7 +6382,8 @@ TEST(pipeline_go_bare_ref_never_binds_field) {
     ASSERT_NOT_NULL(s);
 
     /* The field must exist for the probe to mean anything (#1935's fix). */
-    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "Run", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "state/state.go", "err", "Field"), 1);
     /* Reproduce-first: RED before the fix — the bare local binds the field. */
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
@@ -6104,7 +6420,8 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
-    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    ASSERT_GTE(fixture_node_count(s, project, "app/app.go", "Run", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "state/state.go", "err", "Field"), 1);
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
@@ -6252,6 +6569,10 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     ASSERT_GTE(count_nodes_named(s, project, "/users"), 1);
     /* (3) The false plain-CALLS edges are suppressed in parallel: the regex
      * receiver and the dev.load weak match to ApiThing.load. */
+    ASSERT_GTE(fixture_node_count(s, project, "src/re.ts", "checkFormat", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/thing.ts", "test", "Method"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/load.ts", "callLoad", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/thing.ts", "load", "Method"), 1);
     ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "callLoad", "load"));
 
@@ -6399,6 +6720,10 @@ TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges) {
     ASSERT_NOT_NULL(s);
 
     /* NEGATIVE: every receiver here is a parameter or an attribute of one. */
+    ASSERT_GTE(fixture_node_count(s, project, "caller.py", "train", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "targets.py", "print", "Method"), 2);
+    ASSERT_GTE(fixture_node_count(s, project, "targets.py", "backward", "Method"), 2);
+    ASSERT_GTE(fixture_node_count(s, project, "targets.py", "step", "Method"), 2);
     ASSERT_FALSE(cross_file_call_exists(s, project, "train", "print"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "train", "backward"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "train", "step"));
@@ -6710,6 +7035,9 @@ TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
+    ASSERT_GTE(fixture_node_count(s, project, "src/args.py", "write_fixture", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/args.py", "load_api", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "src/regex.js", "sanitize", "Function"), 1);
     ASSERT_EQ(count_nodes_named(s, project, "/html/g"), 0);
     ASSERT_EQ(count_nodes_named(s, project, "/<table/i"), 0);
     ASSERT_EQ(count_nodes_named(s, project, "/tmp/pgv_fuzz.bin"), 0);
@@ -11202,8 +11530,7 @@ static void write_temp_file(const char *dir, const char *name, const char *conte
         size_t plen = slash - path;
         memcpy(parent, path, plen);
         parent[plen] = '\0';
-        /* mkdir -p (simple version, one level) */
-        cbm_mkdir(parent);
+        cbm_mkdir_p(parent, 0755);
     }
     /* Binary, matching test_helpers.h/repro_harness.h: text mode turns "\n"
      * into "\r\n" on Windows, so the bytes on disk stop matching the source
@@ -11215,6 +11542,228 @@ static void write_temp_file(const char *dir, const char *name, const char *conte
         fputs(content, f);
         fclose(f);
     }
+}
+
+static bool fixture_file_matches(const char *path, const char *expected) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    char actual[1024];
+    size_t expected_length = strlen(expected);
+    size_t offset = 0;
+    size_t bytes = 0;
+    bool matched = true;
+    while ((bytes = fread(actual, 1, sizeof(actual), file)) != 0) {
+        if (bytes > expected_length - offset || memcmp(actual, expected + offset, bytes) != 0) {
+            matched = false;
+            break;
+        }
+        offset += bytes;
+    }
+    matched = matched && !ferror(file) && feof(file) && offset == expected_length;
+    if (fclose(file) != 0) {
+        matched = false;
+    }
+    return matched;
+}
+
+/* #2034: no manual mkdir may make an absent deep fixture look indexed. */
+TEST(pipeline_nested_fixture_files_are_written) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nested_fixture_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char long_name[480];
+    size_t long_length = 480 - strlen(tmp) - 1;
+    memset(long_name, 'a', long_length);
+    for (size_t i = 89; i < long_length - 4; i += 90) {
+        long_name[i] = '/';
+    }
+    memcpy(long_name + long_length - 4, ".txt", 4);
+    long_name[long_length] = '\0';
+    char boundary[3][1026];
+    for (size_t i = 0; i < 3; i++) {
+        size_t length = 1023 + i;
+        memset(boundary[i], 'a', length);
+        boundary[i][length] = '\0';
+    }
+    const struct {
+        const char *name;
+        const char *content;
+    } cases[] = {
+        {"root.go", "package fixtures\n"},
+        {"pkg/one.go", "package fixtures\n\nfunc Marker() {}\n"},
+        {"registry/batch/two.go", "package fixtures\n"},
+        {"registry/batch/cronjob/strategy.go", "package fixtures\n"},
+        {"a/b/c/d/e/f/g/h/deep.txt", "deep\n"},
+        {"space dir/кириллица/中文/data.txt", "строка\nline\r\n行\n"},
+        {"empty/a/file.txt", ""},
+        {"newline/a/file.txt", "\n"},
+        {"siblings/one/file.txt", "one\n"},
+        {"siblings/two/file.txt", "two\n"},
+        {"partial/existing/new/branch/file.txt", "partial\n"},
+        {long_name, "long path\n"},
+        {"boundary/deep/1023.txt", boundary[0]},
+        {"boundary/deep/1024.txt", boundary[1]},
+        {"boundary/deep/1025.txt", boundary[2]},
+    };
+    bool partial_parent = cbm_mkdir_p(TH_PATH(tmp, "partial/existing"), 0755);
+    bool matched[sizeof(cases) / sizeof(cases[0])] = {false};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        write_temp_file(tmp, cases[i].name, cases[i].content);
+    }
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        matched[i] = fixture_file_matches(TH_PATH(tmp, cases[i].name), cases[i].content);
+        if (!matched[i]) {
+            fprintf(stderr, "missing or mismatched fixture: %s\n", cases[i].name);
+        }
+    }
+    const char *replacement[] = {"longer replacement\n", "x", "", "again\n"};
+    bool replaced[sizeof(replacement) / sizeof(replacement[0])] = {false};
+    for (size_t i = 0; i < sizeof(replacement) / sizeof(replacement[0]); i++) {
+        write_temp_file(tmp, "registry/batch/cronjob/strategy.go", replacement[i]);
+        replaced[i] = fixture_file_matches(TH_PATH(tmp, "registry/batch/cronjob/strategy.go"),
+                                           replacement[i]);
+    }
+    bool sibling_preserved = fixture_file_matches(TH_PATH(tmp, "siblings/one/file.txt"), "one\n");
+    bool extra_tail_matches =
+        fixture_file_matches(TH_PATH(tmp, "boundary/deep/1025.txt"), boundary[1]);
+    bool truncated_matches =
+        fixture_file_matches(TH_PATH(tmp, "boundary/deep/1023.txt"), boundary[1]);
+    char changed[sizeof(boundary[2])];
+    memcpy(changed, boundary[2], sizeof(changed));
+    changed[1024] = 'b';
+    bool changed_byte_matches =
+        fixture_file_matches(TH_PATH(tmp, "boundary/deep/1025.txt"), changed);
+    int cleanup_rc = th_rmtree(tmp);
+    ASSERT_TRUE(partial_parent);
+    ASSERT_FALSE(extra_tail_matches);
+    ASSERT_FALSE(truncated_matches);
+    ASSERT_FALSE(changed_byte_matches);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_TRUE(matched[i]);
+    }
+    for (size_t i = 0; i < sizeof(replacement) / sizeof(replacement[0]); i++) {
+        ASSERT_TRUE(replaced[i]);
+    }
+    ASSERT_TRUE(sibling_preserved);
+    ASSERT_EQ(cleanup_rc, 0);
+    PASS();
+}
+
+TEST(pipeline_fixture_file_parent_is_preserved) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fixture_parent_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "blocked", "existing bytes\n");
+    write_temp_file(tmp, "blocked/child/file.txt", "must not be written\n");
+    bool parent_preserved = fixture_file_matches(TH_PATH(tmp, "blocked"), "existing bytes\n");
+    bool child_present = cbm_file_exists(TH_PATH(tmp, "blocked/child/file.txt"));
+    bool precondition_satisfied =
+        fixture_file_matches(TH_PATH(tmp, "blocked/child/file.txt"), "must not be written\n");
+    int cleanup_rc = th_rmtree(tmp);
+    ASSERT_TRUE(parent_preserved);
+    ASSERT_FALSE(child_present);
+    ASSERT_FALSE(precondition_satisfied);
+    ASSERT_EQ(cleanup_rc, 0);
+    PASS();
+}
+
+TEST(pipeline_fixture_node_count_requires_exact_source_nodes) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "fixture", "/tmp"), CBM_STORE_OK);
+    cbm_node_t nodes[] = {
+        {.project = "fixture",
+         .label = "Method",
+         .name = "work",
+         .qualified_name = "fixture.Service.work",
+         .file_path = "nested/service.py"},
+        {.project = "fixture",
+         .label = "Method",
+         .name = "work",
+         .qualified_name = "fixture.OtherService.work",
+         .file_path = "nested/service.py"},
+        {.project = "fixture",
+         .label = "Method",
+         .name = "work",
+         .qualified_name = "fixture.OtherFile.work",
+         .file_path = "other/service.py"},
+        {.project = "fixture",
+         .label = "Function",
+         .name = "work",
+         .qualified_name = "fixture.free_work",
+         .file_path = "nested/service.py"},
+    };
+    bool inserted = true;
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        if (cbm_store_upsert_node(store, &nodes[i]) <= 0) {
+            inserted = false;
+        }
+    }
+    int methods = fixture_node_count(store, "fixture", "nested/service.py", "work", "Method");
+    int other_file = fixture_node_count(store, "fixture", "other/service.py", "work", "Method");
+    int wrong_file = fixture_node_count(store, "fixture", "absent/service.py", "work", "Method");
+    int wrong_label = fixture_node_count(store, "fixture", "nested/service.py", "work", "Class");
+    int missing_name =
+        fixture_node_count(store, "fixture", "nested/service.py", "absent", "Method");
+    int unavailable = fixture_node_count(NULL, "fixture", "nested/service.py", "work", "Method");
+    cbm_store_close(store);
+    ASSERT_TRUE(inserted);
+    ASSERT_EQ(methods, 2);
+    ASSERT_EQ(other_file, 1);
+    ASSERT_EQ(wrong_file, 0);
+    ASSERT_EQ(wrong_label, 0);
+    ASSERT_EQ(missing_name, 0);
+    ASSERT_EQ(unavailable, -1);
+    PASS();
+}
+
+TEST(pipeline_nested_fixture_graph_has_endpoints) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nested_graph_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "main.go", "package main\n\nfunc main() {}\n");
+    write_temp_file(tmp, "registry/batch/cronjob/strategy.go",
+                    "package cronjob\n\n"
+                    "func FixtureTarget() {}\n"
+                    "func FixtureCaller() { FixtureTarget() }\n"
+                    "func FixtureDecoy() {}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fixture.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    const char *names[] = {"FixtureCaller", "FixtureTarget", "FixtureDecoy"};
+    int counts[3] = {-1, -1, -1};
+    bool expected_call = false;
+    bool forbidden_call = false;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        for (size_t i = 0; i < 3; i++) {
+            counts[i] = fixture_node_count(store, project, "registry/batch/cronjob/strategy.go",
+                                           names[i], "Function");
+        }
+        expected_call = cross_file_call_exists(store, project, "FixtureCaller", "FixtureTarget");
+        forbidden_call = cross_file_call_exists(store, project, "FixtureCaller", "FixtureDecoy");
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int cleanup_rc = th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    for (size_t i = 0; i < 3; i++) {
+        ASSERT_EQ(counts[i], 1);
+    }
+    ASSERT_TRUE(expected_call);
+    ASSERT_FALSE(forbidden_call);
+    ASSERT_EQ(cleanup_rc, 0);
+    PASS();
 }
 
 /* Helper: find binding by key in results */
@@ -11500,22 +12049,13 @@ TEST(envscan_skips_ignored_dirs) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("tmpdir");
 
-    /* File inside .git should be skipped */
-    char gitdir[512];
-    snprintf(gitdir, sizeof(gitdir), "%s/.git", tmpdir);
-    cbm_mkdir(gitdir);
-    write_temp_file(tmpdir, ".git/config.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
-
-    /* File inside node_modules should be skipped */
-    char nmdir[512];
-    snprintf(nmdir, sizeof(nmdir), "%s/node_modules", tmpdir);
-    cbm_mkdir(nmdir);
-    char nmpkg[512];
-    snprintf(nmpkg, sizeof(nmpkg), "%s/node_modules/pkg", tmpdir);
-    cbm_mkdir(nmpkg);
-    write_temp_file(tmpdir, "node_modules/pkg/config.sh",
-                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+    static const char ignored_content[] =
+        "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n";
+    write_temp_file(tmpdir, ".git/config.sh", ignored_content);
+    write_temp_file(tmpdir, "node_modules/pkg/config.sh", ignored_content);
+    bool git_written = fixture_file_matches(TH_PATH(tmpdir, ".git/config.sh"), ignored_content);
+    bool module_written =
+        fixture_file_matches(TH_PATH(tmpdir, "node_modules/pkg/config.sh"), ignored_content);
 
     /* File at root level should be scanned */
     write_temp_file(tmpdir, "deploy.sh",
@@ -11533,6 +12073,8 @@ TEST(envscan_skips_ignored_dirs) {
         if (strcmp(bindings[i].file_path, "deploy.sh") == 0)
             from_root = 1;
     }
+    ASSERT_TRUE(git_written);
+    ASSERT_TRUE(module_written);
     ASSERT_EQ(from_git, 0);
     ASSERT_EQ(from_nm, 0);
     ASSERT_EQ(from_root, 1);
@@ -11883,16 +12425,6 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_excl_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         FAIL("tmpdir");
-
-    char dir[512];
-    snprintf(dir, sizeof(dir), "%s/packages", tmpdir);
-    cbm_mkdir(dir);
-    snprintf(dir, sizeof(dir), "%s/packages/app", tmpdir);
-    cbm_mkdir(dir);
-    snprintf(dir, sizeof(dir), "%s/vendor_big", tmpdir);
-    cbm_mkdir(dir);
-    snprintf(dir, sizeof(dir), "%s/vendor_big/lib", tmpdir);
-    cbm_mkdir(dir);
 
     write_temp_file(tmpdir, "packages/app/package.json",
                     "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
@@ -15277,6 +15809,10 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_nested_fixture_files_are_written);
+    RUN_TEST(pipeline_fixture_file_parent_is_preserved);
+    RUN_TEST(pipeline_fixture_node_count_requires_exact_source_nodes);
+    RUN_TEST(pipeline_nested_fixture_graph_has_endpoints);
     RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -15304,10 +15840,12 @@ SUITE(pipeline) {
     /* Integration: structure pass */
     RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
     RUN_TEST(pipeline_doclinks_edge_lands_in_store);
+    RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
+    RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
@@ -15323,6 +15861,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);

@@ -16,6 +16,8 @@
 #include "result_spill.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "iris_export_xml.h"
+#include "helpers.h"    /* cbm_count_branching (walker stack cap) */
+#include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -298,6 +300,58 @@ TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
                                CBM_LANG_CPP, "t", "broken.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(r->parse_incomplete); /* real gap stays reported */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1735: the #1071 check's cost. cbm_subtract_macro_invocation_regions asked
+ * "is this region a macro call?" before "is it inside a function?", and the
+ * first question walked the source from byte 0 for every region: regions x
+ * file bytes on any file with many error regions, whatever its language.
+ * Counted (test seam), never timed. */
+enum { MACRO_SCAN_SRC_CAP = 8192 };
+
+TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735) {
+    /* 40 functions, each followed by a top-level junk line: 40 regions, none
+     * of them inside a function. */
+    char src[MACRO_SCAN_SRC_CAP];
+    int len = snprintf(src, sizeof(src), "#define ALLOC(T, n) ((T *)malloc(sizeof(T) * (n)))\n");
+    for (int i = 0; i < 40; i++) {
+        len += snprintf(src + len, sizeof(src) - (size_t)len,
+                        "int ok%d(void) {\n    return %d;\n}\n} ] junk ( {\n", i, i);
+    }
+    ASSERT_LT(len, MACRO_SCAN_SRC_CAP);
+    uint64_t before = cbm_test_macro_line_scan_bytes();
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "junk.c");
+    uint64_t scanned = cbm_test_macro_line_scan_bytes() - before;
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);     /* top-level junk stays reported... */
+    ASSERT_EQ(r->error_region_count, 40); /* ...one range per junk line, as before */
+    ASSERT_EQ(scanned, 0u);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(macro_check_locates_lines_with_one_table_issue1735) {
+    /* 60 functions whose bodies hold a real syntax error: every region sits
+     * inside a function, so the check has to look at each one's lines. */
+    char src[MACRO_SCAN_SRC_CAP];
+    int len = snprintf(src, sizeof(src), "#define ALLOC(T, n) ((T *)malloc(sizeof(T) * (n)))\n");
+    for (int i = 0; i < 60; i++) {
+        len += snprintf(src + len, sizeof(src) - (size_t)len,
+                        "int f%d(void) {\n    int x = ;\n    return x;\n}\n", i);
+    }
+    ASSERT_LT(len, MACRO_SCAN_SRC_CAP);
+    uint64_t before = cbm_test_macro_line_scan_bytes();
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "inbody.c");
+    uint64_t scanned = cbm_test_macro_line_scan_bytes() - before;
+    ASSERT_NOT_NULL(r);
+    /* #1071 unchanged: a real in-body error is not a macro call and stays
+     * reported, one range per function. */
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 60);
+    /* One line table for the file, not one walk per region. */
+    ASSERT_LTE(scanned, (uint64_t)len);
     cbm_free_result(r);
     PASS();
 }
@@ -5599,6 +5653,101 @@ TEST(walk_defs_wide_file_extracts_every_definition) {
     PASS();
 }
 
+/* ── Walker stacks must never cap graph content ──────────────────────
+ *
+ * The complexity walkers and the body-token sampler used fixed-size pending
+ * stacks (4096 / 512 nodes) and silently stopped pushing children once full.
+ * Children are pushed last-to-first, so a wide body lost its FIRST statements:
+ * a function with 5000 top-level branches under-reported its cyclomatic count,
+ * and the token sampler started mid-body. These build bodies wider than either
+ * old cap and assert the exact metrics. */
+enum { WIDE_STMTS = 5000, WIDE_CALLS = 600, BODY_TOKEN_PREFIX = 100 };
+
+/* C function `wide` whose body holds `n` top-level statements alternating
+ * `if (x) g();` and `while (x) g();`. Caller frees. */
+static char *build_wide_branch_fn(int n) {
+    size_t cap = (size_t)n * 24 + 64;
+    char *src = malloc(cap);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, cap, "void g(void);\nvoid wide(int x) {\n");
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s",
+                                (i % 2 == 0) ? "if (x) g();\n" : "while (x) g();\n");
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    return src;
+}
+
+TEST(complexity_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every if/while is one branching node at nesting depth 0 */
+    ASSERT_EQ(d->complexity, WIDE_STMTS);
+    ASSERT_EQ(d->cognitive, WIDE_STMTS);
+    ASSERT_EQ(d->loop_count, WIDE_STMTS / 2);
+    ASSERT_EQ(d->loop_depth, 1);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(count_branching_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    int n = cbm_count_branching(ts_tree_root_node(tree),
+                                cbm_lang_spec(CBM_LANG_C)->branching_node_types);
+    ASSERT_EQ(n, WIDE_STMTS);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    free(src);
+    PASS();
+}
+
+/* The body-token sampler's contract is "the first BODY_TOKEN_CAP unique
+ * identifiers in source order". A body with 600 distinct calls must sample
+ * from f0 on, not a window starting mid-body (the capped stack began at f91).
+ * Only the source-order prefix f0..f99 is asserted: the sampler's dedupe key
+ * (hash | 1) also merges identifiers whose hashes differ only in bit 0, which
+ * drops a few later names (f122, f124, ...) -- a separate dedupe property this
+ * test deliberately does not pin. */
+TEST(body_tokens_wide_body_samples_from_the_start) {
+    size_t cap = (size_t)WIDE_CALLS * 16 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "void wide_calls(void) {\n");
+    for (int i = 0; i < WIDE_CALLS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "f%d();\n", i);
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    char expect[BODY_TOKEN_PREFIX * 8];
+    size_t ep = 0;
+    for (int i = 0; i < BODY_TOKEN_PREFIX; i++) {
+        ep += (size_t)snprintf(expect + ep, sizeof(expect) - ep, "f%d ", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_calls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide_calls");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->body_tokens);
+    ASSERT_GTE(strlen(d->body_tokens), ep);
+    ASSERT_MEM_EQ(d->body_tokens, expect, ep);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Perl call-graph noise (#459 follow-up)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -7139,6 +7288,73 @@ TEST(extract_csharp_argument_values_use_the_walk_cursor) {
     }
     PASS();
 }
+
+/* #2176: a binary Godot `.res` resource (4.7 MB) never finished indexing. It
+ * parses as ReScript into an error-heavy tree whose root has ~170k children
+ * per MB, and the ReScript `let` binding check climbed from every named leaf
+ * with ts_node_parent — a descent from the root that scans the children at
+ * every level, so O(root children) per leaf and quadratic per file (1 MB spent
+ * 46 s in the unified walk). Valid ReScript with many top-level statements has
+ * the same flat root, so plain text drives it too. The walk now climbs its own
+ * cursor. The counter records every root-descending hop that check makes; the
+ * assertion is that the walk makes none, at any size. */
+static int extract_rescript_let_leaf_fallbacks(int statement_count, int *out_usages,
+                                               uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "let target = 1\n";
+    static const char statement[] = "let v = target\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement);
+    char *source = malloc(capacity);
+    if (!source) {
+        return -1;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    source[offset] = '\0';
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, CBM_LANG_RESCRIPT, "proj", "Flat.res", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return -1;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "target") == 0) {
+            usages++;
+        }
+    }
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return 0;
+}
+
+TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
+    enum { SMALL = 128, BIG = 1024 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_fallbacks = 0;
+    uint64_t big_fallbacks = 0;
+    ASSERT_EQ(extract_rescript_let_leaf_fallbacks(SMALL, &small_usages, &small_fallbacks), 0);
+    ASSERT_EQ(extract_rescript_let_leaf_fallbacks(BIG, &big_usages, &big_fallbacks), 0);
+    fprintf(stderr, "  [rescript-let-bindings] fallbacks(%d)=%llu fallbacks(%d)=%llu\n", SMALL,
+            (unsigned long long)small_fallbacks, BIG, (unsigned long long)big_fallbacks);
+    /* Anti-vacuous: every leaf really was classified (each `target` read is a
+     * usage, each `v` a binding), so zero fallbacks means "took the cursor",
+     * not "never looked". */
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    ASSERT_EQ(small_fallbacks, 0);
+    ASSERT_EQ(big_fallbacks, 0);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -8485,6 +8701,7 @@ SUITE(extraction) {
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
+    RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -8544,6 +8761,8 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
+    RUN_TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735);
+    RUN_TEST(macro_check_locates_lines_with_one_table_issue1735);
     RUN_TEST(extract_gdscript_issue186);
     RUN_TEST(extract_powershell_issue35);
     RUN_TEST(extract_luau_issue39);
@@ -8860,6 +9079,9 @@ SUITE(extraction) {
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(walk_defs_wide_file_extracts_every_definition);
+    RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(body_tokens_wide_body_samples_from_the_start);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);

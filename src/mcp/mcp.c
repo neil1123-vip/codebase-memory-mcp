@@ -2723,18 +2723,23 @@ static void project_record_clear(mcp_project_record_t *record) {
     memset(record, 0, sizeof(*record));
 }
 
+/* strcmp that orders NULL like "". */
+static int nullable_strcmp(const char *a, const char *b) {
+    return strcmp(a ? a : "", b ? b : "");
+}
+
 static int project_record_compare(const void *left, const void *right) {
     const mcp_project_record_t *a = left;
     const mcp_project_record_t *b = right;
-    int by_name = strcmp(a->name ? a->name : "", b->name ? b->name : "");
+    int by_name = nullable_strcmp(a->name, b->name);
     if (by_name != 0) {
         return by_name;
     }
-    int by_root = strcmp(a->root_path ? a->root_path : "", b->root_path ? b->root_path : "");
+    int by_root = nullable_strcmp(a->root_path, b->root_path);
     if (by_root != 0) {
         return by_root;
     }
-    return strcmp(a->db_file ? a->db_file : "", b->db_file ? b->db_file : "");
+    return nullable_strcmp(a->db_file, b->db_file);
 }
 
 typedef enum {
@@ -6771,10 +6776,17 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     if (project) {
         int nodes = cbm_store_count_nodes(store, project);
         int edges = cbm_store_count_edges(store, project);
+        /* A negative count is a failed read (CBM_STORE_ERR), not a small
+         * project. Reporting it as a count would put a bare -1 in the output,
+         * and `nodes > 0 ? "ready" : "empty"` would answer "empty" for an
+         * unreadable table — the false all-clear #2012 is about. Say the read
+         * failed, and name the table that could not be read. */
+        const bool counts_unreadable = nodes < 0 || edges < 0;
         yyjson_mut_obj_add_str(doc, root, "project", project);
-        yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-        yyjson_mut_obj_add_int(doc, root, "edges", edges);
-        yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        yyjson_mut_obj_add_int(doc, root, "nodes", counts_unreadable ? 0 : nodes);
+        yyjson_mut_obj_add_int(doc, root, "edges", counts_unreadable ? 0 : edges);
+        yyjson_mut_obj_add_str(doc, root, "status",
+                               counts_unreadable ? "error" : (nodes > 0 ? "ready" : "empty"));
         cbm_project_t proj_info = {0};
         bool have_proj_info = cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK;
         if (have_proj_info) {
@@ -6791,7 +6803,21 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         safe_str_free(&proj_info.name);
         safe_str_free(&proj_info.indexed_at);
         safe_str_free(&proj_info.root_path);
-        if (nodes == 0) {
+        if (counts_unreadable) {
+            const char *hint;
+            if (nodes < 0 && edges < 0) {
+                hint = "The nodes and edges tables could not be read; the database may be "
+                       "corrupt. Re-run index_repository(repo_path=...) or remove the project "
+                       "cache and re-index.";
+            } else if (nodes < 0) {
+                hint = "The nodes table could not be read; the database may be corrupt. Re-run "
+                       "index_repository(repo_path=...) or remove the project cache and re-index.";
+            } else {
+                hint = "The edges table could not be read; the database may be corrupt. Re-run "
+                       "index_repository(repo_path=...) or remove the project cache and re-index.";
+            }
+            yyjson_mut_obj_add_str(doc, root, "hint", hint);
+        } else if (nodes == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Project is empty. Re-run index_repository(repo_path=...) to populate.");
@@ -11414,9 +11440,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_strcpy(doc, root, "message", message);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "Pipeline failed. Check repo_path exists and contains source files. "
-                               "Try mode='fast' for a quicker diagnostic run.");
+        /* #1665: a post-publish artifact export failure (read-only repo, etc.)
+         * must not be blamed on the repository path. The pipeline snapshots the
+         * export error of THIS run, so its presence names the phase exactly —
+         * the graph database was already published when the export ran. */
+        const char *export_error = cbm_pipeline_export_error(p);
+        if (export_error && export_error[0]) {
+            char hint[CBM_SZ_1K];
+            (void)snprintf(
+                hint, sizeof(hint),
+                "Index database was published, but the persistence artifact export failed for "
+                "repo_path/.codebase-memory (%s). Use a writable checkout, or re-run with "
+                "--persistence false if the shared artifact is not needed.",
+                export_error);
+            yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
+        } else {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "Pipeline failed. Check repo_path exists and contains source "
+                                   "files. Try mode='fast' for a quicker diagnostic run.");
+        }
     }
 
     char *json = yy_doc_to_str(doc);
@@ -12605,12 +12647,11 @@ static int search_result_cmp(const void *a, const void *b) {
     if (score_order != 0) {
         return score_order;
     }
-    int qn_order = strcmp(ra->qualified_name ? ra->qualified_name : "",
-                          rb->qualified_name ? rb->qualified_name : "");
+    int qn_order = nullable_strcmp(ra->qualified_name, rb->qualified_name);
     if (qn_order != 0) {
         return qn_order;
     }
-    int file_order = strcmp(ra->file ? ra->file : "", rb->file ? rb->file : "");
+    int file_order = nullable_strcmp(ra->file, rb->file);
     if (file_order != 0) {
         return file_order;
     }
