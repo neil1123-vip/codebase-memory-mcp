@@ -3265,6 +3265,93 @@ TEST(python_iris_classMethodValue) {
     PASS();
 }
 
+/* #1260: count calls with an exact callee whose enclosing function qn ends
+ * with ".<func>". has_call() is a substring match, which cannot tell
+ * "Pkg.A.Run" emitted from want_a apart from the same callee in want_b. */
+static int count_calls_in_func(CBMFileResult *r, const char *callee, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, callee) != 0 || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* #1260: calls in `func` whose callee is "Run" or ends in ".Run", whatever
+ * the qualifier. One iris.cls("X").Run() site must emit exactly one. */
+static int count_run_calls_in_func(CBMFileResult *r, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t cl = strlen(c->callee_name);
+        bool is_run = strcmp(c->callee_name, "Run") == 0 ||
+                      (cl > 4 && strcmp(c->callee_name + cl - 4, ".Run") == 0);
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (is_run && qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(python_iris_cls_receiver_is_class_aware) {
+    CBMFileResult *r = extract("import iris\n"
+                               "def want_a():\n"
+                               "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                               "def want_b():\n"
+                               "    return iris.cls('Pkg.B').Run('x')\n"
+                               "def dynamic(name):\n"
+                               "    return iris.cls(name).Run('x')\n"
+                               "def fstring(n):\n"
+                               "    return iris.cls(f'Pkg.{n}').Run('x')\n"
+                               "def unrelated_receiver():\n"
+                               "    return some_random_thing.Run('x')\n",
+                               CBM_LANG_PYTHON, "t", "caller.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_a"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "want_b"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_b"), 0);
+    /* The class-qualified callee replaces the bare one: no second call per site. */
+    ASSERT_EQ(count_run_calls_in_func(r, "want_a"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "want_b"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "dynamic"), 1);
+    /* A non-literal class argument names nothing: no class-qualified callee. */
+    ASSERT_EQ(count_calls_in_func(r, "name.Run", "dynamic"), 0);
+    /* An f-string is a Python "string" node but not a class name. */
+    ASSERT_EQ(count_calls_in_func(r, "f'Pkg.{n}'.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.{n}.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "unrelated_receiver"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "unrelated_receiver"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(python_iris_invokeClassMethod) {
+    CBMFileResult *r =
+        extract("def call(db):\n"
+                "    return db.invokeClassMethod('MyApp.Service', 'SomeClassMethod', 1)\n",
+                CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "MyApp.Service.SomeClassMethod", "call"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_calls) {
     CBMFileResult *r =
         extract("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"hello\") }\n",
@@ -5477,6 +5564,38 @@ TEST(complexity_access_depth_and_params) {
     ASSERT_GT(d->max_access_depth, 2); /* x.alpha.beta.gamma.delta */
     ASSERT_GTE(d->param_count, 3);     /* x, a, b, c (grouping may vary) */
     cbm_free_result(r);
+    PASS();
+}
+
+/* The definitions walk kept its pending frames under a ceiling (8M frames,
+ * env CBM_WALK_DEFS_MAX) and stopped pushing once it was reached. Children are
+ * pushed last-to-first, so a file wider than the ceiling lost its FIRST
+ * top-level definitions. The ceiling and its env knob are gone; the knob is set
+ * here to a value this file exceeds to prove it no longer decides content. */
+enum { WIDE_DEFS = 1000, WIDE_DEFS_OLD_CAP = 256 };
+
+TEST(walk_defs_wide_file_extracts_every_definition) {
+    size_t cap = (size_t)WIDE_DEFS * 32 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "int wd%d(void) { return %d; }\n", i, i);
+    }
+    char lim[16];
+    snprintf(lim, sizeof(lim), "%d", WIDE_DEFS_OLD_CAP);
+    cbm_setenv("CBM_WALK_DEFS_MAX", lim, 1);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_defs.c");
+    cbm_unsetenv("CBM_WALK_DEFS_MAX");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "wd%d", i);
+        ASSERT_NOT_NULL(find_def(r, name));
+    }
+    cbm_free_result(r);
+    free(src);
     PASS();
 }
 
@@ -8635,6 +8754,8 @@ SUITE(extraction) {
     /* Cross-cutting */
     RUN_TEST(python_calls);
     RUN_TEST(python_iris_classMethodValue);
+    RUN_TEST(python_iris_cls_receiver_is_class_aware);
+    RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
@@ -8738,6 +8859,7 @@ SUITE(extraction) {
     RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(walk_defs_wide_file_extracts_every_definition);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);

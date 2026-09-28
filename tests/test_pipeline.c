@@ -10,6 +10,7 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -14252,6 +14253,48 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+/* Object arrays are non-flat in yyjson. Exercise ordered decoding and arena
+ * ownership across a large surface, including nested string arrays. */
+TEST(pipeline_lsp_surface_large_object_array_decode) {
+    const int count = 8192;
+    const size_t capacity = (size_t)count * 192 + 64;
+    char *json = malloc(capacity);
+    ASSERT_NOT_NULL(json);
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":1,\"lsp\":[");
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(json + used, capacity - used,
+                         "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
+                         "\"spt\":[\"str\",\"int\"],\"dec\":[\"first\",\"second\"]}",
+                         i ? "," : "", i, i);
+        ASSERT_TRUE(n > 0 && (size_t)n < capacity - used);
+        used += (size_t)n;
+    }
+    snprintf(json + used, capacity - used, "]}");
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = NULL;
+    int decoded = cbm_lsp_surface_defs_from_json(&arena, json, &defs);
+    free(json);
+    ASSERT_EQ(decoded, count);
+    ASSERT_NOT_NULL(defs);
+    for (int i = 0; i < count; i++) {
+        char expected[64];
+        snprintf(expected, sizeof(expected), "pkg.f%d", i);
+        ASSERT_STR_EQ(defs[i].qualified_name, expected);
+        snprintf(expected, sizeof(expected), "f%d", i);
+        ASSERT_STR_EQ(defs[i].short_name, expected);
+        ASSERT_STR_EQ(defs[i].label, "Function");
+        ASSERT_EQ(defs[i].signature_param_count, 2);
+        ASSERT_STR_EQ(defs[i].signature_param_types[0], "str");
+        ASSERT_STR_EQ(defs[i].signature_param_types[1], "int");
+        ASSERT_STR_EQ(defs[i].decorators[0], "first");
+        ASSERT_STR_EQ(defs[i].decorators[1], "second");
+        ASSERT_NULL(defs[i].decorators[2]);
+    }
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* The closure-repair route lives and dies by two properties of the persisted
  * per-file LSP surface: a BODY edit must leave the surface_sha unchanged (the
  * early cutoff -- no dependent recomputation owed), while a SIGNATURE edit
@@ -14711,6 +14754,119 @@ TEST(pipeline_ensemble_routing_method_scoping) {
     PASS();
 }
 
+/* #1260: CALLS edges from the function named `func` whose target qn ends
+ * with ".<target_suffix>" (segment-anchored). A NULL suffix counts every
+ * CALLS edge to a node named "Run". */
+static int iris_cls_calls(cbm_store_t *s, const char *project, const char *func,
+                          const char *target_suffix) {
+    cbm_node_t *fn = NULL;
+    int fn_count = 0;
+    cbm_store_find_nodes_by_name(s, project, func, &fn, &fn_count);
+    int n = 0;
+    for (int fi = 0; fi < fn_count; fi++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, fn[fi].id, "CALLS", &edges, &ec);
+        for (int ei = 0; ei < ec; ei++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[ei].target_id, &tgt) != 0) {
+                continue;
+            }
+            if (!target_suffix) {
+                if (tgt.name && strcmp(tgt.name, "Run") == 0) {
+                    n++;
+                }
+            } else if (tgt.qualified_name) {
+                size_t ql = strlen(tgt.qualified_name);
+                size_t sl = strlen(target_suffix);
+                if (ql > sl && tgt.qualified_name[ql - sl - 1] == '.' &&
+                    strcmp(tgt.qualified_name + ql - sl, target_suffix) == 0) {
+                    n++;
+                }
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        cbm_store_free_edges(edges, ec);
+    }
+    cbm_store_free_nodes(fn, fn_count);
+    return n;
+}
+
+TEST(pipeline_python_iris_cls_class_aware_calls) {
+    /* The #1260 repro: two ObjectScript classes share a method name. Python
+     * callers must reach the class named in iris.cls("<literal>"), and a call
+     * that names no indexed class must not borrow an edge from one that does. */
+    char *tmp = th_mktempdir("cbm_iris_cls");
+    ASSERT_NOT_NULL(tmp);
+    const char *run_body = "{\n"
+                           "ClassMethod Run(x As %String) As %String\n"
+                           "{\n"
+                           "    Quit x\n"
+                           "}\n"
+                           "}\n";
+    char cls[256];
+    snprintf(cls, sizeof(cls), "Class Pkg.A Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "A.cls", cls);
+    snprintf(cls, sizeof(cls), "Class Pkg.B Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "B.cls", cls);
+    /* A third, unrelated Run: a bare "Run" callee could weak-match it. */
+    write_temp_file(tmp, "util.py",
+                    "def Run(x):\n"
+                    "    return x\n");
+    write_temp_file(tmp, "caller.py",
+                    "import iris\n"
+                    "\n"
+                    "class Helper:\n"
+                    "    def Run(self, x):\n"
+                    "        return x\n"
+                    "\n"
+                    "def want_a():\n"
+                    "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                    "\n"
+                    "def want_b():\n"
+                    "    return iris.cls(\"Pkg.B\").Run(\"x\")\n"
+                    "\n"
+                    "def want_nonexistent():\n"
+                    "    return iris.cls(\"Pkg.DoesNotExist\").Run(\"x\")\n"
+                    "\n"
+                    "def unrelated_receiver():\n"
+                    "    return some_random_thing.Run(\"x\")\n"
+                    "\n"
+                    "def via_classmethodvalue(db):\n"
+                    "    return db.classMethodValue(\"Pkg.B\", \"Run\", \"x\")\n"
+                    "\n"
+                    "def via_invoke(db):\n"
+                    "    return db.invokeClassMethod(\"Pkg.A\", \"Run\", \"x\")\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/iris_cls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Helper.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Helper.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_nonexistent", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "unrelated_receiver", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_classmethodvalue", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", NULL), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* #518/#519 item-7 regression: the DELTA merge is the warm path most users
  * hit. It used to write nodes_fts with a hand-rolled four-column INSERT of
  * its own; with a fifth `body` column that literal leaves prose NULL for every
@@ -15121,6 +15277,7 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -15465,6 +15622,7 @@ SUITE(pipeline) {
     /* Ensemble routing pass */
     RUN_TEST(pipeline_ensemble_routing_edges);
     RUN_TEST(pipeline_ensemble_routing_method_scoping);
+    RUN_TEST(pipeline_python_iris_cls_class_aware_calls);
     RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
     RUN_TEST(pipeline_ensemble_routing_settings_targets);
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
