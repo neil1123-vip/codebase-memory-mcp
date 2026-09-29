@@ -1525,7 +1525,7 @@ TEST(daemon_host_cache_db_candidate_filter) {
 TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
     char parent[RUNTIME_TEST_PATH_CAP] = {0};
     if (!th_secure_runtime_parent_new(parent, sizeof(parent), "host-restore")) {
-        SKIP("安全运行时目录不可用");
+        FAIL("安全运行时目录不可用");
     }
     char cache[RUNTIME_TEST_PATH_CAP];
     char root[RUNTIME_TEST_PATH_CAP];
@@ -1551,9 +1551,9 @@ TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
     char db_path[RUNTIME_TEST_PATH_CAP];
     snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
     cbm_store_t *store = config_ok ? cbm_store_open_path(db_path) : NULL;
-    bool db_ok = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK &&
-                 cbm_store_upsert_project(store, "host-restore-project::missed", "") ==
-                     CBM_STORE_OK;
+    bool db_ok =
+        store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK &&
+        cbm_store_upsert_project(store, "host-restore-project::missed", "") == CBM_STORE_OK;
     if (store) {
         cbm_store_close(store);
     }
@@ -1581,29 +1581,27 @@ TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
     char backup_db_path[RUNTIME_TEST_PATH_CAP];
     snprintf(backup_db_path, sizeof(backup_db_path), "%s/backup-copy.db", cache);
     cbm_store_t *backup_store = cbm_store_open_path(backup_db_path);
-    bool backup_db_ok = backup_store &&
-                        cbm_store_upsert_project(backup_store, project, root) == CBM_STORE_OK;
+    bool backup_db_ok =
+        backup_store && cbm_store_upsert_project(backup_store, project, root) == CBM_STORE_OK;
     cbm_store_close(backup_store);
     char missing_db_path[RUNTIME_TEST_PATH_CAP];
     snprintf(missing_db_path, sizeof(missing_db_path), "%s/missing-root.db", cache);
     cbm_store_t *missing_store = cbm_store_open_path(missing_db_path);
-    bool missing_db_ok =
-        missing_store &&
-        cbm_store_upsert_project(missing_store, "missing-root", missing_root) == CBM_STORE_OK;
+    bool missing_db_ok = missing_store && cbm_store_upsert_project(missing_store, "missing-root",
+                                                                   missing_root) == CBM_STORE_OK;
     cbm_store_close(missing_store);
     char outside_db_path[RUNTIME_TEST_PATH_CAP];
     snprintf(outside_db_path, sizeof(outside_db_path), "%s/outside-root.db", cache);
     cbm_store_t *outside_store = cbm_store_open_path(outside_db_path);
-    bool outside_db_ok = outside_store &&
-                         cbm_store_upsert_project(outside_store, "outside-root", outside_root) ==
-                             CBM_STORE_OK;
+    bool outside_db_ok = outside_store && cbm_store_upsert_project(outside_store, "outside-root",
+                                                                   outside_root) == CBM_STORE_OK;
     cbm_store_close(outside_store);
     cbm_daemon_ipc_endpoint_t *endpoint =
         env_ok ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
     int watch_count = -1;
-    bool prepared_disabled = endpoint && config_ok &&
-                             cbm_daemon_host_state_prepare_watch_count_for_test(endpoint,
-                                                                                 &watch_count);
+    bool prepared_disabled =
+        endpoint && config_ok &&
+        cbm_daemon_host_state_prepare_watch_count_for_test(endpoint, &watch_count);
     bool auto_watch_disabled = prepared_disabled && watch_count == 0;
 
     config = cbm_config_open(cache);
@@ -1611,9 +1609,9 @@ TEST(daemon_host_restores_cached_watch_respects_runtime_gates) {
                              cbm_config_set(config, CBM_CONFIG_WATCHER_ENABLED, "true") == 0;
     cbm_config_close(config);
     watch_count = -1;
-    bool prepared_enabled = endpoint && enabled_config_ok &&
-                            cbm_daemon_host_state_prepare_watch_count_for_test(endpoint,
-                                                                                &watch_count);
+    bool prepared_enabled =
+        endpoint && enabled_config_ok &&
+        cbm_daemon_host_state_prepare_watch_count_for_test(endpoint, &watch_count);
     bool auto_watch_enabled = prepared_enabled && watch_count == 1;
 
     config = cbm_config_open(cache);

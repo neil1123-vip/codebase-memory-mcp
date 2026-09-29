@@ -76,13 +76,18 @@ static bool ipc_test_parent_new(char out[TEST_PATH_CAP], const char *tag) {
     return th_secure_runtime_parent_new(out, TEST_PATH_CAP, tag);
 }
 
-static void ipc_test_copy_path(char out[TEST_PATH_CAP], const char *path) {
+static void ipc_test_copy_path_impl(char *out, size_t out_cap, const char *path) {
+    if (!out || out_cap == 0) {
+        return;
+    }
     if (!path) {
         out[0] = '\0';
         return;
     }
-    (void)snprintf(out, TEST_PATH_CAP, "%s", path);
+    (void)snprintf(out, out_cap, "%s", path);
 }
+
+#define ipc_test_copy_path(out, path) ipc_test_copy_path_impl((out), sizeof(out), (path))
 
 static bool ipc_test_full_path(char out[TEST_PATH_CAP], const char *path) {
 #ifdef _WIN32
@@ -1127,8 +1132,8 @@ TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
     (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
     if (builtin_needed > 0) {
         builtin_admins = malloc(builtin_needed);
-        if (builtin_admins &&
-            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
+        if (builtin_admins && !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins,
+                                                  &builtin_needed)) {
             free(builtin_admins);
             builtin_admins = NULL;
         }
@@ -5383,8 +5388,7 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
     if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
         char unexpected[128];
         (void)snprintf(unexpected, sizeof(unexpected),
-                       "userns probe exited %d -- not a security verdict",
-                       WEXITSTATUS(status));
+                       "userns probe exited %d -- not a security verdict", WEXITSTATUS(status));
         FAIL(unexpected);
     }
     ASSERT_EQ(0, WEXITSTATUS(status));
