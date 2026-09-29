@@ -708,8 +708,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
          * made every file look changed on each incremental pass. */
         cbm_path_info_t path_info;
         if (cbm_path_info_utf8(files[i].path, &path_info) != CBM_PATH_INFO_OK ||
-            !path_info.is_regular ||
-            path_info.is_symlink) {
+            !path_info.is_regular || path_info.is_symlink) {
             changed[i] = true;
             n_changed++;
             continue;

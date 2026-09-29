@@ -6352,8 +6352,8 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
      * FILETIME-resolution nanoseconds, so a byte-identical file never matched
      * and every path was reported metadata_changed. */
     cbm_path_info_t path_info;
-    if (cbm_path_info_utf8(abs_path, &path_info) != CBM_PATH_INFO_OK || !path_info.is_regular ||
-        path_info.is_symlink) {
+    if (cbm_path_info_utf8(abs_path, &path_info) != CBM_PATH_INFO_OK ||
+        !path_info.is_regular || path_info.is_symlink) {
         return "missing";
     }
     if (!cbm_path_within_root(root_path, abs_path)) {

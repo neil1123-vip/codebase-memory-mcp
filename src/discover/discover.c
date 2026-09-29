@@ -1749,7 +1749,7 @@ cbm_discover_status_t cbm_discover_git_roots(const char *root, const cbm_discove
     cbm_gitignore_t *cbmignore =
         git_roots_load_ignore(opts && opts->ignore_file ? opts->ignore_file : path, &fl);
     walk_cache_dir_snapshot();
-    walk_dir(absolute, "", opts, gitignore, NULL, cbmignore, &fl);
+    walk_dir(absolute, "", opts, gitignore, NULL, NULL, cbmignore, &fl);
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(cbmignore);
     if (file_list_should_stop(&fl)) {
