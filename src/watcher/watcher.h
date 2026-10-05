@@ -3,7 +3,7 @@
  *
  * 轮询已索引项目的 Git 变化（HEAD 移动或工作区变更）。非 Git 根会发现子仓库，
  * 为子仓库建立独立图谱和 watcher，同时在子仓库变化时刷新外层项目。
- * Git 仓库之外的普通文件不触发监控。
+ * Git 仓库之外的普通文件需 cbm_watcher_set_poll_non_git() 开启监控。
  * Uses adaptive polling intervals based on project size
  * (5s base + 1s per 500 files, capped at 60s).
  *
@@ -66,6 +66,18 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
 void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
                                               cbm_watcher_repository_discovered_fn discovered,
                                               void *context);
+
+/* Opt in to polling ordinary files in NON-GIT project roots (#1948; default
+ * off — child Git repositories are still watched). When on, a non-git root
+ * is polled on the same adaptive cadence by a tree signature: the indexer's
+ * own discovery walk (same skip lists, .gitignore and .cbmignore rules),
+ * folded over each file's (relative
+ * path, size, mtime). A changed signature triggers index_fn; the first poll
+ * after baseline reindexes once, since nothing records which tree state the
+ * index holds. Paths discovery skips — including cbm's own .codebase-memory
+ * artifact directory and cache directory — never change the signature.
+ * Read at each project's baseline, so set it before registering projects. */
+void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled);
 
 /* ── Watch list management ──────────────────────────────────────── */
 
