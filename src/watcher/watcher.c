@@ -1,10 +1,11 @@
 /*
  * watcher.c — Git-based file change watcher.
  *
- * Strategy: git status + HEAD tracking (the most reliable approach).
- * Non-git projects are NOT polled by default. With the opt-in
+ * 策略：通过 git status 和 HEAD 检查变化。非 Git 项目根会发现子仓库，为每个
+ * 子仓库建立独立图谱和 watcher；子仓库变更也会刷新外层项目。
+ * Git 仓库之外的普通文件默认不触发监控。With the opt-in
  * cbm_watcher_set_poll_non_git(w, true) (config key `watch_non_git`, #1948)
- * they are polled with a tree signature instead: the indexer's own discovery
+ * they are also polled with a tree signature: the indexer's own discovery
  * walk (same ignore rules), folded over (relative path, size, mtime).
  *
  *
@@ -34,8 +35,8 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
+#include "discover/discover.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
-#include "discover/discover.h" /* cbm_discover: the non-git tree signature (#1948) */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -53,7 +54,7 @@
 
 /* ── Per-project state ──────────────────────────────────────────── */
 
-typedef struct {
+typedef struct project_state {
     char *project_name;
     char *root_path;
     /* poll_once snapshots retain state pointers after projects_lock is
@@ -65,14 +66,16 @@ typedef struct {
     cbm_subprocess_t *active_git;
     /* Room for Git's 64-hex SHA-256 object ID plus newline/NUL while reading. */
     char last_head[CBM_SZ_128]; /* git HEAD hash (committed baseline) */
-    bool is_git;                /* false → tree-polled if tree_poll, else skipped */
+    bool is_git;                /* false → discover child Git repositories */
     bool tree_poll;             /* non-git root polled by tree signature (#1948) */
     bool baseline_done;         /* true after first poll */
+    atomic_bool refresh_pending; /* 启动恢复要求的一次强制刷新 */
     int missing_root_count;     /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms;  /* cbm_now_ms() of the streak's first miss (0 = no streak) */
+    int last_root_stat_errno;
     int file_count;             /* approximate, for interval calc */
     int interval_ms;            /* adaptive poll interval */
-    int64_t next_poll_ns;       /* next poll time (monotonic ns) */
+    atomic_int_fast64_t next_poll_ns; /* 单调时钟的下次轮询时间（纳秒） */
     /* Dirty-state signature (#937): a persistently dirty worktree must
      * reindex once per DISTINCT dirty state, not on every poll. Baselines
      * are committed only after a SUCCESSFUL reindex (busy-skips and failed
@@ -95,10 +98,22 @@ typedef struct {
      * decays the retry cadence so "never lost" does not also mean "retried
      * forever". Reset to 0 by any successful reindex. */
     int index_failures;
+    bool index_retry_logged; /* 同一轮忙碌重试只记录一次，成功后复位。 */
     /* Hop from root_path up to the repository root ("" when they are the same),
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
     char repo_cdup[CBM_SZ_4K];
+    /* 子仓库探测复用外层项目的取消/进程槽；独立 watcher 由发现回调登记。 */
+    struct project_state *owner;
+    struct project_state **repositories;
+    int repository_count;
+    bool repositories_discovered;
+    bool repositories_changed;
+    bool independent_watch_pending;
+    bool independent_watch_retry_logged;
+    bool pending_valid;
+    int64_t next_discovery_ns;
+    atomic_bool rediscover;
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -116,9 +131,11 @@ struct cbm_watcher {
     cbm_watcher_project_mutation_end_fn mutation_end;
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
+    cbm_watcher_repository_discovered_fn repository_discovered;
+    void *repository_context;
     atomic_int stopped;
-    /* Opt-in (#1948): poll non-git roots by tree signature. Default false —
-     * non-git roots are not watched. Read at each project's baseline. */
+    /* Opt-in (#1948): poll ordinary non-git files by tree signature. Default
+     * false; child Git repositories are still watched. Read at baseline. */
     atomic_bool poll_non_git;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
@@ -136,6 +153,8 @@ struct cbm_watcher {
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
+#define REPOSITORY_DISCOVERY_MS 60000
+#define REPOSITORY_DISCOVERY_BUDGET_MS 5000
 
 /* Hard index-failure backoff. Doubling per consecutive failure, capped, so a
  * persistently failing project costs ~12 attempts/hour instead of ~480 while
@@ -147,12 +166,8 @@ struct cbm_watcher {
  * daemon log names the stuck project instead of only repeating the warning. */
 #define INDEX_FAIL_SUSTAINED 10
 
-/* Stale-root pruning (#286): a watched project whose root directory stays
- * missing is pruned — its cached DB is deleted and the watch entry removed.
- * Deletion is destructive (the DB can hold user-authored data such as the
- * ADR), so it requires BOTH a streak of consecutive missing polls AND a
- * sustained-absence grace window measured from the streak's first miss. */
-#define MISSING_ROOT_DELETE_AFTER 3
+/* 根目录持续不存在时只解除 watcher；缓存库可能含 ADR 等用户数据，必须保留。 */
+#define MISSING_ROOT_UNWATCH_AFTER 3
 #define PRUNE_GRACE_DEFAULT_S 600 /* 10 min; override: CBM_WATCHER_PRUNE_GRACE_S */
 
 /* Sleep chunk for responsive shutdown (ms) */
@@ -198,11 +213,11 @@ int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures) {
 }
 
 int cbm_watcher_poll_interval_ms(int file_count) {
-    int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
+    int64_t ms = POLL_BASE_MS + (((int64_t)file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
     if (ms > POLL_MAX_MS) {
         ms = POLL_MAX_MS;
     }
-    return ms;
+    return (int)ms;
 }
 
 /* ── Git helpers ────────────────────────────────────────────────── */
@@ -379,8 +394,15 @@ static watcher_git_status_t watcher_git_run(cbm_watcher_t *w, project_state_t *s
     if (!w || !state || !argv || !argv[0]) {
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
+    if (state->owner) {
+        state = state->owner;
+    }
     if (output) {
         memset(output, 0, sizeof(*output));
+    }
+    if (atomic_load_explicit(&w->stopped, memory_order_acquire) ||
+        !atomic_load_explicit(&state->registered, memory_order_acquire)) {
+        return WATCHER_GIT_CANCELLED;
     }
     if (output_limit > 0 && (!output || !watcher_git_output_create(output))) {
         return WATCHER_GIT_SUPERVISION_FAILED;
@@ -921,6 +943,9 @@ static project_state_t *state_new(const char *name, const char *root_path) {
         return NULL;
     }
     atomic_init(&s->registered, true);
+    atomic_init(&s->rediscover, true);
+    atomic_init(&s->refresh_pending, false);
+    atomic_init(&s->next_poll_ns, 0);
     s->interval_ms = POLL_BASE_MS;
     return s;
 }
@@ -931,6 +956,10 @@ static void state_free(project_state_t *s) {
     }
     free(s->project_name);
     free(s->root_path);
+    for (int i = 0; i < s->repository_count; i++) {
+        state_free(s->repositories[i]);
+    }
+    free(s->repositories);
     free(s);
 }
 
@@ -1015,62 +1044,6 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
-static bool watcher_unlink_cached_file(const char *project_name, const char *path,
-                                       const char *artifact) {
-    if (cbm_unlink(path) == 0 || errno == ENOENT) {
-        return true;
-    }
-    int unlink_errno = errno;
-    char errno_text[CBM_SZ_32];
-    snprintf(errno_text, sizeof(errno_text), "%d", unlink_errno);
-    cbm_log_warn("watcher.root_prune_delete_failed", "project", project_name, "artifact", artifact,
-                 "path", path, "errno", errno_text);
-    return false;
-}
-
-static bool delete_cached_project_db(const char *project_name) {
-    if (!cbm_validate_project_name(project_name)) {
-        return false;
-    }
-
-    const char *cache_dir = cbm_resolve_cache_dir();
-    if (!cache_dir) {
-        return false;
-    }
-
-    size_t cache_length = strlen(cache_dir);
-    size_t project_length = strlen(project_name);
-    if (cache_length > SIZE_MAX - project_length - sizeof("/.db")) {
-        return false;
-    }
-    size_t path_capacity = cache_length + project_length + sizeof("/.db");
-    char *path = malloc(path_capacity);
-    char *sidecar = malloc(path_capacity + sizeof("-wal"));
-    if (!path || !sidecar) {
-        free(path);
-        free(sidecar);
-        return false;
-    }
-    int written = snprintf(path, path_capacity, "%s/%s.db", cache_dir, project_name);
-    bool formatted = written > 0 && (size_t)written < path_capacity;
-    bool removed = formatted && watcher_unlink_cached_file(project_name, path, "database");
-    /* If the main DB could not be removed, preserve WAL/SHM: together they
-     * may be the only recoverable committed generation. */
-    if (removed) {
-        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-wal", path);
-        removed = written > 0 && (size_t)written < path_capacity + sizeof("-wal") &&
-                  watcher_unlink_cached_file(project_name, sidecar, "wal");
-    }
-    if (removed) {
-        written = snprintf(sidecar, path_capacity + sizeof("-wal"), "%s-shm", path);
-        removed = written > 0 && (size_t)written < path_capacity + sizeof("-wal") &&
-                  watcher_unlink_cached_file(project_name, sidecar, "shm");
-    }
-    free(path);
-    free(sidecar);
-    return removed;
-}
-
 /* Hash table foreach callback to free state entries */
 static void free_state_entry(const char *key, void *val, void *ud) {
     (void)key;
@@ -1141,6 +1114,18 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
     w->mutation_end = valid ? end : NULL;
     w->project_pruned = valid ? pruned : NULL;
     w->mutation_context = valid ? context : NULL;
+    cbm_mutex_unlock(&w->coordination_lock);
+}
+
+void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
+                                              cbm_watcher_repository_discovered_fn discovered,
+                                              void *context) {
+    if (!w) {
+        return;
+    }
+    cbm_mutex_lock(&w->coordination_lock);
+    w->repository_discovered = discovered;
+    w->repository_context = discovered ? context : NULL;
     cbm_mutex_unlock(&w->coordination_lock);
 }
 
@@ -1246,7 +1231,22 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
-        s->next_poll_ns = 0;
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
+        atomic_store_explicit(&s->rediscover, true, memory_order_release);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+}
+
+void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        /* 首次 poll 先建立基线，再执行一次强制刷新，避免 clean commit 被基线吞掉。 */
+        atomic_store_explicit(&s->refresh_pending, true, memory_order_release);
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
     }
     cbm_mutex_unlock(&w->projects_lock);
 }
@@ -1299,9 +1299,9 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
      * A directory is only really git-managed here if it carries its own .git,
      * or the ancestor repository actually tracks something inside it. A
      * genuine sub-package of a monorepo passes the second test; a scratch or
-     * gitignored folder sitting under a repo fails both and is treated as a
-     * non-git root: NOT polled by default, or polled by its own tree signature
-     * when the watch_non_git opt-in is on (#1948). Either way the ancestor's
+     * gitignored folder sitting under a repo fails both and is polled as a
+     * container of possible child repositories, and by its own tree signature
+     * when the watch_non_git opt-in is on (#1948). The ancestor's
      * dirty state never reaches it. */
     if (s->is_git && !git_has_own_dot_git(s->root_path)) {
         bool tracked = false;
@@ -1354,10 +1354,13 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         s->tree_poll = true;
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "tree");
     } else {
-        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
+        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git_children",
+                     "status", "discovering");
     }
 
-    s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+    atomic_store_explicit(&s->next_poll_ns,
+                          now_ns() + ((int64_t)s->interval_ms * US_PER_MS),
+                          memory_order_release);
     return true;
 }
 
@@ -1401,8 +1404,13 @@ static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_ou
     watcher_git_status_t head_status = git_head(w, s, head, sizeof(head));
     if (head_status == WATCHER_GIT_OK) {
         if (s->last_head[0] == '\0') {
-            /* First observed HEAD: adopt as baseline, not a change. */
-            snprintf(s->last_head, sizeof(s->last_head), "%s", head);
+            if (s->owner) {
+                /* An empty child repository can gain its first clean commit
+                 * between polls. Do not absorb it before the outer refresh. */
+                changed = true;
+            } else {
+                snprintf(s->last_head, sizeof(s->last_head), "%s", head);
+            }
         } else if (strcmp(head, s->last_head) != 0) {
             changed = true;
         }
@@ -1419,7 +1427,7 @@ static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_ou
     if (signature_status == WATCHER_GIT_COMMAND_FAILED) {
         /* The repository may have been removed between baseline and poll.
          * Preserve committed observations and wait for a later clean probe. */
-        return true;
+        return s->owner == NULL;
     }
     if (signature_status != WATCHER_GIT_OK) {
         return false;
@@ -1431,6 +1439,174 @@ static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_ou
 
     *changed_out = changed;
     return true;
+}
+
+typedef struct {
+    cbm_watcher_t *watcher;
+    project_state_t *project;
+} repository_scan_t;
+
+static bool repository_scan_cancelled(void *context) {
+    repository_scan_t *scan = context;
+    return atomic_load_explicit(&scan->watcher->stopped, memory_order_acquire) ||
+           !atomic_load_explicit(&scan->project->registered, memory_order_acquire);
+}
+
+static project_state_t *find_repository(project_state_t **items, int count, const char *path) {
+    /* ponytail: at most 1024 roots from discovery; use a map if large workspaces
+     * make this once-per-minute reconciliation measurable. */
+    for (int i = 0; i < count; i++) {
+        if (strcmp(items[i]->root_path, path) == 0) {
+            return items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Only a complete discovery replaces the root set. Retain existing Git
+ * baselines; a newly found clean repository still needs an outer refresh. */
+static bool refresh_repositories(cbm_watcher_t *w, project_state_t *s) {
+    repository_scan_t scan = {.watcher = w, .project = s};
+    cbm_discover_opts_t options = {.mode = CBM_MODE_FULL};
+    char **roots = NULL;
+    int count = 0;
+    cbm_discover_status_t status = cbm_discover_git_roots(
+        s->root_path, &options, cbm_now_ms() + REPOSITORY_DISCOVERY_BUDGET_MS,
+        repository_scan_cancelled, &scan, &roots, &count);
+    if (status != CBM_DISCOVER_OK) {
+        cbm_log_warn("watcher.discovery.failed", "project", s->project_name, "reason",
+                     status == CBM_DISCOVER_LIMIT_EXCEEDED ? "repository_limit" : "incomplete");
+        return false;
+    }
+    project_state_t **next = count > 0 ? calloc((size_t)count, sizeof(*next)) : NULL;
+    if (count > 0 && !next) {
+        cbm_discover_free_excluded(roots, count);
+        return false;
+    }
+    bool complete = true;
+    bool changed = false;
+    int next_count = 0;
+    int file_count = 0;
+    for (int i = 0; i < count; i++) {
+        project_state_t *repository =
+            find_repository(s->repositories, s->repository_count, roots[i]);
+        if (!repository) {
+            repository = state_new(s->project_name, roots[i]);
+            if (repository) {
+                repository->owner = s;
+            }
+            if (!repository || !init_baseline(w, repository)) {
+                state_free(repository);
+                complete = false;
+                break;
+            }
+            if (!repository->is_git) {
+                /* A marker alone does not prove a Git repository exists. */
+                state_free(repository);
+                continue;
+            }
+            repository->independent_watch_pending = true;
+            changed = true;
+        }
+        next[next_count++] = repository;
+        if (repository_scan_cancelled(&scan)) {
+            complete = false;
+            break;
+        }
+        if (repository->file_count > INT_MAX - file_count) {
+            file_count = INT_MAX;
+        } else {
+            file_count += repository->file_count;
+        }
+    }
+    cbm_discover_free_excluded(roots, count);
+    if (!complete) {
+        for (int i = 0; i < next_count; i++) {
+            if (next[i] &&
+                !find_repository(s->repositories, s->repository_count, next[i]->root_path)) {
+                state_free(next[i]);
+            }
+        }
+        free(next);
+        return false;
+    }
+    for (int i = 0; i < s->repository_count; i++) {
+        if (!find_repository(next, next_count, s->repositories[i]->root_path)) {
+            state_free(s->repositories[i]);
+        }
+    }
+    free(s->repositories);
+    changed |= next_count != s->repository_count;
+    s->repositories = next;
+    s->repository_count = next_count;
+    s->repositories_changed |= changed;
+    s->file_count = file_count;
+    s->interval_ms = cbm_watcher_poll_interval_ms(file_count);
+    for (int i = 0; i < s->repository_count; i++) {
+        project_state_t *repository = s->repositories[i];
+        if (!repository->owner || !repository->independent_watch_pending) {
+            continue;
+        }
+        cbm_mutex_lock(&w->coordination_lock);
+        cbm_watcher_repository_discovered_fn discovered = w->repository_discovered;
+        void *context = w->repository_context;
+        bool registered = discovered &&
+                          discovered(s->project_name, repository->root_path, context);
+        cbm_mutex_unlock(&w->coordination_lock);
+        if (registered) {
+            repository->independent_watch_pending = false;
+            repository->independent_watch_retry_logged = false;
+        } else if (discovered && !repository->independent_watch_retry_logged) {
+            cbm_log_warn("watcher.repository.register_failed", "project", s->project_name,
+                         "path", repository->root_path, "action", "retry");
+            repository->independent_watch_retry_logged = true;
+        }
+    }
+    if (!s->repositories_discovered || changed) {
+        cbm_log_info("watcher.repositories", "project", s->project_name, "count",
+                     itoa_buf(next_count), "auto_refresh",
+                     next_count > 0 ? "git_children" : "disabled_no_git");
+    }
+    s->repositories_discovered = true;
+    s->next_discovery_ns = now_ns() + ((int64_t)REPOSITORY_DISCOVERY_MS * US_PER_MS);
+    return true;
+}
+
+static bool check_repository_changes(cbm_watcher_t *w, project_state_t *s, bool *changed) {
+    repository_scan_t scan = {.watcher = w, .project = s};
+    bool rediscover = atomic_exchange_explicit(&s->rediscover, false, memory_order_acq_rel);
+    if (rediscover || now_ns() >= s->next_discovery_ns) {
+        if (!refresh_repositories(w, s)) {
+            atomic_store_explicit(&s->rediscover, true, memory_order_release);
+            /* Discovery failure must not disable already known siblings. */
+        }
+    }
+    *changed = s->repositories_changed;
+    for (int i = 0; i < s->repository_count; i++) {
+        if (repository_scan_cancelled(&scan)) {
+            return false;
+        }
+        project_state_t *repository = s->repositories[i];
+        repository->pending_valid = false;
+        /* A removed marker must not make Git silently inherit an ancestor's
+         * repository. A complete rediscovery will remove this child. */
+        bool child_changed = false;
+        if (!git_has_own_dot_git(repository->root_path) ||
+            !check_changes(w, repository, &child_changed)) {
+            atomic_store_explicit(&s->rediscover, true, memory_order_release);
+            continue;
+        }
+        repository->pending_valid = true;
+        *changed |= child_changed;
+    }
+    return true;
+}
+
+static void commit_git_baseline(project_state_t *s) {
+    if (s->pending_head[0] != '\0') {
+        snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
+    }
+    s->last_dirty_sig = s->pending_dirty_sig;
 }
 
 /* Context for poll_once foreach callback */
@@ -1474,19 +1650,13 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     uint64_t now_ms = cbm_now_ms();
     bool still_eligible =
         current == s && strcmp(current->root_path, root_path) == 0 &&
-        current->missing_root_count >= MISSING_ROOT_DELETE_AFTER && current->first_missing_ms > 0 &&
+        current->missing_root_count >= MISSING_ROOT_UNWATCH_AFTER && current->first_missing_ms > 0 &&
         now_ms - current->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC &&
         root_status(root_path, &stat_errno) == ROOT_MISSING;
     if (still_eligible && defer_state_free(w, s)) {
-        if (delete_cached_project_db(project_name)) {
-            atomic_store_explicit(&s->registered, false, memory_order_release);
-            cbm_ht_delete(w->projects, project_name);
-            removed = true;
-        } else {
-            /* The state stays registered; undo the just-added deferred-free
-             * entry so the next poll can safely retry the failed deletion. */
-            w->pending_free[--w->pending_free_count] = NULL;
-        }
+        atomic_store_explicit(&s->registered, false, memory_order_release);
+        cbm_ht_delete(w->projects, project_name);
+        removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
 
@@ -1499,7 +1669,8 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     cbm_mutex_unlock(&w->coordination_lock);
 
     if (removed) {
-        cbm_log_info("watcher.root_pruned", "project", project_name);
+        cbm_log_info("watcher.root_unwatched", "project", project_name,
+                     "reason", "root_missing");
     }
     free(project_name);
     free(root_path);
@@ -1512,13 +1683,18 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
 static void commit_baselines(cbm_watcher_t *w, project_state_t *s) {
     if (!s->is_git) {
         /* Tree strategy (#1948): the walk already refreshed the file count. */
-        s->last_tree_sig = s->pending_tree_sig;
+        if (s->tree_poll) {
+            s->last_tree_sig = s->pending_tree_sig;
+        }
+        for (int i = 0; i < s->repository_count; i++) {
+            if (s->repositories[i]->pending_valid) {
+                commit_git_baseline(s->repositories[i]);
+            }
+        }
+        s->repositories_changed = false;
         return;
     }
-    if (s->pending_head[0] != '\0') {
-        snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
-    }
-    s->last_dirty_sig = s->pending_dirty_sig;
+    commit_git_baseline(s);
     /* Refresh file count for interval */
     int file_count = 0;
     if (git_file_count(w, s, &file_count) == WATCHER_GIT_OK) {
@@ -1535,33 +1711,32 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
 
-    /* Stale-root pruning (#286): classify the root BEFORE the baseline /
-     * is_git / interval gates so vanished roots are noticed even for
-     * non-git projects and regardless of adaptive backoff. */
+    /* 先于基线、Git 类型和退避检查根目录，确保非 Git 项目也能及时解除失效 watcher。 */
     int stat_errno = 0;
     root_status_t rs = root_status(s->root_path, &stat_errno);
     if (rs == ROOT_UNCERTAIN) {
-        /* EACCES / EIO / network blip / TCC revocation — the root may still
-         * exist. Never count toward pruning; restart the streak so only an
-         * uninterrupted run of genuine ENOENT/ENOTDIR observations can
-         * delete user data. */
+        /* 权限、I/O 或挂载错误不能证明目录已删除；清空缺失计数，并按错误码抑制重复日志。 */
         if (s->missing_root_count > 0) {
             s->missing_root_count = 0;
             s->first_missing_ms = 0;
         }
-        cbm_log_warn("watcher.root_stat_error", "project", s->project_name, "path", s->root_path,
-                     "errno", itoa_buf(stat_errno));
+        if (s->last_root_stat_errno != stat_errno) {
+            cbm_log_warn("watcher.root_stat_error", "project", s->project_name, "path",
+                         s->root_path, "errno", itoa_buf(stat_errno));
+            s->last_root_stat_errno = stat_errno;
+        }
         return;
     }
+    s->last_root_stat_errno = 0;
     if (rs == ROOT_MISSING) {
         uint64_t now_ms = cbm_now_ms();
         if (s->missing_root_count == 0) {
             s->first_missing_ms = now_ms;
+            cbm_log_warn("watcher.root_missing", "project", s->project_name, "path",
+                         s->root_path, "polls", "1");
         }
         s->missing_root_count++;
-        cbm_log_warn("watcher.root_missing", "project", s->project_name, "path", s->root_path,
-                     "polls", itoa_buf(s->missing_root_count));
-        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER &&
+        if (s->missing_root_count >= MISSING_ROOT_UNWATCH_AFTER &&
             now_ms - s->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC) {
             prune_missing_project(ctx->w, s);
         }
@@ -1573,52 +1748,79 @@ static void poll_project(const char *key, void *val, void *ud) {
         s->first_missing_ms = 0;
     }
 
+    bool refresh_pending = atomic_load_explicit(&s->refresh_pending, memory_order_acquire);
+    int64_t next_poll_ns = atomic_load_explicit(&s->next_poll_ns, memory_order_acquire);
+    bool force_refresh = refresh_pending && ctx->now >= next_poll_ns;
+    bool baseline_refresh = refresh_pending && !s->baseline_done;
+
     /* Initialize baseline on first poll */
     if (!s->baseline_done) {
         (void)init_baseline(ctx->w, s);
-        return;
-    }
-
-    /* Non-git projects are skipped unless the watch_non_git opt-in turned on
-     * tree polling for them at baseline (#1948). */
-    if (!s->is_git && !s->tree_poll) {
-        return;
+        if (!s->baseline_done || (!force_refresh && !baseline_refresh)) {
+            return;
+        }
+        force_refresh = true;
+        atomic_store_explicit(&s->next_poll_ns, 0, memory_order_release);
     }
 
     /* Respect adaptive interval */
-    if (ctx->now < s->next_poll_ns) {
+    if (!force_refresh &&
+        ctx->now < atomic_load_explicit(&s->next_poll_ns, memory_order_acquire)) {
         return;
     }
 
     /* Check for changes */
     bool changed = false;
-    if (!check_changes(ctx->w, s, &changed)) {
+    bool checked = s->is_git ? check_changes(ctx->w, s, &changed)
+                             : check_repository_changes(ctx->w, s, &changed);
+    if (checked && s->tree_poll) {
+        bool tree_changed = false;
+        checked = check_tree_changes(s, &tree_changed);
+        changed |= tree_changed;
+    }
+    if (force_refresh) {
+        changed = true;
+    }
+    if (!checked) {
+        atomic_store_explicit(&s->next_poll_ns,
+                              ctx->now + ((int64_t)s->interval_ms * US_PER_MS),
+                              memory_order_release);
         return;
     }
     if (!changed) {
-        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+        s->index_retry_logged = false;
+        atomic_store_explicit(&s->next_poll_ns,
+                              ctx->now + ((int64_t)s->interval_ms * US_PER_MS),
+                              memory_order_release);
         return;
     }
 
     /* Trigger reindex */
-    if (!atomic_load_explicit(&s->registered, memory_order_acquire)) {
+    if (!atomic_load_explicit(&s->registered, memory_order_acquire) ||
+        atomic_load_explicit(&ctx->w->stopped, memory_order_acquire)) {
         /* Git inspection can take long enough for the final owning daemon
          * session to disconnect. Unwatch tombstones the snapshot state; do
          * not admit an index callback after that ownership boundary. */
         return;
     }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy",
-                 s->is_git ? "git" : "tree");
+                 s->is_git ? "git" : (s->tree_poll ? "tree" : "git_children"));
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
+            s->index_retry_logged = false;
+            atomic_store_explicit(&s->refresh_pending, false, memory_order_release);
             commit_baselines(ctx->w, s);
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
-            cbm_log_info("watcher.index.retry", "project", s->project_name);
+            if (!s->index_retry_logged) {
+                cbm_log_info("watcher.index.retry", "project", s->project_name);
+                s->index_retry_logged = true;
+            }
         } else {
+            s->index_retry_logged = false;
             /* itoa_buf returns one shared per-thread buffer, so two of them
              * in one call would print the same value twice. */
             char rc_text[CBM_SZ_32];
@@ -1638,9 +1840,11 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Failures back off; success and busy-skip keep the adaptive cadence. */
-    s->next_poll_ns =
+    atomic_store_explicit(
+        &s->next_poll_ns,
         ctx->now +
-        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
+            ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS),
+        memory_order_release);
 }
 
 /* Callback to snapshot project state pointers into an array. */

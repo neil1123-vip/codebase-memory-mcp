@@ -1801,6 +1801,8 @@ struct cbm_mcp_server {
     cbm_mcp_project_mutation_try_begin_fn mutation_try_begin;
     cbm_mcp_project_mutation_end_fn mutation_end;
     void *mutation_context;
+    cbm_mcp_project_deleted_fn project_deleted;
+    void *project_deleted_context;
     cbm_mcp_quarantine_test_hook_fn quarantine_test_hook;
     void *quarantine_test_context;
     cbm_mcp_command_test_hook_fn command_test_hook;
@@ -1988,6 +1990,15 @@ void cbm_mcp_server_set_project_mutation_try_guard(
     cbm_mcp_server_t *srv, cbm_mcp_project_mutation_try_begin_fn try_begin) {
     if (srv && srv->mutation_begin) {
         srv->mutation_try_begin = try_begin;
+    }
+}
+
+void cbm_mcp_server_set_project_deleted_callback(cbm_mcp_server_t *srv,
+                                                 cbm_mcp_project_deleted_fn callback,
+                                                 void *context) {
+    if (srv) {
+        srv->project_deleted = callback;
+        srv->project_deleted_context = callback ? context : NULL;
     }
 }
 
@@ -2447,6 +2458,12 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
     srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    if (!srv->store && path[0] && cbm_file_exists(path) && recovery_status) {
+        /* A published DB can be briefly unavailable while its writer swaps
+         * generations. Keep this distinct from a genuinely missing project so
+         * query callers can retry without turning hard errors into sleeps. */
+        *recovery_status = STORE_RECOVERY_BUSY;
+    }
     if (srv->store) {
         /* Query-only resolve: classify a failed integrity check without any
          * mutation — no lease, no quarantine. A corrupt database is reported
@@ -2585,7 +2602,21 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
 
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* Query-only callers (every read tool): strictly non-mutating resolve. */
-    return resolve_store_internal(srv, project, false, false, NULL, false);
+    enum {
+        STORE_RESOLVE_ATTEMPTS = 3,
+        STORE_RESOLVE_RETRY_US = 50000,
+    };
+    store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
+    for (int attempt = 0; attempt < STORE_RESOLVE_ATTEMPTS; attempt++) {
+        cbm_store_t *store = resolve_store_internal(srv, project, false, false,
+                                                     &recovery_status, false);
+        if (store || recovery_status != STORE_RECOVERY_BUSY ||
+            attempt + 1 >= STORE_RESOLVE_ATTEMPTS) {
+            return store;
+        }
+        cbm_usleep(STORE_RESOLVE_RETRY_US);
+    }
+    return NULL;
 }
 
 /* Forward decl — definition lives below in handle_trace_call_path's helpers. */
@@ -6460,8 +6491,9 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
      * seconds on Windows (st_mtime), while the file_hashes record carries
      * FILETIME-resolution nanoseconds, so a byte-identical file never matched
      * and every path was reported metadata_changed. */
-    cbm_path_info_t info;
-    if (cbm_path_info_utf8(abs_path, &info) != 0) {
+    cbm_path_info_t path_info;
+    if (cbm_path_info_utf8(abs_path, &path_info) != CBM_PATH_INFO_OK ||
+        !path_info.is_regular || path_info.is_symlink) {
         return "missing";
     }
     if (!cbm_path_within_root(root_path, abs_path)) {
@@ -6477,7 +6509,7 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
     if (rc != CBM_STORE_OK) {
         return "unavailable";
     }
-    bool matches = hash.mtime_ns == info.mtime_ns && hash.size == info.size;
+    bool matches = hash.mtime_ns == path_info.mtime_ns && hash.size == path_info.size;
     cbm_store_clear_file_hash(&hash);
     return matches ? "metadata_match" : "metadata_changed";
 }
@@ -7013,6 +7045,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
+    bool project_removed = !exists;
 
     if (exists) {
         int rc = cbm_unlink(path);
@@ -7020,6 +7053,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         (void)cbm_unlink(shm);
         if (rc == 0) {
             status = "deleted";
+            project_removed = true;
         } else {
             status = "delete_failed";
             error_detail = strerror(errno);
@@ -7031,8 +7065,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_unlock();
 
-    if (srv->watcher) {
-        cbm_watcher_unwatch(srv->watcher, name);
+    if (project_removed) {
+        if (srv->project_deleted) {
+            srv->project_deleted(srv->project_deleted_context, name);
+        } else if (srv->watcher) {
+            cbm_watcher_unwatch(srv->watcher, name);
+        }
     }
 
     cbm_mem_collect(); /* return freed pages to OS after closing database */
@@ -11477,6 +11515,11 @@ static void index_args_free(char *repo_path, char *mode_str, char *name_override
     free(name_override);
 }
 
+static bool auto_watch_enabled(cbm_mcp_server_t *srv);
+static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
+                                              const char *root);
+static bool index_response_is_success(const char *response);
+
 /* #2144: async and status are strict booleans. A present non-boolean value is
  * refused rather than read as false, so "async":"true" never silently blocks
  * for the whole index. */
@@ -11714,6 +11757,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         char *supervised = index_run_supervised(srv, worker_args);
         free(worker_args);
         if (supervised) {
+            if (index_response_is_success(supervised)) {
+                register_index_watcher_if_enabled(srv, mutation_project, repo_path);
+            }
             free(mutation_project);
             index_args_free(repo_path, mode_str, name_override);
             return supervised;
@@ -11961,6 +12007,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         cbm_log_info("index.worker.fast_exit", "skip", "pipeline_free");
     } else {
         cbm_pipeline_free(p);
+    }
+    if (rc == 0) {
+        register_index_watcher_if_enabled(srv, mutation_project, repo_path);
     }
     free(project_name);
     free(repo_path);
@@ -19015,6 +19064,29 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
     cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
 }
 
+static bool index_response_is_success(const char *response) {
+    yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *is_error = yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    bool success = yyjson_is_bool(is_error) && !yyjson_get_bool(is_error);
+    yyjson_doc_free(document);
+    return success;
+}
+
+/* Explicit index requests can target a project below the MCP session root.
+ * Keep that target live too; the daemon coordinator handles its own logical
+ * session ownership, while standalone embedders use the borrowed watcher. */
+static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
+                                              const char *root) {
+    if (!srv || !srv->watcher || !project || !project[0] || !root || !root[0] ||
+        !auto_watch_enabled(srv)) {
+        return;
+    }
+    if (!cbm_watcher_watch(srv->watcher, project, root)) {
+        cbm_log_warn("watcher.register.failed", "project", project, "path", root);
+    }
+}
+
 /* Background auto-index thread function */
 /* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
  * Every worker thread that runs extraction must free that cache before it exits,
@@ -19102,7 +19174,8 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
     return status == CBM_DISCOVER_OK;
 }
 
-/* Start auto-indexing if configured and project not yet indexed. */
+/* Start auto-indexing if configured. Existing DBs are refreshed once at startup
+ * so commits made while the process was down cannot be missed by the watcher. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
@@ -19123,21 +19196,6 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Check if project already has a DB */
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        char db_check[CBM_SZ_1K];
-        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
-                 srv->session_project);
-        if (cbm_file_size(db_check) >= 0) {
-            /* Already indexed → register watcher for change detection */
-            cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
-                         srv->session_project);
-            register_watcher_if_enabled(srv);
-            return;
-        }
-    }
-
     /* Check auto_index config */
     bool auto_index = false;
     int file_limit = CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
@@ -19145,6 +19203,24 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, false);
         file_limit = cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                         CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT);
+    }
+
+    /* Existing DBs still get one startup refresh when auto_index is enabled. */
+    const char *home = cbm_get_home_dir();
+    if (home) {
+        char db_check[CBM_SZ_1K];
+        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
+                 srv->session_project);
+        if (cbm_file_size(db_check) >= 0) {
+            if (!auto_index) {
+                cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
+                             srv->session_project);
+                register_watcher_if_enabled(srv);
+                return;
+            }
+            cbm_log_info("autoindex.refresh", "reason", "startup", "project",
+                         srv->session_project);
+        }
     }
 
     if (!auto_index) {

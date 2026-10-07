@@ -25,6 +25,7 @@ typedef int (*cbm_http_index_executor_fn)(void *context, const char *root_path,
                                           const char *project_name);
 typedef bool (*cbm_http_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_http_project_mutation_end_fn)(void *context, const char *project);
+typedef void (*cbm_http_project_deleted_fn)(void *context, const char *project);
 
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
@@ -63,6 +64,9 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
 
 /* Set external watcher reference for UI project lifecycle actions. Not owned. */
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
+void cbm_http_server_set_project_deleted_callback(cbm_http_server_t *srv,
+                                                  cbm_http_project_deleted_fn callback,
+                                                  void *context);
 
 /* Route UI indexing through the daemon's shared operation registry. */
 void cbm_http_server_set_index_executor(cbm_http_server_t *srv, cbm_http_index_executor_fn executor,

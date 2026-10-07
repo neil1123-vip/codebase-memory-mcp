@@ -1,12 +1,13 @@
 /*
  * watcher.h — File change watcher for auto-reindexing.
  *
- * Polls indexed projects for git changes (HEAD movement or dirty working tree)
- * and triggers re-indexing via a callback. Uses adaptive polling intervals
- * based on project size (5s base + 1s per 500 files, capped at 60s).
- * Non-git roots are not polled unless cbm_watcher_set_poll_non_git() opts in.
+ * 轮询已索引项目的 Git 变化（HEAD 移动或工作区变更）。非 Git 根会发现子仓库，
+ * 为子仓库建立独立图谱和 watcher，同时在子仓库变化时刷新外层项目。
+ * Git 仓库之外的普通文件需 cbm_watcher_set_poll_non_git() 开启监控。
+ * Uses adaptive polling intervals based on project size
+ * (5s base + 1s per 500 files, capped at 60s).
  *
- * Depends on: foundation, store (for project metadata)
+ * Depends on: foundation, store (for project metadata), discover
  */
 #ifndef CBM_WATCHER_H
 #define CBM_WATCHER_H
@@ -29,17 +30,18 @@ typedef struct cbm_watcher cbm_watcher_t;
  * commits the watcher's change baselines — a skipped or failed reindex keeps
  * the change pending so it is retried, never silently lost (#937).
  * project_name: project identifier
- * root_path: absolute path to the repository root */
+ * root_path: absolute path to the indexed project root (possibly a container
+ * of multiple Git repositories) */
 typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
 
-/* Optional daemon coordination for destructive stale-root pruning. begin is
- * non-blocking: a false result preserves the watch and retries on a later
- * poll. A successful begin is paired with end. pruned is called after the
- * physical watch and cached DB have been removed so the daemon can invalidate
- * its logical subscriptions. All callbacks use the same borrowed context. */
+/* daemon 用于协调 root 缺失后的物理 watcher 卸载。begin 非阻塞失败时保留 watcher 并重试；
+ * 成功 begin 必须配对 end。pruned 在物理 watcher 移除后调用，缓存数据库始终保留。 */
 typedef bool (*cbm_watcher_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_mutation_end_fn)(void *context, const char *project);
 typedef void (*cbm_watcher_project_pruned_fn)(void *context, const char *project);
+/* 发现新的子 Git 仓库时登记独立项目；返回 false 表示稍后重试。 */
+typedef bool (*cbm_watcher_repository_discovered_fn)(const char *enclosing_project,
+                                                     const char *repository_root, void *context);
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
@@ -60,10 +62,16 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
                                             cbm_watcher_project_mutation_end_fn end,
                                             cbm_watcher_project_pruned_fn pruned, void *context);
 
-/* Opt in to polling NON-GIT project roots (#1948; default off — non-git roots
- * are not watched). When on, a non-git root is polled on the same adaptive
- * cadence by a tree signature: the indexer's own discovery walk (same skip
- * lists, .gitignore and .cbmignore rules), folded over each file's (relative
+/* 安装子仓库登记回调；daemon 在 watcher 开始轮询前设置。 */
+void cbm_watcher_set_repository_discovered_fn(cbm_watcher_t *w,
+                                              cbm_watcher_repository_discovered_fn discovered,
+                                              void *context);
+
+/* Opt in to polling ordinary files in NON-GIT project roots (#1948; default
+ * off — child Git repositories are still watched). When on, a non-git root
+ * is polled on the same adaptive cadence by a tree signature: the indexer's
+ * own discovery walk (same skip lists, .gitignore and .cbmignore rules),
+ * folded over each file's (relative
  * path, size, mtime). A changed signature triggers index_fn; the first poll
  * after baseline reindexes once, since nothing records which tree state the
  * index holds. Paths discovery skips — including cbm's own .codebase-memory
@@ -82,8 +90,11 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
  * current poll snapshot is invalidated before this function returns. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
-/* Refresh a project's timestamp (resets adaptive backoff). */
+/* Reset adaptive backoff and request child repository discovery on next poll. */
 void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
+
+/* 安排一次不依赖文件变更的后台刷新，通常用于 daemon 重启恢复 watcher。 */
+void cbm_watcher_schedule_refresh(cbm_watcher_t *w, const char *project_name);
 
 /* ── Polling ────────────────────────────────────────────────────── */
 
