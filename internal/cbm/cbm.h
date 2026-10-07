@@ -894,6 +894,14 @@ void cbm_work_arena_keep_begin(void);
 /* Free the compaction scratch this thread kept (cbm_work_arena_release calls it). */
 void cbm_result_compact_release_thread(void);
 
+/* Parse one whole file as if its last line ended with "\n" (#2078). The
+ * parser sees the source plus one virtual newline when the last byte is not
+ * already one; the returned tree is then clamped back to `source_len`, so no
+ * node range, point or text reaches past the real bytes. Every whole-file parse
+ * goes through here, so a retained tree and a fallback re-parse agree. */
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the
@@ -1004,6 +1012,11 @@ void cbm_usage_field_lookup_test_reset(void);
 uint64_t cbm_usage_field_lookup_test_work(void);
 uint64_t cbm_usage_slow_parent_fallback_test_count(void);
 #endif
+
+// Number of 1-based lines in a source buffer. The single line-count convention
+// for coverage reporting (#1967): a trailing '\n' ends the last line and opens
+// no new one; an empty buffer counts as 1 line. See the definition in cbm.c.
+uint32_t cbm_source_line_count(const char *src, int src_len);
 
 // Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
 // it only for full/advanced index modes (it dominates extraction on macro-dense
