@@ -1348,6 +1348,7 @@ TEST(lang_probe_bytes_follow_the_name) {
     ASSERT_EQ(cbm_language_probe_bytes("foo.inc"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("Form1.frm"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("App.res"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("config.pkl"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("Widget.cfc"), 16384);
     ASSERT_EQ(cbm_language_probe_bytes("pom.xml"), 255);
     /* An unknown name falls back to a shebang probe of the first line. */
@@ -1423,6 +1424,29 @@ TEST(lang_classify_matches_every_content_rule) {
             }
             ASSERT_EQ(by_path, cases[i].expect);
         }
+    }
+    PASS();
+}
+
+TEST(lang_classify_pkl_source_and_binary_pickle) {
+    static const struct {
+        const char *content;
+        size_t length;
+        CBMLanguage expect;
+    } cases[] = {
+        {"foo = 1\n", 8, CBM_LANG_PKL},
+        {"\x80\x02N.", 4, CBM_LANG_COUNT}, /* protocol 2 pickle without a NUL */
+        {"]q\0.", 4, CBM_LANG_COUNT},    /* protocol 1 pickle with a NUL */
+    };
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_lang_pickle.pkl", cbm_tmpdir());
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMLanguage classified = classify_content("config.pkl", cases[i].content, cases[i].length);
+        ASSERT_TRUE(write_exact(path, cases[i].content, cases[i].length));
+        CBMLanguage from_file = cbm_language_for_file("config.pkl", path);
+        remove(path);
+        ASSERT_EQ(classified, cases[i].expect);
+        ASSERT_EQ(from_file, cases[i].expect);
     }
     PASS();
 }
@@ -1753,6 +1777,7 @@ SUITE(language) {
     RUN_TEST(lang_all_have_names);
     RUN_TEST(lang_probe_bytes_follow_the_name);
     RUN_TEST(lang_classify_matches_every_content_rule);
+    RUN_TEST(lang_classify_pkl_source_and_binary_pickle);
     RUN_TEST(lang_classify_unreadable_content_keeps_the_name_default);
     RUN_TEST(lang_classify_shebang_needs_the_whole_first_line);
     RUN_TEST(lang_classify_reads_only_its_probe);

@@ -1544,7 +1544,7 @@ static bool lang_name_in(const char *name, const char *const *list) {
 
 /* The content rule a name needs, or NULL. */
 static const char *lang_probe_extension(const char *filename) {
-    static const char *const PROBED[] = {".m", ".cls", ".inc", ".cfc", ".frm", ".res", NULL};
+    static const char *const PROBED[] = {".m", ".cls", ".inc", ".cfc", ".frm", ".res", ".pkl", NULL};
     const char *dot = strrchr(filename, '.');
     return (dot && lang_name_in(dot, PROBED)) ? dot : NULL;
 }
@@ -1610,6 +1610,12 @@ CBMLanguage cbm_language_classify_with(const cbm_userconfig_t *config, const cha
         } else if (strcmp(ext, ".frm") == 0) {
             /* FORM or a Visual Basic 6 form (#721) */
             lang = readable ? lang_frm_text(buf) : CBM_LANG_FORM;
+        } else if (strcmp(ext, ".pkl") == 0) {
+            /* Pkl source shares its suffix with binary Python pickle caches. */
+            size_t n = head_len < LANG_PROBE_HEAD ? head_len : LANG_PROBE_HEAD;
+            lang = readable && n > 0 && (head[0] == 0x80 || memchr(head, '\0', n))
+                       ? CBM_LANG_COUNT
+                       : CBM_LANG_PKL;
         } else {
             /* .res: ReScript, or a binary Godot / Windows resource (#2176) */
             lang = readable ? lang_res_bytes(head, head_len) : CBM_LANG_RESCRIPT;

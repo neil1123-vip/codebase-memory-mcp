@@ -197,7 +197,8 @@ TEST(suffix_tilde) {
     PASS();
 }
 TEST(suffix_pickle) {
-    ASSERT_TRUE(cbm_has_ignored_suffix("cache.pkl", CBM_MODE_FULL));
+    /* .pkl also names Pkl source; the content classifier rejects binary caches. */
+    ASSERT_FALSE(cbm_has_ignored_suffix("cache.pkl", CBM_MODE_FULL));
     ASSERT_TRUE(cbm_has_ignored_suffix("cache.pickle", CBM_MODE_FULL));
     PASS();
 }
