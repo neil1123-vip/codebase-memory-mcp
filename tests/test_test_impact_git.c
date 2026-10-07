@@ -52,7 +52,8 @@ static bool gf_write(const char *path, const void *bytes, size_t length) {
 
 /* Native executable fixture for Git's optional diff/textconv command. Extra
  * arguments added by Git are deliberately ignored. Normal harness entry keeps
- * argv[0] for a private executable copy; neither mode changes the environment. */
+ * argv[0] for a private executable copy. The hostile control changes only its
+ * own process environment. */
 const char *tf_runner_image(int argc, char **argv); /* test_main.c */
 int tf_maybe_run_git_facts_diff_probe(int argc, char **argv);
 int tf_maybe_run_git_facts_diff_probe(int argc, char **argv) {
@@ -64,9 +65,13 @@ int tf_maybe_run_git_facts_diff_probe(int argc, char **argv) {
          * Re-enter the existing exact-diff test; the parent process remains untouched.
          * An inherited CBM_TEST_ONLY_FILE (a narrowed CI run) is cleared: the runner
          * unions it with CBM_TEST_ONLY, and one naming this suite would re-run the
-         * spawning test, which spawns again. */
+         * spawning test, which spawns again.
+         * LLVM_PROFILE_FILE already routes this child's continuous coverage to
+         * the spawning test. Keep it, and clear the parent's per-test collector
+         * request so this child does not try to initialize parent routing. */
         if (cbm_setenv("GIT_DIFF_OPTS", "--unified=999", 1) != 0 ||
             cbm_setenv("CBM_TEST_ONLY_FILE", "", 1) != 0 ||
+            cbm_unsetenv("CBM_TEST_COVERAGE_DIR") != 0 ||
             cbm_setenv(
                 "CBM_TEST_ONLY",
                 "test_impact_git:test_git_facts_diff_uses_merge_base_zero_context_and_nul_metadata",
