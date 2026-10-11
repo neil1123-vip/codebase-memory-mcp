@@ -31,7 +31,7 @@
 #     first-party scope (never narrowed by the diff); c-cpp compiles the
 #     vendored objects before tracing, then traces the first-party build plus
 #     the vendored files the PR changes;
-#   - push to main, the dry run and the release run the full scan, and the
+#   - manual dispatch, the dry run and the release run the full scan, and the
 #     release's verify needs it;
 #   - superseded push and PR runs are cancelled, dispatched ones never.
 set -euo pipefail
@@ -129,16 +129,14 @@ require(
     "inside a command substitution does not stop the caller on its own",
 )
 
-# 4. Triggers: never per pull request (PR CI calls the workflow instead), on
-#    push to main, callable by PR CI, the dry run and the release.
+# 4. Fork policy: PR CI, the dry run and the release call CodeQL directly;
+#    upstream sync pushes and schedules must not start another scan.
 on = re.search(r"(?ms)^on:\n(?P<body>.*?)(?=^\S)", workflow)
 triggers = set(re.findall(r"(?m)^  ([a-z_]+):", on.group("body"))) if on else set()
 require("pull_request" not in triggers and "pull_request_target" not in triggers,
         "codeql.yml must not trigger on pull requests (pr.yml calls it as a job)")
-require({"push", "workflow_call"} <= triggers,
-        f"codeql.yml must run on push to main and be callable, has {sorted(triggers)}")
-require(re.search(r"(?m)^  push:\n    branches: \[main\]$", workflow) is not None,
-        "codeql.yml's push trigger must be main")
+require(triggers == {"workflow_dispatch", "workflow_call"},
+        f"codeql.yml must be manual or callable on this fork, has {sorted(triggers)}")
 
 # 5. Nothing waits for a separate CodeQL run, and _security.yml has no CodeQL.
 for path in sorted(workflow_dir.glob("*.yml")):
