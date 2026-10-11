@@ -209,6 +209,8 @@ typedef enum {
     CBM_LANG_ARKTS,    // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
     CBM_LANG_PLSQL,    // Oracle PL/SQL
     CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
+    CBM_LANG_PDF,      // PDF documents: the text layer, read without a grammar (doc_pdf.c)
+    CBM_LANG_ASCIIDOC, // AsciiDoc documents, read without a grammar (doc_adoc.c)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -267,15 +269,37 @@ typedef struct {
      * HTTP_CALLS edge to base + path. Tail fields: zero-init stays valid. */
     const char *http_client;
     const char *http_base_url;
+    /* Set when this FILE holds two or more definitions with this QN and label
+     * (`#if`/`#else` twins, a macro redefined per platform, overloads): the
+     * graph keeps one node per QN, and this lists every one of those
+     * definitions' line spans, the surviving one included, as a JSON array
+     * sorted by start line, in graph_buffer.c's variants schema:
+     * [{"file_path":"a.c","start_line":10,"end_line":14},
+     *  {"file_path":"a.c","start_line":20,"end_line":26}].
+     * Carried by the definition the graph keeps for the file (the last by
+     * start line), which makes it the node's `variants` property. NULL on
+     * every other definition, and in every language outside
+     * cbm_is_c_preprocessor_lang. */
+    const char *variants;
     /* Callable identity (#2061): offset of the signature suffix inside
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
+     * the global namespace and every other language). Per type, because the
+     * file-level namespace_name records only a file's first namespace. */
+    const char *decl_namespace;
     CBMTestDefinitionRole test_role; /* NONE preserves legacy helper/test-file semantics */
     /* Configured raw definitions only; zero for all legacy rows. Exact spans
      * are bound to the owning result's source identity before cross-file use. */
     uint32_t test_name_start_byte, test_name_end_byte;
     uint32_t test_body_start_byte, test_body_end_byte;
+    /* Documents only: facts a document definition adds to its node's
+     * properties, as a NULL-terminated key, value, key, value, ... list (an
+     * ADR's id, status, date, deciders, title). Keys are fixed literals; the
+     * values are escaped where the properties are written. Tail field:
+     * zero-init stays valid. */
+    const char **extra_props;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -287,6 +311,17 @@ typedef struct {
 } CBMCallArg;
 
 #define CBM_MAX_CALL_ARGS 8
+
+/* The qualified name of a C-preprocessor macro (`#define NAME ...` in C, C++,
+ * CUDA, Objective-C, GLSL, ISPC) is `<module QN>.<NAME>#macro`. C keeps macros
+ * apart from ordinary identifiers, so a macro and a function, type, variable or
+ * enumerator may legally share a name in one file; the fence gives the macro
+ * an identity of its own, and the plain `<module QN>.<NAME>` always belongs to
+ * the definition. `name` stays NAME and the label stays "Macro".
+ *
+ * Tie rule for anything that resolves a NAME or a plain QN to a node: the
+ * definition is the target, and the macro only when no definition is visible. */
+#define CBM_MACRO_QN_SUFFIX "#macro"
 
 /* Byte offsets are meaningful only within the source buffer that produced
  * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
@@ -583,6 +618,31 @@ typedef struct {
     int cap;
 } CBMFieldTypeArray;
 
+/* One reference found in a definition's complete doc comment, or in the file's
+ * own doc (doclink.h has the syntax table and the per-language parsers).
+ * Resolution happens later, per file, in the pipeline
+ * (src/pipeline/doc_links.c). */
+typedef struct {
+    const char *source_qn; // QN of the documented definition (the edge source);
+                           // for a file-level reference the file's module QN
+    const char *raw;       // the reference as written, markup entities decoded
+    uint32_t line;         // 1-based source line of the reference
+    uint32_t def_line;     // 1-based start line of the documented definition
+    uint16_t syntax;       // CBMDocLinkSyntax (doclink.h)
+    uint16_t flags;        // CBM_DOCLINK_FLAG_* (doclink.h); set by the driver
+} CBMDocLink;
+
+typedef struct {
+    CBMDocLink *items;
+    int count;
+    int cap;
+    /* Memory ran out while this file's doc-link data was extracted (a token,
+     * a reference value, a doc text or the scope blob was lost): the
+     * resolving half fails the layer instead of publishing a silently
+     * incomplete graph. */
+    bool failed;
+} CBMDocLinkArray;
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -695,6 +755,14 @@ typedef struct CBMFileResult {
     int test_owner_source_len;
     CBMLanguage test_owner_language;
     char test_owner_source_sha256[65]; /* exact raw source; identity, not authentication */
+
+    /* Doc-comment references of this file's definitions (doclink.h), and the
+     * file's doc-link scope: a language-tagged text blob with what OTHER
+     * files' doc-link resolution needs from this file (C#: namespaces,
+     * usings, type and member declarations). A pure function of the file's
+     * bytes; NULL for languages without a scope scanner. */
+    CBMDocLinkArray doc_links;
+    const char *doc_scope;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -791,6 +859,18 @@ typedef struct {
     struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */
     int test_definition_match_count;
     int test_definition_match_cap;
+    /* Start line of every doc text doc_run_text built, keyed by the returned
+     * pointer (doclink.c), so a definition's doc references get exact source
+     * lines. NULL until the first doc; allocated in `scratch`. */
+    void *doc_lines;
+    /* A per-file slot for the language's doc-link hooks (parse_doc and
+     * scan_scope, internal/cbm/doclink_<lang>.c): state that has to survive
+     * between the hook calls of ONE file, e.g. an index of the file's doc
+     * sections. NULL at the start of every file. What a hook stores here must
+     * be allocated in `scratch` (or `arena`), so that it ends with the file.
+     * The core never reads, interprets or frees it. It is the only place for
+     * such state: a static or thread-local cache is not. */
+    void *doclink_state;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */

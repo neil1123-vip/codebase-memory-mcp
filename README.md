@@ -151,13 +151,15 @@ codebase-memory-mcp config set auto_index true
 
 When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
 
+The watcher follows MCP sessions and also retains successfully indexed projects after their sessions close. Cached projects are restored when the daemon starts if `auto_watch` is enabled. `index_status` reports the current watcher in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to prevent session registration and startup restoration of cached project watchers. It does not stop the watcher subsystem or tear down every owner in an already-running daemon; restart the daemon to apply the setting to restored projects.
 
 When a watched project root is not Git-managed, the watcher discovers Git repositories below it using the indexer's directory exclusions, including `.gitignore` and `.cbmignore`. Each child repository (including linked worktrees) is registered as a separate graph project named from its path and gets its own watcher; the outer project continues to refresh when child repositories change. Automatic child indexing obeys the `auto_index_limit` file cap. Repository discovery is repeated every minute; discovering a new repository schedules an initial refresh for both the child and outer project. Ordinary files outside Git repositories do not trigger refreshes. If no repositories are found, `watcher.repositories` logs `auto_refresh=disabled_no_git`; manual indexing remains available. Discovery errors preserve the previous repository set for retry.
 
 To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered or restored, while `auto_index` and manual `index_repository` keep working. `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
-The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
+The watcher uses Git change detection by default, including the child repositories of a non-Git root. To have ordinary files in non-Git roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
 ### Keeping Up to Date
 
@@ -248,7 +250,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
+- **Auto-sync**: Background watcher detects changes in session projects and retained indexed projects and re-indexes them automatically (`index_status` shows `watch`)
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
@@ -683,7 +685,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `index_repository` | Index a repository into the graph. Successfully indexed projects retain a daemon watcher when auto-watch is enabled (`index_status` shows `watch`). Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
@@ -745,7 +747,9 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `MENTIONS`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+
+`MENTIONS` links a documented definition to the code its doc comment references (C# `<see cref>`, `<seealso cref>`, `<exception cref>`, `<inheritdoc cref>`), one edge per pair with `via`, `syntax`, `tier` (`exact` or `unique`), first `line` and `count`. A reference is bound only when it names exactly one definition under the language's own lookup rules; the rest are counted by reason in `index_status` under `doc_links` (samples with `diagnostics='full'`).
 
 ### Qualified Names
 
