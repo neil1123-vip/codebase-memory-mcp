@@ -70,6 +70,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/doc_links.h" /* cbm_doclinks_resolve_file: MENTIONS beside CALLS */
 #include "result_spill.h"
 #include "foundation/platform.h"     /* cbm_resolve_cache_dir */
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
@@ -478,6 +479,24 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
+/* Append an already-serialized JSON value verbatim: ,"key":<json>. Atomic like
+ * append_json_string. For `variants`, which extraction builds as a JSON array
+ * of objects (cbm.h). Twin of pass_definitions.c -- keep both in sync. */
+static void append_json_raw(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            const char *json) {
+    if (!json || json[0] == '\0') {
+        return;
+    }
+    size_t required = strlen(key) + strlen(json) + PP_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    int w = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, json);
+    if (w > 0 && (size_t)w < bufsize - *pos) {
+        *pos += (size_t)w;
+    }
+}
+
 static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
@@ -518,6 +537,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    /* Right after the docstring: the buffer is sized for exactly these two
+     * uncapped fields (pp_props_buf), so neither can be squeezed out. */
+    append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -529,6 +551,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
+    /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
+    for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        append_json_string(buf, bufsize, &pos, kv[0], kv[SKIP_ONE]);
+    }
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -703,16 +729,21 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring field, which has no length cap (a field that does not
- * fit is dropped whole). Returns `stack` for a def without a docstring, or
- * when the larger buffer cannot be allocated. Twin of pass_definitions.c --
+ * serialized docstring and variants fields, which have no length cap (a field
+ * that does not fit is dropped whole). Returns `stack` for a def with neither,
+ * or when the larger buffer cannot be allocated. Twin of pass_definitions.c --
  * keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
-    if (!def->docstring || !def->docstring[0]) {
+    size_t need = *size;
+    if (def->docstring && def->docstring[0]) {
+        need += strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variants && def->variants[0]) {
+        need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (need == *size) {
         return stack;
     }
-    size_t need =
-        *size + strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
     char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
     if (!buf) {
         return stack;
@@ -2752,14 +2783,20 @@ static void file_node_cache_clear(void) {
     tl_file_node = NULL;
 }
 
+const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel) {
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    return node;
+}
+
 static const cbm_gbuf_node_t *file_node_for(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel) {
     if (tl_file_node_gbuf == gbuf && tl_file_node_rel == rel) {
         return tl_file_node;
     }
-    char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
-    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, file_qn);
-    free(file_qn);
+    const cbm_gbuf_node_t *node = cbm_pipeline_file_node(gbuf, project, rel);
     tl_file_node_gbuf = gbuf;
     tl_file_node_rel = rel;
     tl_file_node = node;
@@ -3518,7 +3555,13 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                                    imp_keys, imp_count)) {
                 continue;
             }
-            tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            /* a plain value reference names the field twin of a same-named
+             * method; a callable-reference candidate keeps the method */
+            bool value_ref = usage->kind == CBM_USAGE_VALUE && !usage->may_be_call_reference;
+            tgt = cbm_gbuf_find_by_qn(
+                rc->main_gbuf, value_ref
+                                   ? cbm_registry_value_target(rc->registry, res.qualified_name)
+                                   : res.qualified_name);
             /* #1928: the registry fallback is a bare-name guess — never let it
              * bind a reference across a language boundary. Mirrors the
              * sequential twin (pass_usages.c). */
@@ -3639,7 +3682,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(
+            rc->main_gbuf, cbm_registry_value_target(rc->registry, res.qualified_name));
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -3660,16 +3704,27 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
     cbm_pipeline_lsp_field_index_free(&field_index);
 }
 
+/* The per-file facts the base-class gate needs beyond the import map. */
+typedef struct {
+    const CBMImportArray *imports;
+    const char *rel;
+    CBMLanguage lang;
+} pp_file_scope_t;
+
 /* Resolve base_classes → INHERITS edges for one definition. */
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                 const char *mq, const char **ik, const char **iv, int ic) {
+                                 const pp_file_scope_t *fs, const char *mq, const char **ik,
+                                 const char **iv, int ic) {
     if (!def->base_classes) {
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
         const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
-        if (!bqn) {
+        /* Same external-base gate as the sequential semantic pass. */
+        if (!bqn ||
+            cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
+                                                 rc->main_gbuf, rc->project_name, fs->rel)) {
             continue;
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
@@ -3756,8 +3811,10 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
 
 /* Resolve INHERITS + DECORATES + IMPLEMENTS for one file. */
 static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
-                                  CBMFileResult *result, const char *module_qn,
-                                  const char **imp_keys, const char **imp_vals, int imp_count) {
+                                  CBMFileResult *result, const char *rel, CBMLanguage lang,
+                                  const char *module_qn, const char **imp_keys,
+                                  const char **imp_vals, int imp_count) {
+    const pp_file_scope_t fs = {&result->imports, rel, lang};
     for (int d = 0; d < result->defs.count; d++) {
         CBMDefinition *def = &result->defs.items[d];
         if (!def->qualified_name) {
@@ -3767,7 +3824,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!node) {
             continue;
         }
-        resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_inherits(rc, ws, def, node, &fs, module_qn, imp_keys, imp_vals, imp_count);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
@@ -4189,9 +4246,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_semantic(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_semantic(rc, ws, result, rel, lang, module_qn, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
+
+        /* ── MENTIONS (doc-comment references) ─────────────────── */
+        if (rc->pctx && rc->pctx->doc_links) {
+            cbm_doclinks_resolve_file(rc->pctx->doc_links, file_idx, result, rc->main_gbuf,
+                                      ws->local_edge_buf);
+        }
 
     resolve_file_cleanup:
         cbm_registry_reach_cache_end();

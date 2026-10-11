@@ -2546,6 +2546,98 @@ TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469) {
     PASS();
 }
 
+/* get_file_outline shows the sections possibly about the file as a whole or
+ * about a folder holding it (highest p first, kind shown), in both formats,
+ * on the first page only; a candidate for a function in the file is not one
+ * of them. */
+TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "doc-outline", "/tmp/doc-outline"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "doc-outline");
+    const struct {
+        const char *label, *qn, *path;
+        int start;
+    } nodes[] = {{"File", "doc-outline.pkg.mail.parse.__file__", "pkg/mail/parse.py", 0},
+                 {"Function", "doc-outline.pkg.mail.parse.parse_mail", "pkg/mail/parse.py", 3},
+                 {"Folder", "doc-outline.pkg.mail", "pkg/mail", 0},
+                 {"Section", "doc-outline.pkg.mail.README.Mail", "pkg/mail/README.md", 1},
+                 {"Section", "doc-outline.docs.parsing.Parsing", "docs/parsing.md", 5}};
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        cbm_node_t node = {.project = "doc-outline",
+                           .label = nodes[i].label,
+                           .name = nodes[i].qn,
+                           .qualified_name = nodes[i].qn,
+                           .file_path = nodes[i].path,
+                           .start_line = nodes[i].start,
+                           .end_line = nodes[i].start + 2};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "doc-outline.docs.parsing.Parsing",
+         .target_qn = "doc-outline.pkg.mail.parse.__file__",
+         .rank = 1,
+         .score = 0.41,
+         .p = 0.5,
+         .evidence = "{\"shared_terms\":4,\"name_tokens\":0,\"kind\":\"file\","
+                     "\"position\":\"global\"}"},
+        {.section_qn = "doc-outline.pkg.mail.README.Mail",
+         .target_qn = "doc-outline.pkg.mail",
+         .rank = 1,
+         .p = 0.8,
+         .evidence = "{\"shared_terms\":0,\"name_tokens\":0,\"kind\":\"folder\","
+                     "\"position\":\"local\"}"},
+        {.section_qn = "doc-outline.docs.parsing.Parsing",
+         .target_qn = "doc-outline.pkg.mail.parse.parse_mail",
+         .rank = 1,
+         .score = 0.5,
+         .p = 0.9,
+         .evidence = "{\"shared_terms\":5,\"name_tokens\":1,\"kind\":\"function\","
+                     "\"position\":\"global\"}"},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(store, "doc-outline", rows, 3), CBM_STORE_OK);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_file_outline",
+                            "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\","
+                            "\"format\":\"json\"}");
+    char *text = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *in = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_described_in");
+    ASSERT_EQ((int)yyjson_arr_size(in), 2);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "section")),
+                  "doc-outline.pkg.mail.README.Mail");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "kind")), "folder");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 1), "kind")), "file");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 1), "file_path")),
+                  "docs/parsing.md");
+    ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "candidates_note"));
+    yyjson_doc_free(doc);
+    free(text);
+
+    raw = cbm_mcp_handle_tool(srv, "get_file_outline",
+                              "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "possibly_described_in"));
+    ASSERT_NOT_NULL(strstr(raw, "doc-outline.pkg.mail.README.Mail"));
+    ASSERT_NOT_NULL(strstr(raw, "folder"));
+    free(raw);
+
+    raw = cbm_mcp_handle_tool(srv, "get_file_outline",
+                              "{\"project\":\"doc-outline\",\"file_path\":\"pkg/mail/parse.py\","
+                              "\"offset\":1}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NULL(strstr(raw, "possibly_described_in"));
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
     cbm_store_t *store = cbm_mcp_server_store(srv);
@@ -6589,6 +6681,50 @@ TEST(tool_trace_call_path_ambiguous) {
     PASS();
 }
 
+/* Tie rule for the C-macro namespace (PR C1): a typedef and its rename macro
+ * (`typedef struct state_s\n    state_t;` + `#define state_t NS(state_t)`) are
+ * two nodes with one name, `<module>.state_t` and `<module>.state_t#macro`, and
+ * here the same line span. The name resolves to the definition: without the
+ * macro ranking below it, the two tie and trace_path answers "ambiguous". */
+TEST(tool_trace_path_definition_beats_c_macro_c1) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "tie-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tie");
+    cbm_node_t type = {.project = proj,
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "tie-proj.xxhash.state_t",
+                       .file_path = "xxhash.h",
+                       .start_line = 653,
+                       .end_line = 654};
+    cbm_node_t macro = {.project = proj,
+                        .label = "Macro",
+                        .name = "state_t",
+                        .qualified_name = "tie-proj.xxhash.state_t#macro",
+                        .file_path = "xxhash.h",
+                        .start_line = 429,
+                        .end_line = 430}; /* equal span: a tie without the rule */
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &macro), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"state_t\",\"project\":\"tie-proj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "function not found"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Multi-seed union hop semantics: bfs_union_same_name deduped visited nodes
  * keep-FIRST-seen, so a node reached at hop 2 from the first seed kept hop 2
  * even when the second seed reaches it at hop 1. hop feeds risk_labels and
@@ -7574,9 +7710,10 @@ TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
     cbm_store_free_nodes(by_name, by_name_count);
 
     char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
-             "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+        "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -18464,6 +18601,93 @@ TEST(snippet_exact_qn) {
     PASS();
 }
 
+/* Doc -> code candidates on get_code_snippet: a Section lists the functions
+ * it is possibly about (highest p first, evidence included), a function the
+ * sections that possibly describe it; a row whose other end no longer exists
+ * is skipped, and a node without rows gets no candidate keys at all. */
+TEST(snippet_doc_candidates_both_directions) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    cbm_node_t sec = {.project = "test-project",
+                      .label = "Section",
+                      .name = "Orders",
+                      .qualified_name = "test-project.README.Orders",
+                      .file_path = "README.md",
+                      .start_line = 1,
+                      .end_line = 4};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &sec) > 0);
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.cmd.server.main.HandleRequest",
+         .rank = 2,
+         .score = 0.25,
+         .p = 0.36,
+         .evidence = "{\"shared_terms\":2,\"name_tokens\":0}"},
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.cmd.server.main.ProcessOrder",
+         .rank = 1,
+         .score = 0.45,
+         .p = 0.548,
+         .evidence = "{\"shared_terms\":5,\"name_tokens\":2,\"kind\":\"function\","
+                     "\"position\":\"local\"}"},
+        {.section_qn = "test-project.README.Orders",
+         .target_qn = "test-project.gone.Missing",
+         .rank = 3,
+         .score = 0.31,
+         .p = 0.42,
+         .evidence = "{\"shared_terms\":1,\"name_tokens\":0}"},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(st, "test-project", rows, 3), CBM_STORE_OK);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"test-project.README.Orders\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *about = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_about");
+    ASSERT_EQ((int)yyjson_arr_size(about), 2);
+    yyjson_val *first = yyjson_arr_get(about, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "qualified_name")),
+                  "test-project.cmd.server.main.ProcessOrder");
+    ASSERT_FLOAT_EQ(yyjson_get_num(yyjson_obj_get(first, "p")), 0.548, 1e-9);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(first, "shared_terms")), 5);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(first, "start_line")), 7);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "label")), "Function");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "kind")), "function");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(first, "position")), "local");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(about, 1), "qualified_name")),
+                  "test-project.cmd.server.main.HandleRequest");
+    ASSERT_NOT_NULL(yyjson_obj_get(yyjson_doc_get_root(doc), "candidates_note"));
+    yyjson_doc_free(doc);
+    free(resp);
+
+    resp = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\","
+                             "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *in = yyjson_obj_get(yyjson_doc_get_root(doc), "possibly_described_in");
+    ASSERT_EQ((int)yyjson_arr_size(in), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "section")),
+                  "test-project.README.Orders");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(in, 0), "file_path")), "README.md");
+    yyjson_doc_free(doc);
+    free(resp);
+
+    resp = call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.Run\","
+                             "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "possibly_"));
+    ASSERT_NULL(strstr(resp, "candidates_note"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ── TestSnippet_QNSuffix ─────────────────────────────────────── */
 
 TEST(snippet_qn_suffix) {
@@ -18499,6 +18723,79 @@ TEST(snippet_unique_short_name) {
     ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── C-macro namespace (PR C1) ────────────────────────────────── */
+
+/* A C macro's QN ends in "#macro", which no caller spells. get_code_snippet
+ * still returns the macro for its short name, for a dotted suffix and for the
+ * QN it had before the fence (`<module>.<NAME>`); when a definition owns that
+ * QN or that name, the definition is the answer. */
+TEST(snippet_c_macro_namespace_c1) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+
+    cbm_node_t only_macro = {.project = "test-project",
+                             .label = "Macro",
+                             .name = "MAX_LEN",
+                             .qualified_name = "test-project.lib.cfg.MAX_LEN#macro",
+                             .file_path = "main.go",
+                             .start_line = 7,
+                             .end_line = 8};
+    cbm_node_t type = {.project = "test-project",
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "test-project.lib.xx.state_t",
+                       .file_path = "main.go",
+                       .start_line = 3,
+                       .end_line = 3};
+    cbm_node_t shadowed_macro = {.project = "test-project",
+                                 .label = "Macro",
+                                 .name = "state_t",
+                                 .qualified_name = "test-project.lib.xx.state_t#macro",
+                                 .file_path = "main.go",
+                                 .start_line = 11,
+                                 .end_line = 12};
+    ASSERT_GT(cbm_store_upsert_node(st, &only_macro), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &shadowed_macro), 0);
+
+    static const char *const macro_inputs[] = {
+        "{\"qualified_name\":\"MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(macro_inputs) / sizeof(macro_inputs[0]); i++) {
+        char *resp = call_snippet(srv, macro_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", macro_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Macro\""));
+        free(resp);
+    }
+
+    static const char *const definition_inputs[] = {
+        "{\"qualified_name\":\"test-project.lib.xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"state_t\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(definition_inputs) / sizeof(definition_inputs[0]); i++) {
+        char *resp = call_snippet(srv, definition_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"label\":\"Type\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", definition_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.xx.state_t\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Type\""));
+        free(resp);
+    }
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -23584,6 +23881,7 @@ SUITE(mcp) {
     RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
     RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
+    RUN_TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders);
     RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
@@ -23639,6 +23937,7 @@ SUITE(mcp) {
     RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
@@ -23834,8 +24133,10 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_doc_candidates_both_directions);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
+    RUN_TEST(snippet_c_macro_namespace_c1);
     RUN_TEST(snippet_name_tier);
     RUN_TEST(snippet_ambiguous_short_name);
     RUN_TEST(snippet_not_found);
