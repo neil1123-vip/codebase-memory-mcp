@@ -4,18 +4,13 @@
 # EVERY push to main and failed because Jekyll's Liquid parser choked on the
 # planning docs under /docs (e.g. `Unknown tag 'data'` in EVALUATION_PLAN.md).
 # /docs is a hand-written static site (index.html + robots/sitemap/llms.txt),
-# so we upload it as-is — no Jekyll — and only run when the site changes.
+# so we upload it as-is — no Jekyll. This fork deploys only on manual dispatch.
 #
 # Requires the repo Pages source to be set to "GitHub Actions"
 # (Settings → Pages → Build and deployment → Source: GitHub Actions).
 name: Deploy Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docs/**'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
