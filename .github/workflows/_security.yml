@@ -1,6 +1,5 @@
 # Reusable: security-static + license gate.
-# CodeQL is not here: PRs do not run it. It runs on push to main, weekly, and
-# inside dry-run.yml / release.yml, which call codeql.yml directly.
+# CodeQL runs through PR CI, dry runs and releases, which call codeql.yml directly.
 # Runs independently from lint/test/build — does not block the main pipeline.
 # Affects overall workflow success status.
 name: Security Gate
@@ -53,4 +52,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/audit-license-provenance.py
-
