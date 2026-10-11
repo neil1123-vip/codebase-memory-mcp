@@ -1,4 +1,4 @@
-# Soak dispatcher — the weekly scheduled soak AND every on-demand soak run.
+# Soak dispatcher — on-demand soak runs only on this fork.
 #
 # Absorbs the retired soak.yml (the standalone "multi-hour #581" workflow): its
 # reasons to exist — a job budget that actually covers a 4h run, and the
@@ -9,8 +9,6 @@
 name: Nightly Soak
 
 on:
-  schedule:
-    - cron: '0 2 * * 0' # Every Sunday at 2am UTC
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -26,10 +24,6 @@ on:
         description: 'Also run the 15-min ASan soak legs'
         type: boolean
         default: true
-  # Iteration convenience carried over from soak.yml: pushing a qa/soak-**
-  # branch starts a real run from that branch's own copy of the workflows.
-  push:
-    branches: ['qa/soak-**']
 
 permissions:
   contents: read
@@ -39,7 +33,6 @@ jobs:
   # budget instead of a fixed count. NON-GATING like the soak; a crash uploads
   # its reproducer, which becomes a fixed-seed regression input once fixed.
   fuzz:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -59,8 +52,6 @@ jobs:
   soak:
     uses: ./.github/workflows/_soak.yml
     with:
-      # On schedule/push events the inputs context is empty — fall back to the
-      # weekly defaults (4h, both legs, ASan on).
-      duration_minutes: ${{ inputs.duration_minutes || 240 }}
-      legs: ${{ inputs.legs || 'quick,query-leak' }}
-      run_asan: ${{ github.event_name != 'workflow_dispatch' || inputs.run_asan }}
+      duration_minutes: ${{ inputs.duration_minutes }}
+      legs: ${{ inputs.legs }}
+      run_asan: ${{ inputs.run_asan }}
