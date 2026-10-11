@@ -1,10 +1,10 @@
-# Nightly compiler-cache warming for main's scope. GitHub cache isolation
+# Manual compiler-cache warming for main's scope. GitHub cache isolation
 # lets a PR restore only caches written by its own ref or the base branch —
 # and nothing used to write test caches in main's scope (the test workflow
 # runs on pull_request and workflow_dispatch only), so the cross-ref
 # fallback restore keys in _test.yml had no warm source and every fresh PR
-# built cold. This build-only job (no tests) keeps main-scoped caches at
-# most a day stale; CCACHE_COMPILERCHECK=content turns staleness into
+# built cold. This build-only job (no tests) keeps main-scoped caches
+# ready before a testing session; CCACHE_COMPILERCHECK=content turns staleness into
 # partial misses, never wrong output. The build commands and ccache
 # environment mirror scripts/test.sh's build phase exactly — a warm entry
 # only hits when flags and compiler content match, so fidelity here is what
@@ -12,8 +12,6 @@
 name: Cache warm
 
 on:
-  schedule:
-    - cron: '17 2 * * *'
   workflow_dispatch: {}
 
 permissions:
