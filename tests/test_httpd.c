@@ -3845,8 +3845,7 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
 
 TEST(ui_server_configuration_is_atomic_and_origin_protected) {
     char directory[256];
-    snprintf(directory, sizeof(directory), "%s/cbm-http-settings-XXXXXX", cbm_tmpdir());
-    ASSERT_NOT_NULL(cbm_mkdtemp(directory));
+    ASSERT_TRUE(th_secure_runtime_parent_new(directory, sizeof(directory), "http-settings"));
     char *previous = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
     ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", directory, 1), 0);
     th_server_t server;
