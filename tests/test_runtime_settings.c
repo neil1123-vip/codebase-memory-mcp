@@ -7,6 +7,7 @@
 #include "foundation/log.h"
 #include "cli/cli.h"
 #include "cli/runtime_settings.h"
+#include "test_helpers.h"
 #include "ui/config.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -22,8 +23,7 @@ typedef struct {
 } settings_fixture_t;
 static bool fixture_open(settings_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
-    snprintf(fixture->path, sizeof(fixture->path), "%s/cbm-settings-XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(fixture->path))
+    if (!th_secure_runtime_parent_new(fixture->path, sizeof(fixture->path), "settings"))
         return false;
     fixture->cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
     fixture->workers = getenv("CBM_WORKERS") ? strdup(getenv("CBM_WORKERS")) : NULL;
