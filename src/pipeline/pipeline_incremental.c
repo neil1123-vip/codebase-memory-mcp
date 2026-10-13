@@ -21,6 +21,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
+#include "helpers.h" /* cbm_fqn_module */
 #include "pipeline/doc_links.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
@@ -1400,7 +1401,7 @@ enum {
      * the honest signal that a rebuild costs less than a repair. */
     CLOSURE_BUDGET_FLOOR_FILES = 8,
     /* Variant partners of partners: real chains are one step (a header and
-     * its source, a set of platform files); a longer one declines. */
+     * its source, a set of Go build-tagged files); a longer one declines. */
     CLOSURE_VARIANT_ROUNDS_MAX = 8,
 };
 
@@ -2098,7 +2099,9 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         return rc < 0 ? rc : CBM_NOT_FOUND;
     }
 
-    /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
+    /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes.
+     * Fast mode runs the semantic pass only for doc -> code candidates
+     * (doc_candidates explicitly on), doc-only: no edges. */
     if (ctx->mode <= CBM_MODE_MODERATE) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_pipeline_pass_similarity(ctx);
@@ -2107,7 +2110,8 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         if (rc < 0 || cbm_pipeline_check_cancel(ctx)) {
             return rc < 0 ? rc : CBM_NOT_FOUND;
         }
-
+    }
+    if (ctx->mode <= CBM_MODE_MODERATE || cbm_pipeline_doc_candidates_enabled(ctx->pipeline)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_pipeline_pass_semantic_edges(ctx);
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
@@ -2348,16 +2352,21 @@ static bool closure_path_listed(char **paths, int count, const char *path) {
 }
 
 /* Variant partners (graph_buffer.c "Definition variants"): a definition
- * written in several files (platform files, a struct's header declaration
- * and its source definition, Go build-tagged files) is ONE node whose
- * file_path names one of them, with a DEFINES edge from every file that
- * writes a variant. Re-parsing one of those files alone rebuilds the node
- * without the others' spans and outbound edges, or leaves a changed
- * partner's stale span behind; so every file of such a node joins the
- * closure, to a fixpoint. `paths` is the delta (changed, then deleted from
- * index n_changed on); `dependents` already joined. A deleted partner is in
- * the delta already; any other partner outside the discovery declines, as a
- * dependent would. Returns the decline reason, or NULL. */
+ * written in several files (a struct's header declaration and its source
+ * definition, Go build-tagged files) is ONE node whose file_path names one of
+ * them, with a DEFINES edge from every file that writes a variant.
+ * Re-parsing one of those files alone rebuilds the node without the others'
+ * spans and outbound edges, or leaves a changed partner's stale span behind;
+ * so every file of such a node joins the closure, to a fixpoint. `paths` is
+ * the delta (changed, then deleted from index n_changed on); `dependents`
+ * already joined. A deleted partner is in the delta already; any other
+ * partner outside the discovery declines, as a dependent would. Returns the
+ * decline reason, or NULL.
+ * C-family platform files (foo_win.c / foo_posix.c) are no partners: each
+ * definition is its own node with its own path QN, and the `variant_key` that
+ * relates them is a function of the definition's own path, name and linkage,
+ * so re-parsing the changed file alone writes what a full index writes; the
+ * group is formed where it is read (store_impact.c), never stored. */
 static const char *closure_add_variant_partners(cbm_store_t *store, const char *project,
                                                 CBMHashTable *closure_set,
                                                 CBMHashTable *files_by_path, char **paths,
@@ -2500,6 +2509,67 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
     return NULL;
 }
 
+/* rel's directory prefix of len bytes as the plain Folder QN, in the arena. */
+static char *closure_prefix_folder_qn(CBMArena *a, const char *project, const char *rel,
+                                      size_t len) {
+    char *dir = cbm_arena_strndup(a, rel, len);
+    return dir ? cbm_fqn_folder(a, project, dir) : NULL;
+}
+
+/* A deleted file that took part in a stem collision (cbm_stem_marks_t)
+ * changes which side carries the mark: its own Module QN was a Folder's, or
+ * a directory above it -- which it may empty, or leave without its last
+ * Java/Go file -- holds another file's Module QN. Only a full rebuild
+ * re-spells the survivors. Both sides are read from the files before the
+ * deletion (discovered plus deleted); a deleted file's language is unknown,
+ * so it counts as a stem file either way. */
+static const char *closure_stem_mark_decline(const char *project, const cbm_file_info_t *files,
+                                             int file_count, char **deleted, int n_deleted) {
+    if (n_deleted <= 0) {
+        return NULL;
+    }
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMHashTable *folders = cbm_ht_create(CBM_SZ_256); /* plain Folder QNs */
+    CBMHashTable *stems = cbm_ht_create(CBM_SZ_256);   /* Module QNs outside Java/Go */
+    for (int i = 0; i < file_count + n_deleted; i++) {
+        const char *rel = i < file_count ? files[i].rel_path : deleted[i - file_count];
+        if (!rel) {
+            continue;
+        }
+        bool dir_module = i < file_count &&
+                          (files[i].language == CBM_LANG_JAVA || files[i].language == CBM_LANG_GO);
+        char *qn = dir_module ? NULL : cbm_fqn_module(&a, project, rel);
+        if (qn) {
+            cbm_ht_set(stems, qn, qn);
+        }
+        for (const char *s = strchr(rel, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+            char *fqn = closure_prefix_folder_qn(&a, project, rel, (size_t)(s - rel));
+            if (fqn) {
+                cbm_ht_set(folders, fqn, fqn);
+            }
+        }
+    }
+    const char *decline = NULL;
+    for (int i = 0; i < n_deleted && !decline; i++) {
+        const char *rel = deleted[i];
+        char *own = cbm_fqn_module(&a, project, rel);
+        if (own && cbm_ht_get(folders, own)) {
+            decline = "stem_mark_changed";
+        }
+        for (const char *s = strchr(rel, '/'); s && !decline; s = strchr(s + SKIP_ONE, '/')) {
+            char *fqn = closure_prefix_folder_qn(&a, project, rel, (size_t)(s - rel));
+            if (fqn && cbm_ht_get(stems, fqn)) {
+                decline = "stem_mark_changed";
+            }
+        }
+    }
+    cbm_ht_free(folders);
+    cbm_ht_free(stems);
+    cbm_arena_destroy(&a);
+    return decline;
+}
+
 /* A Python file whose namespace metadata changed, or is unreadable, declines
  * the closure before any hash cutoff: its importers' bindings follow the
  * namespace order. A deleted file passes NULL for fresh_json. */
@@ -2636,6 +2706,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     decline = closure_k8s_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
                                   n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline =
+        closure_stem_mark_decline(project, files, file_count, changed_paths + n_changed, n_deleted);
     if (decline) {
         goto done;
     }
@@ -2935,6 +3010,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int manifest_count = 0;
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
+    /* The repair re-extracts files: their Module QNs follow the stem
+     * collisions of the whole discovered set, as in a full run. */
+    cbm_stem_marks_t stem_marks;
+    cbm_stem_marks_init(&stem_marks, project, files, file_count);
     cbm_doclink_scope_t *doc_base = NULL;
     int doc_base_count = 0;
     cbm_doc_link_row_t *doc_fresh = NULL;
@@ -3151,6 +3230,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .doc_link_base_count = doc_base_count,
         .build_decl_files = decl_files,
         .build_decl_count = decl_count,
+        .stem_marks = &stem_marks,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3416,6 +3496,7 @@ out:
     }
     cbm_delta_free_snapshot(snapshot, snapshot_count);
     cbm_arena_destroy(&decl_arena);
+    cbm_stem_marks_free(&stem_marks);
     surface_name_set_free(stale_surface_set);
     cbm_doclinks_free_scopes(doc_base, doc_base_count);
     cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);

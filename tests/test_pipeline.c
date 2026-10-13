@@ -3524,11 +3524,18 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
 
 /* Deleting the only file that starts a program leaves no Process node
  * behind -- a full index never makes one without a SPAWNS edge. One script
- * (pass_shell.c) and one Python call (pass_spawns.c) go; the program a kept
- * script starts stays. `legacy`: through the full-load route, else the
- * closure-repair route. Returns the Process count after the deletion, or -1;
- * *route: the route taken. */
-static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route) {
+ * (pass_shell.c) and one Python call (pass_spawns.c) start programs; the
+ * program a kept script starts stays.
+ * - `legacy`: both go at once, through the full-load route.
+ * - otherwise in two steps: the script alone goes through closure repair,
+ *   then the Python file, whose deletion the Python namespace admission
+ *   declines (a deleted module's names leave its importers' namespaces), so
+ *   it takes the full route.
+ * Returns the Process count after the last deletion, or -1. *route: the route
+ * of the first (or only) step; *after_script and *python_route: the count and
+ * the route after the script-only step and the Python step (two-step mode). */
+static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *route,
+                                      int *after_script, cbm_incremental_route_t *python_route) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_spawngc_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
@@ -3545,28 +3552,35 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     char path[512];
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
+    if (!legacy) {
+        *after_script =
+            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *route = cbm_pipeline_incremental_test_last_route();
+    }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
     (void)remove(path);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (legacy) {
         cbm_pipeline_incremental_test_force_legacy_partial_once();
     }
-#else
-    (void)legacy;
 #endif
     int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
-    *route = cbm_pipeline_incremental_test_last_route();
+    *(legacy ? route : python_route) = cbm_pipeline_incremental_test_last_route();
     th_rmtree(tmp);
     return full == 3 ? after : -1;
 }
 
 TEST(incremental_deleted_spawner_drops_its_process) {
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
-    int left = incremental_spawner_delete(false, &route);
+    cbm_incremental_route_t python_route = CBM_INCREMENTAL_ROUTE_NONE;
+    int after_script = -1;
+    int left = incremental_spawner_delete(false, &route, &after_script, &python_route);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(after_script, 2); /* tool-a gone; tool-b and tool-c stay */
+    ASSERT_EQ(python_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(left, 1);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    left = incremental_spawner_delete(true, &route);
+    left = incremental_spawner_delete(true, &route, &after_script, &python_route);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
     ASSERT_EQ(left, 1);
 #endif
@@ -4519,6 +4533,249 @@ TEST(pipeline_closure_repair_new_file_declines_to_full) {
     cbm_pipeline_free(incr);
     th_rmtree(tmp);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+static int stem_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "stem");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static void stem_unlink(const char *tmp, const char *rel) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", tmp, rel);
+    (void)cbm_unlink(path);
+}
+
+/* Every collision shape of cbm_stem_marks_t, plus `fillers` plain scripts. */
+static void stem_repo(const char *tmp, int fillers) {
+    write_temp_file(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    write_temp_file(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
+    write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
+    write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
+    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
+    write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
+    write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    write_temp_file(tmp, "goapi/main/main.go",
+                    "package main\n\nimport \"example.com/stem/goapi/api\"\n\n"
+                    "func main() { api.Serve() }\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "fill/f%02d.sh", i);
+        snprintf(body, sizeof(body), "#!/bin/sh\nfill_%02d() {\n  echo %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* A file and the directory beside it with one stem (genproto.sh, genproto/)
+ * shared a QN, and the graph buffer kept only the Folder: the file's Module
+ * was lost. Now one side yields (cbm_stem_marks_t). The Folder is spelled
+ * `stem.genproto/` -- unless the directory is a Go package: it IS that
+ * package's module and Go imports land on it, so the file's Module yields as
+ * `stem.goapi.api#sh`. Rust's foo.rs beside foo/ and C's foo.h/foo.c stem pair
+ * keep their Module QNs; a dotted stem (foo.test.ts, foo/test/) collides by QN
+ * too. Run small (sequential extraction) and past MIN_FILES_FOR_PARALLEL
+ * (parallel workers), which insert Modules on separate paths. */
+TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
+    static const char *const checks[][2] = {
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.genproto' AND "
+         "file_path='genproto.sh'",
+         "genproto.sh Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/' AND "
+         "file_path='genproto'",
+         "genproto/ Folder marked"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='CONTAINS_FILE' AND s.qualified_name='stem.genproto/' AND "
+         "t.file_path='genproto/one.sh'",
+         "marked Folder contains its file"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='genproto.sh' AND t.label='Module' AND t.qualified_name='stem.genproto'",
+         "genproto.sh defines its Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo' AND "
+         "file_path='rs/foo.rs'",
+         "Rust foo.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo.bar' AND "
+         "file_path='rs/foo/bar.rs'",
+         "Rust foo/bar.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.rs.foo/'",
+         "rs/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.c.foo'",
+         "C stem pair Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
+         "c/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+         "file_path='ts/foo.test.ts'",
+         "dotted foo.test.ts Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
+         "ts/foo/test/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api'",
+         "Go package Folder keeps its QN"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh' "
+         "AND file_path='goapi/api.sh'",
+         "api.sh Module beside the Go package"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='goapi/api.sh' AND t.qualified_name='stem.goapi.api#sh'",
+         "api.sh defines its Module"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='IMPORTS' AND s.file_path='goapi/main/main.go' AND "
+         "t.label='Folder' AND t.qualified_name='stem.goapi.api'",
+         "Go import lands on the package Folder"},
+    };
+    enum { STEM_CHECKS = sizeof(checks) / sizeof(checks[0]) };
+    static const int fillers[] = {0, 60};
+    int got[2][STEM_CHECKS];
+    int rcs[2];
+    for (int run = 0; run < 2; run++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemdir_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        stem_repo(tmp, fillers[run]);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/stem.db", tmp);
+        rcs[run] = stem_index(tmp, db);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            got[run][c] = k8s_inc_count(db, checks[c][0]);
+        }
+        th_rmtree(tmp);
+    }
+    int wrong = 0;
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rcs[run], 0);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            if (got[run][c] != 1) {
+                printf("  fillers=%d: %s: %d\n", fillers[run], checks[c][1], got[run][c]);
+                wrong++;
+            }
+        }
+    }
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
+/* A kustomization names a directory (`dashboards`) and the manifest beside it
+ * with the same stem (`dashboards.yaml`), as kubernetes/k8s.io does. The
+ * file's Module, once swallowed by the Folder, is a node now: the directory
+ * entry must still land on the (marked) Folder, the file entry on the file. */
+TEST(pipeline_kustomize_entry_beside_same_stem_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemkust_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "monitoring/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                    "kind: Kustomization\n"
+                    "resources:\n"
+                    "  - dashboards\n"
+                    "  - dashboards.yaml\n");
+    write_temp_file(tmp, "monitoring/dashboards.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: board\n");
+    write_temp_file(tmp, "monitoring/dashboards/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                    "kind: Kustomization\n"
+                    "resources:\n"
+                    "  - cm.yaml\n");
+    write_temp_file(tmp, "monitoring/dashboards/cm.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: inner\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/stemkust.db", tmp);
+    int rc = stem_index(tmp, db);
+    int to_dir = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+            "s.file_path='monitoring/kustomization.yaml' AND t.label='Folder' AND "
+            "t.qualified_name='stem.monitoring.dashboards/'");
+    int to_file = k8s_inc_count(
+        db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.type='IMPORTS' AND "
+            "s.file_path='monitoring/kustomization.yaml' AND t.label='Module' AND "
+            "t.file_path='monitoring/dashboards.yaml'");
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(to_dir, 1);
+    ASSERT_EQ(to_file, 1);
+    PASS();
+}
+
+/* Deleting a file that takes part in a stem collision changes which side
+ * carries the mark, and only a full rebuild re-spells the survivors, so the
+ * planner declines the closure repair: deleting genproto.sh frees the
+ * Folder's plain QN; deleting a Go package's only Go file leaves a plain
+ * directory, whose Folder then yields to api.sh's Module. A deletion away
+ * from every collision stays a closure repair. */
+TEST(incremental_stem_mark_deletion_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stemdel_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    write_temp_file(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    write_temp_file(tmp, "goapi/api/run.sh", "#!/bin/sh\nrun_it() {\n  echo run\n}\n");
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo other\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/stemdel.db", tmp);
+    static const char marked_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/'";
+    static const char plain_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto'";
+    static const char go_side[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh'";
+    static const char api_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api/'";
+    static const char api_mod[] = "SELECT COUNT(*) FROM nodes WHERE label='Module' AND "
+                                  "qualified_name='stem.goapi.api' AND file_path='goapi/api.sh'";
+
+    int full_rc = stem_index(tmp, db);
+    int full_marked = k8s_inc_count(db, marked_dir);
+    int full_go_side = k8s_inc_count(db, go_side);
+
+    stem_unlink(tmp, "misc/other.sh");
+    int other_rc = stem_index(tmp, db);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+
+    stem_unlink(tmp, "genproto.sh");
+    int gen_rc = stem_index(tmp, db);
+    cbm_incremental_route_t gen_route = cbm_pipeline_incremental_test_last_route();
+    int gen_marked = k8s_inc_count(db, marked_dir);
+    int gen_plain = k8s_inc_count(db, plain_dir);
+
+    stem_unlink(tmp, "goapi/api/server.go");
+    int go_rc = stem_index(tmp, db);
+    cbm_incremental_route_t go_route = cbm_pipeline_incremental_test_last_route();
+    int go_side_after = k8s_inc_count(db, go_side);
+    int api_dir_after = k8s_inc_count(db, api_dir);
+    int api_mod_after = k8s_inc_count(db, api_mod);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(full_marked, 1);
+    ASSERT_EQ(full_go_side, 1);
+    ASSERT_EQ(other_rc, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(gen_rc, 0);
+    ASSERT_EQ(gen_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(gen_marked, 0);
+    ASSERT_EQ(gen_plain, 1);
+    ASSERT_EQ(go_rc, 0);
+    ASSERT_EQ(go_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(go_side_after, 0);
+    ASSERT_EQ(api_dir_after, 1);
+    ASSERT_EQ(api_mod_after, 1);
     PASS();
 }
 
@@ -8172,6 +8429,156 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
      * the member-access signal exactly like the sequential resolvers. */
     ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
     ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A C caller of a header function that shares its name with a struct member
+ * elsewhere (kernel: include/linux/mm.h put_page beside the arm64
+ * kvm_pgtable_mm_ops.put_page member). pad_files pushes the run past
+ * MIN_FILES_FOR_PARALLEL for the parallel twin. */
+static void write_c_header_namesake_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "include/linux/mm.h",
+                    "struct page;\n"
+                    "static inline void put_page(struct page *page)\n"
+                    "{\n"
+                    "\t(void)page;\n"
+                    "}\n");
+    write_temp_file(tmp, "arch/arm64/include/asm/kvm_pgtable.h",
+                    "struct kvm_pgtable_mm_ops {\n"
+                    "\tvoid (*put_page)(void *addr);\n"
+                    "};\n");
+    write_temp_file(tmp, "arch/arm64/kernel/elfcore.c",
+                    "#include <linux/mm.h>\n"
+                    "#include <asm/kvm_pgtable.h>\n"
+                    "int mte_dump_tag_range(struct page *page)\n"
+                    "{\n"
+                    "\tput_page(page);\n"
+                    "\treturn 0;\n"
+                    "}\n");
+    write_temp_file(tmp, "drivers/net/rx.c",
+                    "#include <linux/mm.h>\n"
+                    "void recv_buffer_free(struct page *page)\n"
+                    "{\n"
+                    "\tput_page(page);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* CALLS edges from the nodes named src_name into nodes named tgt_name that
+ * carry tgt_label: the name-only probes cannot tell the header Function from
+ * its struct-member namesake. */
+static int labelled_call_count(cbm_store_t *s, const char *project, const char *src_name,
+                               const char *tgt_name, const char *tgt_label) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    for (int i = 0; i < sc; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].label &&
+                    strcmp(tgts[k].label, tgt_label) == 0) {
+                    n++;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return n;
+}
+
+TEST(pipeline_c_call_reaches_header_function_beside_field) {
+    /* 2026-10-13 kernel audit: `put_page(page)` 345 -> 9 callers. The struct
+     * member in the short-name registry makes the bare name two candidates,
+     * so the lookup answers by suffix_match; .h is C++ in the extension table
+     * and the #725 guard dropped the C caller's edge as cross-language.
+     * Reproduce-first: RED before the fix. Sequential-path twin. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_hdr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_header_namesake_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_hdr.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both namesakes must exist for the probe to mean anything. */
+    ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
+                                  "Field"),
+               1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
+    /* A bare C call never names the struct member. */
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
+    /* Parallel twin: the kernel resolves through pass_parallel.c, which asks
+     * the same #725 guard. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_hdrp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_header_namesake_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_hdrp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
+                                  "Field"),
+               1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
+    ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -21179,7 +21586,7 @@ static int doc_candidate_row_count(cbm_store_t *s) {
 
 /* doc_candidates off: the same repository indexed with the switch off has no
  * candidate rows and exactly the nodes and edges of the default run, which has
- * candidates (the default is on). */
+ * candidates (the default is on in full mode). */
 TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_off_XXXXXX");
@@ -21280,6 +21687,187 @@ TEST(pipeline_doc_candidates_off_clears_rows_on_delta) {
     cbm_pipeline_incremental_test_reset_faults();
     PASS();
 }
+
+/* One index run of the doc-candidate fixture in tmp into db. set < 0 leaves
+ * doc_candidates unset (the index mode decides); 0 / 1 set it explicitly. */
+typedef struct {
+    bool enabled_before; /* the switch as the pipeline reports it before the run */
+    int rows;            /* doc_link_candidates rows; -1 on an error */
+    int sem;             /* SEMANTICALLY_RELATED edges */
+    int sim;             /* SIMILAR_TO edges */
+    int nodes;
+    int edges;
+} doc_mode_run_t;
+
+static doc_mode_run_t doc_candidates_mode_run(const char *tmp, const char *db,
+                                              cbm_index_mode_t mode, int set) {
+    doc_mode_run_t r = {.rows = -1};
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, mode);
+    if (!p) {
+        return r;
+    }
+    if (set >= 0) {
+        cbm_pipeline_set_doc_candidates_enabled(p, set == 1);
+    }
+    r.enabled_before = cbm_pipeline_doc_candidates_enabled(p);
+    /* A threshold low enough that the fixture's near-duplicates relate, so
+     * the SEMANTICALLY_RELATED count shows whether the edge phases ran. */
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    char project[512];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
+    if (!s) {
+        return r;
+    }
+    r.rows = doc_candidate_row_count(s);
+    r.sem = cbm_store_count_edges_by_type(s, project, "SEMANTICALLY_RELATED");
+    r.sim = cbm_store_count_edges_by_type(s, project, "SIMILAR_TO");
+    r.nodes = cbm_store_count_nodes(s, project);
+    r.edges = cbm_store_count_edges(s, project);
+    cbm_store_close(s);
+    return r;
+}
+
+/* doc_candidates unset: the index mode decides -- a full index stores
+ * candidate rows, moderate and fast store none. Moderate still runs the
+ * semantic pass (its SEMANTICALLY_RELATED edges), only without the doc
+ * phase. Each run writes a fresh database outside the indexed tree. */
+TEST(pipeline_doc_candidates_default_follows_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_mode_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_mdb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db_full[512];
+    char db_moderate[512];
+    char db_fast[512];
+    snprintf(db_full, sizeof(db_full), "%s/full.db", dbdir);
+    snprintf(db_moderate, sizeof(db_moderate), "%s/moderate.db", dbdir);
+    snprintf(db_fast, sizeof(db_fast), "%s/fast.db", dbdir);
+
+    doc_mode_run_t full = doc_candidates_mode_run(tmp, db_full, CBM_MODE_FULL, -1);
+    doc_mode_run_t moderate = doc_candidates_mode_run(tmp, db_moderate, CBM_MODE_MODERATE, -1);
+    doc_mode_run_t fast = doc_candidates_mode_run(tmp, db_fast, CBM_MODE_FAST, -1);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_TRUE(full.enabled_before);
+    ASSERT_GT(full.rows, 0);
+    ASSERT_FALSE(moderate.enabled_before);
+    ASSERT_EQ(moderate.rows, 0);
+    ASSERT_GT(moderate.sem, 0);
+    ASSERT_FALSE(fast.enabled_before);
+    ASSERT_EQ(fast.rows, 0);
+    ASSERT_EQ(fast.sem, 0);
+    PASS();
+}
+
+/* An explicit doc_candidates wins over the mode in both directions: full +
+ * off stores none, moderate + on and fast + on store rows. Fast keeps its
+ * contract -- the doc-only semantic pass adds no SEMANTICALLY_RELATED or
+ * SIMILAR_TO edge, and the graph is exactly fast's default graph. */
+TEST(pipeline_doc_candidates_explicit_wins_over_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_expl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_edb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db_full_off[512];
+    char db_moderate_on[512];
+    char db_fast_on[512];
+    char db_fast[512];
+    snprintf(db_full_off, sizeof(db_full_off), "%s/full_off.db", dbdir);
+    snprintf(db_moderate_on, sizeof(db_moderate_on), "%s/moderate_on.db", dbdir);
+    snprintf(db_fast_on, sizeof(db_fast_on), "%s/fast_on.db", dbdir);
+    snprintf(db_fast, sizeof(db_fast), "%s/fast.db", dbdir);
+
+    doc_mode_run_t full_off = doc_candidates_mode_run(tmp, db_full_off, CBM_MODE_FULL, 0);
+    doc_mode_run_t moderate_on = doc_candidates_mode_run(tmp, db_moderate_on, CBM_MODE_MODERATE, 1);
+    doc_mode_run_t fast_on = doc_candidates_mode_run(tmp, db_fast_on, CBM_MODE_FAST, 1);
+    doc_mode_run_t fast = doc_candidates_mode_run(tmp, db_fast, CBM_MODE_FAST, -1);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_FALSE(full_off.enabled_before);
+    ASSERT_EQ(full_off.rows, 0);
+    ASSERT_TRUE(moderate_on.enabled_before);
+    ASSERT_GT(moderate_on.rows, 0);
+    ASSERT_GT(moderate_on.sem, 0);
+    ASSERT_TRUE(fast_on.enabled_before);
+    ASSERT_GT(fast_on.rows, 0);
+    ASSERT_EQ(fast_on.sem, 0);
+    ASSERT_EQ(fast_on.sim, 0);
+    ASSERT_EQ(fast.rows, 0);
+    ASSERT_GT(fast.nodes, 0);
+    ASSERT_EQ(fast_on.nodes, fast.nodes);
+    ASSERT_EQ(fast_on.edges, fast.edges);
+    PASS();
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+/* The incremental legacy-partial route mirrors the full path: a fast reindex
+ * with doc_candidates explicitly on recomputes candidate rows over the
+ * rehydrated project and still adds no SEMANTICALLY_RELATED / SIMILAR_TO
+ * edge. */
+TEST(pipeline_doc_candidates_fast_on_legacy_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_finc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_doc_candidate_fixture(tmp);
+    char dbdir[256];
+    snprintf(dbdir, sizeof(dbdir), "/tmp/cbm_doccand_fidb_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dbdir));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/fast.db", dbdir);
+
+    doc_mode_run_t first = doc_candidates_mode_run(tmp, db, CBM_MODE_FAST, -1);
+    char edited[512];
+    snprintf(edited, sizeof(edited), "%s/User_config.go", tmp);
+    FILE *ef = cbm_fopen(edited, "a");
+    ASSERT_NOT_NULL(ef);
+    (void)fputs("\n// edited after the first index\n", ef);
+    (void)fclose(ef);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_doc_candidates_enabled(p, true);
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    ASSERT_EQ(rc, 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    char project[512];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    int rows = doc_candidate_row_count(s);
+    int sem = cbm_store_count_edges_by_type(s, project, "SEMANTICALLY_RELATED");
+    int sim = cbm_store_count_edges_by_type(s, project, "SIMILAR_TO");
+    cbm_store_close(s);
+    th_rmtree(tmp);
+    th_rmtree(dbdir);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(first.rows, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_GT(rows, 0);
+    ASSERT_EQ(sem, 0);
+    ASSERT_EQ(sim, 0);
+    PASS();
+}
+#endif
 
 /* One Python family per subject: parse / load / validate / write, each with
  * a docstring, so the functions' corpus has the subject words to match. */
@@ -22377,6 +22965,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
+    RUN_TEST(pipeline_kustomize_entry_beside_same_stem_file);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
@@ -22429,6 +23019,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_c_call_reaches_header_function_beside_field);
+    RUN_TEST(pipeline_c_call_reaches_header_function_beside_field_parallel);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
@@ -22704,6 +23296,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_doc_candidates_published_and_kept_by_delta);
     RUN_TEST(pipeline_doc_candidates_off_stores_none_and_keeps_graph);
     RUN_TEST(pipeline_doc_candidates_off_clears_rows_on_delta);
+    RUN_TEST(pipeline_doc_candidates_default_follows_mode);
+    RUN_TEST(pipeline_doc_candidates_explicit_wins_over_mode);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_doc_candidates_fast_on_legacy_incremental);
+#endif
     RUN_TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves);
     RUN_TEST(pipeline_doc_candidates_home_position_and_kinds);
     RUN_TEST(pipeline_doc_candidates_diagram_family_curves);
@@ -22741,6 +23338,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
+    RUN_TEST(incremental_stem_mark_deletion_rebuilds);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
