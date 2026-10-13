@@ -1164,6 +1164,68 @@ static bool incr_edge_type_is_recomputed(const char *type) {
                     strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
 }
 
+static int incr_strcmp(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* Are the component Images this run built (pass_docker.c P4.2b: an Image
+ * with a `component` property and a build edge in `gb`) exactly `before`
+ * (sorted QNs)? */
+static bool incr_image_components_equal(const cbm_gbuf_t *gb, const char *const *before, int nb,
+                                        CBMArena *a) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_label(gb, "Image", &nodes, &n) != 0 || n == 0) {
+        return nb == 0;
+    }
+    const char **now = cbm_arena_alloc(a, (size_t)n * sizeof(*now));
+    if (!now) {
+        return false;
+    }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_edge_t **out = NULL;
+        int ne = 0;
+        if (nodes[i]->properties_json && strstr(nodes[i]->properties_json, "\"component\":") &&
+            cbm_gbuf_find_edges_by_source_type(gb, nodes[i]->id, "DEPENDS_ON", &out, &ne) == 0 &&
+            ne > 0) {
+            now[k++] = nodes[i]->qualified_name;
+        }
+    }
+    if (k != nb) {
+        return false;
+    }
+    qsort((void *)now, (size_t)k, sizeof(*now), incr_strcmp);
+    for (int i = 0; i < k; i++) {
+        if (strcmp(now[i], before[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The files whose File node the shell pass marked as running a container
+ * build (pass_shell.c), from the full-load buffer, into arena `a`; returns
+ * how many. */
+static int incr_build_decl_files(const cbm_gbuf_t *gb, CBMArena *a, const char ***out) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    *out = NULL;
+    if (cbm_gbuf_find_by_label(gb, "File", &nodes, &n) != 0 || n == 0) {
+        return 0;
+    }
+    const char **items = cbm_arena_alloc(a, (size_t)n * sizeof(*items));
+    int k = 0;
+    for (int i = 0; items && i < n; i++) {
+        const char *p = nodes[i]->properties_json;
+        if (nodes[i]->file_path && p && strstr(p, "\"declares_build\":true")) {
+            items[k++] = cbm_arena_strdup(a, nodes[i]->file_path);
+        }
+    }
+    *out = items;
+    return k;
+}
+
 /* cbm_gbuf_foreach_edge visitor: snapshot inbound cross-file edges into
  * changed files so they survive the purge and can be re-linked afterward. */
 static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
@@ -1742,7 +1804,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             free_incremental_result_cache(cache, ci);
             return rc;
         }
-        cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
 
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
@@ -1902,7 +1964,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
         cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
-        cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
         free_incremental_result_cache(cache, ci);
         if (legacy_cross_arena_live) {
             free(all_defs); /* array returned by the existing collect helper */
@@ -2015,6 +2077,14 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     rc = cbm_pipeline_pass_configlink(ctx);
     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    if (rc < 0 || cbm_pipeline_check_cancel(ctx)) {
+        return rc < 0 ? rc : CBM_NOT_FOUND;
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    rc = cbm_pipeline_pass_operator(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_operator", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
     if (rc < 0 || cbm_pipeline_check_cancel(ctx)) {
         return rc < 0 ? rc : CBM_NOT_FOUND;
@@ -2346,6 +2416,102 @@ static const char *closure_add_variant_partners(cbm_store_t *store, const char *
     return decline;
 }
 
+/* Whether the directory of `rel` (whose basename is at `base`) holds a
+ * compose file: compose interpolates that directory's .env into it, so the
+ * .env changes what its services build and run (pass_ci.c). */
+static bool closure_dir_has_compose(const char *repo_path, const char *rel, const char *base) {
+    char dir[CBM_SZ_4K];
+    int n = snprintf(dir, sizeof(dir), "%s/%.*s", repo_path, (int)(base - rel), rel);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        return true; /* unknown: decline */
+    }
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    cbm_dirent_t *e;
+    while (!found && (e = cbm_readdir(d)) != NULL) {
+        found = !e->is_dir && cbm_build_path(e->name) &&
+                strncmp(e->name, "skaffold", strlen("skaffold")) != 0;
+    }
+    cbm_closedir(d);
+    return found;
+}
+
+/* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
+ * decides which manifests deploy together and in which namespace, a
+ * Chart.yaml links other charts, and a manifest's Services select workloads
+ * in other files of its bundle. The repair re-runs the K8s pass over its plan
+ * only, so a delta touching any of them -- a file that held objects, or holds
+ * them now -- declines to the full rebuild. Returns the reason, or NULL. */
+static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
+                                       const char *repo_path, char **paths, int n_changed,
+                                       int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *rel = paths[i];
+        const char *slash = strrchr(rel, '/');
+        const char *base = slash ? slash + SKIP_ONE : rel;
+        if (cbm_is_kustomize_file(base) || strcmp(base, "Kustomization") == 0) {
+            return "k8s_bundle_input_changed";
+        }
+        if (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) {
+            return "helm_chart_changed";
+        }
+        if (strcmp(base, ".env") == 0 && closure_dir_has_compose(repo_path, rel, base)) {
+            return "compose_env_changed";
+        }
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
+            return "k8s_lookup_failed";
+        }
+        /* A compose service (pass_docker.c) is a Resource too, but it links
+         * only inside its file and to the Images / Dockerfiles every run
+         * recomputes: no bundle reaches past it. */
+        bool held = false;
+        for (int j = 0; j < count && !held; j++) {
+            held = nodes[j].label && strcmp(nodes[j].label, "Resource") == 0 &&
+                   !(nodes[j].properties_json &&
+                     strstr(nodes[j].properties_json, "\"ecosystem\":\"compose\""));
+        }
+        cbm_store_free_nodes(nodes, count);
+        if (held) {
+            return "k8s_manifest_changed";
+        }
+        const char *ext = strrchr(base, '.');
+        if (i < n_changed && ext && (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0)) {
+            enum { K8S_PEEK = 4096 };
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
+            char head[K8S_PEEK + SKIP_ONE];
+            size_t n = 0;
+            FILE *f = cbm_fopen(path, "rb");
+            if (f) {
+                n = fread(head, SKIP_ONE, K8S_PEEK, f);
+                (void)fclose(f);
+            }
+            head[n] = '\0';
+            if (cbm_is_k8s_manifest(base, head)) {
+                return "k8s_manifest_changed";
+            }
+        }
+    }
+    return NULL;
+}
+
+/* A Python file whose namespace metadata changed, or is unreadable, declines
+ * the closure before any hash cutoff: its importers' bindings follow the
+ * namespace order. A deleted file passes NULL for fresh_json. */
+static const char *closure_python_namespace_decline(const char *stored_json,
+                                                    const char *fresh_json) {
+    int change = cbm_lsp_surface_python_change(stored_json, fresh_json);
+    if (change < 0) {
+        return "python_namespace_metadata_invalid";
+    }
+    return change > 0 ? "python_namespace_changed" : NULL;
+}
+
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
@@ -2468,6 +2634,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             goto done;
         }
     }
+    decline = closure_k8s_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
+                                  n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
 
     /* Load the previous generation's surfaces and probe the changed files'
      * fresh ones. Missing rows fail closed. */
@@ -2535,8 +2706,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         goto done;
     }
 
-    /* Early cutoff per changed file; surface-changed files seed the
-     * dependent query. Deleted files always seed it. */
+    /* Validate Python namespace metadata before any hash cutoff or dependent
+     * query. Python changes require a full rebuild; other surface changes and
+     * deletions seed the dependent query. */
     int n_surface_changed = 0;
     /* dep_targets, then the body-edited files (body_targets) in the same block */
     const char **dep_targets =
@@ -2548,7 +2720,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     body_targets = dep_targets + n_changed + n_deleted;
     int dep_target_count = 0;
-    for (int i = 0; i < n_changed; i++) {
+    /* The first file that declines the closure stops both loops; the one exit
+     * below releases dep_targets and the row index for every reason. */
+    const char *why = NULL;
+    for (int i = 0; i < n_changed && !why; i++) {
         const cbm_lsp_surface_row_t *stored_row = cbm_ht_get(rows_by_path, changed_paths[i]);
         const cbm_lsp_surface_row_t *fresh_row = NULL;
         for (int j = 0; j < probe_count; j++) {
@@ -2558,10 +2733,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             }
         }
         if (!stored_row || !fresh_row) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = "missing_surface_row";
-            goto done;
+            why = "missing_surface_row";
+            break;
+        }
+        why = closure_python_namespace_decline(stored_row->defs_json, fresh_row->defs_json);
+        if (why) {
+            break;
         }
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
             /* body edit: the file re-resolves, and of the others only the
@@ -2570,27 +2747,25 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             continue;
         }
         bool added = false;
-        const char *why = NULL;
         if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
             added) {
             why = "added_definition_names";
         } else if (!doc_scope_repairable(stored_row->defs_json, fresh_row->defs_json,
                                          removed_names)) {
             why = "doc_scope_changed";
+        } else {
+            n_surface_changed++;
+            dep_targets[dep_target_count++] = changed_paths[i];
         }
-        if (why) {
-            free(dep_targets);
-            cbm_ht_free(rows_by_path);
-            decline = why;
-            goto done;
-        }
-        n_surface_changed++;
-        dep_targets[dep_target_count++] = changed_paths[i];
     }
     bool gone_scope_changed = false; /* a deleted file takes its declarations along */
-    for (int i = 0; i < n_deleted; i++) {
-        dep_targets[dep_target_count++] = changed_paths[n_changed + i];
+    for (int i = 0; i < n_deleted && !why; i++) {
         const cbm_lsp_surface_row_t *gone = cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
+        why = closure_python_namespace_decline(gone ? gone->defs_json : NULL, NULL);
+        if (why) {
+            break;
+        }
+        dep_targets[dep_target_count++] = changed_paths[n_changed + i];
         if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names)) {
             gone_scope_changed = true;
         }
@@ -2602,14 +2777,18 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
      * target, so the documents with edges into a body-edited file re-resolve
      * too (added to the closure below). */
     bool dep_failed =
-        (dep_target_count > 0 &&
-         cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count, &dependents,
-                                       &dependent_count) != CBM_STORE_OK) ||
-        (body_target_count > 0 &&
-         cbm_store_get_dependent_files(store, project, body_targets, body_target_count, &line_docs,
-                                       &line_doc_count) != CBM_STORE_OK);
+        !why && ((dep_target_count > 0 &&
+                  cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count,
+                                                &dependents, &dependent_count) != CBM_STORE_OK) ||
+                 (body_target_count > 0 &&
+                  cbm_store_get_dependent_files(store, project, body_targets, body_target_count,
+                                                &line_docs, &line_doc_count) != CBM_STORE_OK));
     free(dep_targets); /* body_targets with it */
     body_targets = NULL;
+    if (why) {
+        decline = why;
+        goto done;
+    }
     if (dep_failed) {
         decline = "dependent_query_failed";
         goto done;
@@ -2763,6 +2942,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_doc_link_row_t *doc_rows = NULL;
     int doc_row_count = 0;
     bool doc_failed = false;
+    CBMArena decl_arena; /* the files that declared image builds before */
+    cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
+    const char **decl_files = NULL;
+    int decl_count = 0;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
@@ -2775,6 +2958,14 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     cbm_log_info("delta.staging_open", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    /* before the purge drops any of their edges */
+    decl_count = cbm_delta_build_decl_files(staging, project, &decl_arena, &decl_files);
+    decl_count = decl_count > 0 ? decl_count : 0;
+    const char **hub_images = NULL;
+    int hub_count = cbm_delta_image_components(staging, project, &decl_arena, &hub_images);
+    if (hub_count < 0) {
+        goto out;
+    }
 
     /* Purge set = closure files + deleted files. */
     int purge_count = ci + deleted_count;
@@ -2958,6 +3149,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .excluded_count = excluded_count,
         .doc_link_base = doc_base,
         .doc_link_base_count = doc_base_count,
+        .build_decl_files = decl_files,
+        .build_decl_count = decl_count,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3002,6 +3195,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         }
         goto out;
     }
+    /* A repository split differently (pass_docker.c P4.2b) leaves the
+     * references of files not repaired here on the old component Images:
+     * only a full rebuild re-points them. */
+    if (!incr_image_components_equal(gbuf, hub_images, hub_count, &decl_arena)) {
+        cbm_log_info("delta.fallback", "reason", "image_components_changed");
+        goto out;
+    }
     cbm_log_info("delta.repair", "files", itoa_buf(ci), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
     /* Doc-link rows: the previous rows of every file not re-extracted (or
@@ -3017,11 +3217,26 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         }
     }
 
+    /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
+     * the skaffold / compose file declaring them, not to either end: the K8s
+     * pass just recomputed them from every build file, so they replace the
+     * staging set wholesale. */
+    if (cbm_delta_drop_edges_from_label(staging, project, CBM_BUILD_EDGE_TYPE,
+                                        CBM_BUILD_EDGE_SOURCE) < 0) {
+        goto out;
+    }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_patch(staging, project, gbuf, max_db_id, snapshot, snapshot_count) != 0) {
         goto out;
     }
     cbm_log_info("delta.patch_done", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    /* The proxy buffer holds no edges, so only the patched staging graph can
+     * tell a Process node no SPAWNS reaches any more (its last spawner was
+     * purged), or an Image nothing builds on, builds or runs. */
+    if (cbm_delta_drop_unreferenced(staging, project, "Process", SH_PROCESS_EDGES) < 0 ||
+        cbm_delta_drop_unreferenced(staging, project, "Image", DK_IMAGE_EDGES) < 0) {
+        goto out;
+    }
 
     /* Importance, in SQL, over the now-complete staging graph. This is the
      * FIRST point on this route where the whole project is queryable: the
@@ -3172,7 +3387,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .doc_link_rows = doc_rows,
             .doc_link_row_count = doc_row_count,
             .doc_links_failed = doc_failed,
-            .doc_candidates_in_place = true, /* the clone keeps the previous rows */
+            /* The clone keeps the previous rows; with doc_candidates off they
+             * are replaced by none, so turning it off leaves no stale rows. */
+            .doc_candidates_in_place = cbm_pipeline_doc_candidates_enabled(p),
         };
         cbm_store_close(staging);
         staging = NULL;
@@ -3198,6 +3415,7 @@ out:
 #endif
     }
     cbm_delta_free_snapshot(snapshot, snapshot_count);
+    cbm_arena_destroy(&decl_arena);
     surface_name_set_free(stale_surface_set);
     cbm_doclinks_free_scopes(doc_base, doc_base_count);
     cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);
@@ -3529,6 +3747,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     legacy_doc_load(&legacy_doc, store, project, changed_files, ci, deleted, deleted_count);
     cbm_store_close(store);
 
+    /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
+     * the skaffold / compose file declaring them, not to either end: the K8s
+     * pass recomputes them all from every build file, so none is kept (nor
+     * captured below). */
+    CBMArena decl_arena; /* the files that declared image builds before */
+    cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
+    const char **decl_files = NULL;
+    int decl_count = incr_build_decl_files(existing, &decl_arena, &decl_files);
+    (void)cbm_gbuf_delete_edges_from_label(existing, CBM_BUILD_EDGE_TYPE, CBM_BUILD_EDGE_SOURCE);
+
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
      * an unchanged (never-re-parsed) file. Re-linked after re-resolution. */
@@ -3620,6 +3848,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
 
+    ctx.build_decl_files = decl_files;
+    ctx.build_decl_count = decl_count;
     int phase_rc = run_extract_resolve(&ctx, changed_files, ci, NULL);
     if (phase_rc == 0) {
         phase_rc = cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
@@ -3628,6 +3858,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         phase_rc = cbm_pipeline_check_cancel(&ctx);
     }
     if (phase_rc == 0) {
+        /* A Process node exists only as a SPAWNS target (pass_spawns.c,
+         * pass_shell.c), an Image only through its DEPENDS_ON / USAGE edges
+         * (pass_docker.c); neither carries a file: when the last file naming
+         * one is gone, nothing else removes it -- a full index never makes
+         * it. This buffer holds the whole graph. */
+        (void)cbm_gbuf_delete_unreferenced(existing, "Process", SH_PROCESS_EDGES);
+        (void)cbm_gbuf_delete_unreferenced(existing, "Image", DK_IMAGE_EDGES);
         phase_rc = run_postpasses(&ctx, changed_files, ci, project, true);
     }
 
@@ -3659,6 +3896,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        cbm_arena_destroy(&decl_arena);
         legacy_doc_free(&legacy_doc);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
@@ -3771,6 +4009,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        cbm_arena_destroy(&decl_arena);
         cbm_doclinks_free_rows(doc_rows, doc_row_count);
         return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
                                                           : CBM_PIPELINE_ABORT_PRESERVE_DB;
@@ -3814,6 +4053,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
+    cbm_arena_destroy(&decl_arena);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return persist_rc;
