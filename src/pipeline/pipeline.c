@@ -278,11 +278,16 @@ struct cbm_pipeline {
      * cbm_pipeline_free). NULL when the pass found none or did not run. */
     cbm_doc_candidate_t *doc_candidates;
     int doc_candidate_count;
+    /* doc_candidates setting off (calloc'd false = on, the default). */
+    bool doc_candidates_off;
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
     void *before_publish_hook_ctx;
+    /* Test-only: sees the complete graph buffer before the dump releases its indexes. */
+    void (*before_dump_hook)(const cbm_gbuf_t *, void *);
+    void *before_dump_hook_ctx;
     int (*rename_hook)(const char *, const char *, void *);
     void *rename_hook_ctx;
 };
@@ -871,6 +876,16 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->doc_candidates_off = !enabled;
+    }
+}
+
+bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p) {
+    return !p || !p->doc_candidates_off;
+}
+
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
                                       const cbm_index_resource_policy_t *policy) {
     if (p && policy) {
@@ -1045,6 +1060,32 @@ void cbm_pipeline_set_before_publish_hook_for_tests(
         p->before_publish_hook = hook;
         p->before_publish_hook_ctx = ctx;
     }
+}
+
+void cbm_pipeline_set_before_dump_hook_for_tests(cbm_pipeline_t *p,
+                                                 void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx) {
+    if (p) {
+        p->before_dump_hook = hook;
+        p->before_dump_hook_ctx = ctx;
+    }
+}
+
+static CBM_TLS void (*g_id_sync_hook)(cbm_gbuf_t *, void *);
+static CBM_TLS void *g_id_sync_hook_ctx;
+
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx) {
+    g_id_sync_hook = hook;
+    g_id_sync_hook_ctx = ctx;
+}
+
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids) {
+    if (g_id_sync_hook) {
+        g_id_sync_hook(gb, g_id_sync_hook_ctx);
+    }
+    /* Raise only: lowering it to the shared value handed the merged edges'
+     * ids out a second time. */
+    cbm_gbuf_raise_next_id(gb, atomic_load(shared_ids));
 }
 
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
@@ -1552,6 +1593,53 @@ static void *gh_compute_thread_fn(void *arg) {
     return NULL;
 }
 
+/* ── Secret hygiene: config values that are secret material stay out ─── */
+
+#define INFRA_SLEN(lit) (sizeof(lit) - SKIP_ONE)
+
+/* A file of values, not declarations: .tfvars assigns Terraform variables,
+ * .env the process environment -- where deployments keep their secrets. */
+static bool infra_values_file(const char *fp) {
+    const char *slash = strrchr(fp, '/');
+    const char *base = slash ? slash + SKIP_ONE : fp;
+    size_t n = strlen(base);
+    static const char *const suffixes[] = {".tfvars", ".tfvars.json", ".env"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t s = strlen(suffixes[i]);
+        if (n >= s && strcmp(base + n - s, suffixes[i]) == 0) {
+            return true;
+        }
+    }
+    return strcmp(base, ".env") == 0 || strncmp(base, ".env.", INFRA_SLEN(".env.")) == 0;
+}
+
+/* A manifest's data / stringData / binaryData hold configuration payload
+ * (a Secret keeps its values there); a value under them never declares an
+ * endpoint the service exposes. */
+static bool infra_payload_key(const char *key_path) {
+    if (!key_path) {
+        return false;
+    }
+    size_t first = strcspn(key_path, ".");
+    return (first == INFRA_SLEN("data") && strncmp(key_path, "data", first) == 0) ||
+           (first == INFRA_SLEN("stringData") && strncmp(key_path, "stringData", first) == 0) ||
+           (first == INFRA_SLEN("binaryData") && strncmp(key_path, "binaryData", first) == 0);
+}
+
+/* `url` as a route: scheme, host and path. Userinfo (`user:pass@`), the query
+ * and the fragment are where credentials and tokens ride; none is part of
+ * the endpoint. */
+static void infra_url_route_form(const char *url, char *out, size_t out_sz) {
+    const char *scheme_end = strstr(url, "://");
+    const char *host = scheme_end ? scheme_end + INFRA_SLEN("://") : url;
+    const char *path = host + strcspn(host, "/?#");
+    const char *at = memchr(host, '@', (size_t)(path - host));
+    const char *host_start = at ? at + SKIP_ONE : host;
+    size_t path_len = strcspn(path, "?#");
+    snprintf(out, out_sz, "%.*s%.*s%.*s", (int)(host - url), url, (int)(path - host_start),
+             host_start, (int)path_len, path);
+}
+
 /* Extract Route nodes from URL strings found in config files (YAML, HCL, TOML).
  * These are infrastructure-defined endpoints (Cloud Scheduler, Terraform). */
 /* Process infra bindings: topic→URL pairs from IaC configs.
@@ -1560,10 +1648,17 @@ static void *gh_compute_thread_fn(void *arg) {
 /* Process one infra binding: create Route node + INFRA_MAPS edge. */
 static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib,
                                      const char *rel_path) {
+    /* Secret hygiene, as for config routes: a values file or a token-shaped
+     * URL mints nothing; a kept URL loses its credentials and query. */
+    if (infra_values_file(rel_path) || cbm_is_secret_value(ib->target_url)) {
+        return 0;
+    }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(ib->target_url, url, sizeof(url));
     char url_route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", ib->target_url);
-    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->target_url, url_route_qn,
-                                                rel_path, 0, 0, "{\"source\":\"infra\"}");
+    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", url);
+    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", url, url_route_qn, rel_path, 0, 0,
+                                                "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(topic_route_qn, sizeof(topic_route_qn), "__route__%s__%s",
              ib->broker ? ib->broker : "async", ib->source_name);
@@ -1584,7 +1679,7 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     }
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props), "{\"broker\":\"%s\",\"topic\":\"%s\",\"endpoint\":\"%s\"}",
-             ib->broker ? ib->broker : "async", ib->source_name, ib->target_url);
+             ib->broker ? ib->broker : "async", ib->source_name, url);
     cbm_gbuf_insert_edge(gbuf, topic_route_id, url_route_id, "INFRA_MAPS", props);
     return SKIP_ONE;
 }
@@ -1670,21 +1765,32 @@ static bool is_ci_tooling_config(const char *fp) {
     return false;
 }
 
-/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
- * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
- * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
- * curl targets) are NOT routes the service serves and must not mint Route nodes
- * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
- * are intentionally absent here so they still produce infra Route nodes. */
-static bool is_upstream_config_key(const char *key_path) {
+/* True when a config key names an endpoint THIS service exposes -- a URL other
+ * systems call on it: a push subscription's endpoint, a post/callback/webhook
+ * URL. Only such keys mint infra Route nodes. Every other config URL is a
+ * reference: an upstream dependency, a registry or repository, a docs or
+ * runbook link, a changelog's pull-request link, a kubeconfig server. A deny
+ * list of those (#521) could not keep up: in 17 infra repositories almost
+ * every infra Route came from such a key (deckhouse: 6,240 `pull_request`
+ * links). The leaf key decides, compared ignoring case, `_` and `-`. */
+static bool is_exposed_endpoint_key(const char *key_path) {
     if (!key_path) {
-        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
         return false;
     }
-    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
-                                       "upstream", "_service_url", "auth",       NULL};
-    for (int i = 0; deny[i]; i++) {
-        if (strstr(key_path, deny[i]) != NULL) {
+    const char *leaf = strrchr(key_path, '.');
+    leaf = leaf ? leaf + SKIP_ONE : key_path;
+    char norm[CBM_SZ_64];
+    size_t n = 0;
+    for (const char *p = leaf; *p && n + 1 < sizeof(norm); p++) {
+        if (*p != '_' && *p != '-') {
+            norm[n++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    norm[n] = '\0';
+    static const char *const endpoints[] = {"pushendpoint", "posturl",    "callback", "callbackurl",
+                                            "webhook",      "webhookurl", NULL};
+    for (int i = 0; endpoints[i]; i++) {
+        if (strcmp(norm, endpoints[i]) == 0) {
             return true;
         }
     }
@@ -1696,12 +1802,14 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
         return;
     }
-    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
-    if (is_upstream_config_key(sr->key_path)) {
+    /* Only an endpoint this service exposes is a route it serves (#521). */
+    if (!is_exposed_endpoint_key(sr->key_path)) {
         return;
     }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(sr->value, url, sizeof(url));
     char route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", sr->value);
+    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", url);
     char route_props[CBM_SZ_512];
     if (sr->key_path) {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\",\"key_path\":\"%s\"}",
@@ -1709,14 +1817,14 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     } else {
         snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\"}");
     }
-    cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
+    cbm_gbuf_upsert_node(gbuf, "Route", url, route_qn, fp, 0, 0, route_props);
 }
 
 /* A URL string_ref that does NOT denote a route the service serves: a value
  * containing whitespace is a command/sentence with an embedded URL (e.g. a
  * Docker healthcheck `curl --fail http://... || exit 1`); a NULL key_path is a
- * context-less/duplicate ref; an upstream/config/healthcheck key is an external
- * dependency, not an exposed route. (#521) */
+ * context-less/duplicate ref; any key but an exposed-endpoint key is a
+ * reference, not an exposed route. (#521) */
 static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->value || strchr(sr->value, ' ')) {
         return true;
@@ -1724,7 +1832,12 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->key_path) {
         return true;
     }
-    return is_upstream_config_key(sr->key_path);
+    /* Secret hygiene: payload values and token-shaped values are denied by
+     * value, so no sibling ref of the same URL mints it either. */
+    if (infra_payload_key(sr->key_path) || cbm_is_secret_value(sr->value)) {
+        return true;
+    }
+    return !is_exposed_endpoint_key(sr->key_path);
 }
 
 static void cbm_pipeline_extract_infra_routes(const cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
@@ -1745,7 +1858,8 @@ static void cbm_pipeline_extract_infra_routes(const cbm_pipeline_ctx_t *ctx, cbm
     CBMHashTable *denied = cbm_ht_create(16);
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!is_infra_file(files[i].rel_path) || is_ci_tooling_config(files[i].rel_path)) {
+            if (!is_infra_file(files[i].rel_path) || is_ci_tooling_config(files[i].rel_path) ||
+                infra_values_file(files[i].rel_path)) {
                 continue;
             }
             bool loaded = false;
@@ -1793,6 +1907,9 @@ static void predump_sem(cbm_pipeline_ctx_t *ctx) {
 }
 static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_configlink(ctx);
+}
+static void predump_operator(cbm_pipeline_ctx_t *ctx) {
+    (void)cbm_pipeline_pass_operator(ctx);
 }
 static void predump_doclinks(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_doclinks(ctx);
@@ -1861,7 +1978,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
     size_t str_def_profile = 0, str_def_lists = 0, str_def_fp = 0, str_def_misc = 0;
     size_t str_call_names = 0, str_call_enclosing = 0, str_call_args = 0;
     size_t str_usage_names = 0, str_usage_enclosing = 0, str_rw = 0, str_typeref = 0;
-    size_t str_resolved = 0, str_source = 0, str_module = 0;
+    size_t str_resolved = 0, str_source = 0, str_module = 0, str_imports = 0;
     for (int i = 0; i < file_count; i++) {
         const CBMFileResult *r = cache ? cache[i] : NULL;
         if (!r) {
@@ -1937,6 +2054,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_call_enclosing += census_len(call->enclosing_func_qn);
             for (int a = 0; a < call->arg_count && a < CBM_MAX_CALL_ARGS; a++) {
                 str_call_args += census_len(call->args[a].expr) + census_len(call->args[a].value) +
+                                 census_len(call->args[a].url_value) +
                                  census_len(call->args[a].keyword);
             }
         }
@@ -1951,6 +2069,12 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
         for (int t = 0; t < r->type_refs.count; t++) {
             str_typeref += census_len(r->type_refs.items[t].type_name) +
                            census_len(r->type_refs.items[t].enclosing_func_qn);
+        }
+        for (int m = 0; m < r->imports.count; m++) {
+            const CBMImport *imp = &r->imports.items[m];
+            /* A non-aliased named import's member IS its local name string. */
+            str_imports += census_len(imp->local_name) + census_len(imp->module_path) +
+                           (imp->member != imp->local_name ? census_len(imp->member) : 0);
         }
         for (int q = 0; q < r->resolved_calls.count; q++) {
             const CBMResolvedCall *rc = &r->resolved_calls.items[q];
@@ -1984,10 +2108,11 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
     cbm_log_info("extract.census.def_strings_mb", "tag", tag, "v", line);
     snprintf(line, sizeof(line),
              "call_names=%lu call_enclosing=%lu call_args=%lu usage_names=%lu "
-             "usage_enclosing=%lu rw=%lu type_refs=%lu resolved=%lu source=%lu module=%lu",
+             "usage_enclosing=%lu rw=%lu type_refs=%lu resolved=%lu source=%lu module=%lu "
+             "imports=%lu",
              MB(str_call_names), MB(str_call_enclosing), MB(str_call_args), MB(str_usage_names),
              MB(str_usage_enclosing), MB(str_rw), MB(str_typeref), MB(str_resolved), MB(str_source),
-             MB(str_module));
+             MB(str_module), MB(str_imports));
     cbm_log_info("extract.census.ref_strings_mb", "tag", tag, "v", line);
 #undef MB
 }
@@ -2036,6 +2161,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     } passes[] = {
         {predump_deco, "decorator_tags", false},
         {predump_cfg, "configlink", false},
+        {predump_operator, "operator", false},
         {predump_doclinks, "doclinks", false},
         {predump_route, "route_match", false},
         {predump_ensemble, "ensemble_routing", false},
@@ -2291,7 +2417,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_pipeline_spill_close(ctx);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     /* extract -> registry handoff: return the extract phase's freed-but-retained
      * allocator pages to the OS before registry_build allocates. On a 2x Linux
      * index the extract peak holds ~13 GB of reclaimable pages (peak_mb 20.7 vs
@@ -2465,7 +2591,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         free(def_modules);
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
@@ -3415,6 +3541,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
      * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
      * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    if (p->before_dump_hook) {
+        p->before_dump_hook(p->gbuf, p->before_dump_hook_ctx);
+    }
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     int rc = publish_generation_impl(&generation, p->frozen ? p : NULL);
@@ -3572,6 +3701,9 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
+    /* A repository Image whose edges all went to its components (pass_docker.c
+     * P4.2b) is left without any: it goes, as on the incremental routes. */
+    (void)cbm_gbuf_delete_unreferenced(p->gbuf, "Image", DK_IMAGE_EDGES);
     return rc;
 }
 
@@ -3595,11 +3727,13 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     p->mode = p->requested_mode;
     pipeline_reset_doc_links(p);
+    cbm_log_debug("pipeline.setup", "step", "coverage");
     bool mode_promoted = p->frozen ? false : promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.
      * Refresh once here, then use this exact snapshot for both Branch graph
      * construction and the baseline semantic manifest. */
+    cbm_log_debug("pipeline.setup", "step", "git_context");
     if (!p->frozen && pipeline_refresh_git_context(p) != 0) {
         return CBM_NOT_FOUND;
     }
@@ -3611,6 +3745,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* One project read supplies extensions, declarations and manifest digest.
      * Snapshot ownership extends through the outer publication guard. */
+    cbm_log_debug("pipeline.setup", "step", "test_config");
     CBM_PROF_START(t_userconfig);
     if (!p->frozen && !pipeline_load_test_config(p)) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_config");
@@ -3620,6 +3755,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
     /* Phase 1: Discover files */
+    cbm_log_debug("pipeline.setup", "step", "discover");
     CBM_PROF_START(t_discover);
     p->resource_violation = (cbm_index_resource_violation_t){0};
     cbm_discover_opts_t opts = {
@@ -4310,6 +4446,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    /* Debug-level setup markers up to discovery, the first info line: a run
+     * that stops before it is named by the last step printed. */
+    cbm_log_debug("pipeline.setup", "step", "stage");
     pipeline_release_test_config(p);
     p->export_error[0] = '\0';
     char *final_path = resolve_db_path(p);
@@ -4350,6 +4489,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
+    cbm_log_debug("pipeline.setup", "step", "staged");
     int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
