@@ -539,9 +539,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
-    /* Right after the docstring: the buffer is sized for exactly these two
-     * uncapped fields (pp_props_buf), so neither can be squeezed out. */
+    /* Right after the docstring: the buffer is sized for exactly these three
+     * uncapped fields (pp_props_buf), so none can be squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
+    append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -731,10 +732,10 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring and variants fields, which have no length cap (a field
- * that does not fit is dropped whole). Returns `stack` for a def with neither,
- * or when the larger buffer cannot be allocated. Twin of pass_definitions.c --
- * keep both in sync. */
+ * serialized docstring, variants and variant_key fields, which have no length
+ * cap (a field that does not fit is dropped whole). Returns `stack` for a def
+ * with none of them, or when the larger buffer cannot be allocated. Twin of
+ * pass_definitions.c -- keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = *size;
     if (def->docstring && def->docstring[0]) {
@@ -742,6 +743,10 @@ static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     }
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variant_key && def->variant_key[0]) {
+        need +=
+            strlen("variant_key") + pp_json_escaped_len(def->variant_key) + PP_JSON_FIELD_OVERHEAD;
     }
     if (need == *size) {
         return stack;
@@ -755,16 +760,21 @@ static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
 }
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
-static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 CBMDefinition *def) {
+static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_stem_marks_t *marks,
+                                 const cbm_file_info_t *fi, CBMDefinition *def) {
     char stack[CBM_SZ_2K];
     size_t props_size = sizeof(stack);
     char *props = pp_props_buf(def, stack, &props_size);
     build_def_props(props, props_size, def);
+    const char *rel = def->file_path ? def->file_path : fi->rel_path;
+    char marked[CBM_SZ_4K];
+    const char *qn = def->label && strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(marks, def->qualified_name, rel, fi->language,
+                                                    marked, sizeof(marked))
+                         : def->qualified_name;
     int64_t func_id =
-        cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
-                             def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
-                             (int)def->start_line, (int)def->end_line, props);
+        cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name, qn,
+                             rel, (int)def->start_line, (int)def->end_line, props);
     if (props != stack) {
         cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
     }
@@ -1399,7 +1409,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, def);
+                insert_def_into_gbuf(ws, ec->pctx ? ec->pctx->stem_marks : NULL, fi, def);
             }
         }
 
@@ -1774,7 +1784,12 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
         (*reg_entries)++;
     }
-    const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+    char marked[CBM_SZ_4K];
+    const char *qn = strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name,
+                                                    def->file_path, lang, marked, sizeof(marked))
+                         : def->qualified_name;
+    const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
     if (file_node_id > 0 && def_node) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node_id, def_node->id, "DEFINES", "{}");
         edges++;
@@ -3252,8 +3267,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
-                                            imp_vals, imp_count, lang);
+            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn,
+                                                 imp_keys, imp_vals, imp_count, lang);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further

@@ -253,6 +253,13 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang);
+/* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call
+ * (no `.` / `->`) does not consider Field or Method nodes, which it can never
+ * call. */
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #endif
@@ -276,6 +283,34 @@ void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
 /* cbm_route_canon_path: cbm.h (route_path.c). */
+
+/* A file and the directory beside it share a stem (`pkg/foo.sh` beside
+ * `pkg/foo/`): the file's Module QN equals the directory's Folder QN, and the
+ * graph buffer keeps only the Folder. One side yields:
+ * - the Folder, spelled `proj.pkg.foo/` (cbm_stem_marks_folder_qn);
+ * - but a Java/Go package directory keeps its plain QN -- it IS their module,
+ *   and their imports resolve to it -- so there the file's Module yields,
+ *   spelled `proj.pkg.foo#sh` (cbm_stem_marks_module_qn).
+ * Symbol QNs never change. Built from the discovered files once per run,
+ * read-only while extraction workers consult it. */
+typedef struct {
+    CBMArena arena;               /* owns the QN keys of both tables */
+    CBMHashTable *module_qns;     /* Module QNs of files outside Java/Go */
+    CBMHashTable *dir_module_qns; /* Module QNs of Java/Go files: their package dirs */
+} cbm_stem_marks_t;
+
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count);
+void cbm_stem_marks_free(cbm_stem_marks_t *m);
+/* rel_dir's Folder QN, marked when it must yield, written into buf; NULL
+ * when it does not fit. */
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size);
+/* The QN a file's Module definition takes: `qn#ext` when it must yield,
+ * written into buf; qn itself otherwise (and when m is NULL). */
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size);
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -358,6 +393,10 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Stem collisions of the discovered files: which Module definitions take
+     * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
+    const cbm_stem_marks_t *stem_marks;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -1391,8 +1430,17 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      diagrams are Diagram/DiagramElement nodes with DIAGRAM_ARROW edges;
  *      OpenAPI operations are Routes; a Markdown section's text keeps a
  *      diagram fence's labels instead of its syntax, and its candidates
- *      carry the p of its diagrams' kind family. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
+ *      carry the p of its diagrams' kind family; a non-static file-scope
+ *      C/C++/CUDA/ObjC function in a platform file or directory (foo_win.c,
+ *      src/unix/) keeps its path QN and carries a `variant_key` property
+ *      (its platform-neutral QN) that relates its platform variants.
+ *   8: a file and the directory beside it with one stem (`pkg/foo.sh`,
+ *      `pkg/foo/`) no longer share a QN (cbm_stem_marks_t): the Folder is
+ *      spelled `proj.pkg.foo/`, or, where the directory is a Java/Go package,
+ *      the file's Module is `proj.pkg.foo#sh`. The Module the Folder used to
+ *      swallow is a node again. An index built before holds neither, so it
+ *      rebuilds once on upgrade. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
