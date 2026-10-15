@@ -1379,15 +1379,15 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
 /* Terraform reference resolution, end to end.
  *
  * An HCL block names itself with its labels appended -- find_hcl_block_name
- * mints "resource.aws_instance.web" -- while its QN's last dot segment is
- * bare "web", and a reference written `aws_instance.web.id` reaches the
- * by-name index through that tail. HCL is therefore a language where the
- * definition name and the QN tail are different strings, and an index keyed on
- * either one alone drops every cross-resource reference in the file.
+ * mints "resource.aws_instance.web" -- and the module resolver
+ * (pass_terraform.c) finds the block a reference `aws_instance.web.id` names
+ * by recomputing that QN from the declaring file and the name. The reference
+ * USAGEs it from the block holding it, `resource.aws_eip.ip`; the file itself
+ * USAGEs nothing (a .tf file is no longer served by the generic by-name index).
  *
- * This has to be a pipeline test: the registry is shared by every language
- * and nothing in the HCL extractor mentions the index key, so the two halves
- * can disagree with every extraction-level assertion still green.
+ * This has to be a pipeline test: the extractor mints the name and the
+ * resolver recomputes the QN, so the two halves can disagree with every
+ * extraction-level assertion still green.
  */
 TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
     if (setup_test_repo() != 0) {
@@ -1422,7 +1422,9 @@ TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
     ASSERT_NOT_NULL(ts);
     const char *tf_project = cbm_pipeline_project_name(tp);
 
-    ASSERT(cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
+    ASSERT(cross_file_edge_exists(ts, tf_project, "resource.aws_eip.ip",
+                                  "resource.aws_instance.web", "USAGE"));
+    ASSERT(!cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
 
     cbm_store_close(ts);
     cbm_pipeline_free(tp);
@@ -1481,6 +1483,244 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     int calls_after = cbm_store_count_edges_by_type(s2, project2, "CALLS");
     ASSERT_EQ(calls_after, calls_before);
     ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+static void write_temp_file(const char *dir, const char *name, const char *content);
+
+/* An Ansible task file included by an UNCHANGED file is edited, its body
+ * only. The includer is not re-parsed, so its IMPORTS edge must survive the
+ * edited file's re-index: an edge into a node the repair re-creates would be
+ * lost (the Terraform layer needed closure_terraform_decline for that). */
+TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: setup\n  include_tasks: setup.yml\n");
+    write_temp_file(g_tmpdir, "roles/app/tasks/setup.yml", "- name: s\n  debug:\n    msg: one\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_ansible.db", g_tmpdir);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_TRUE(cross_file_edge_exists(s1, cbm_pipeline_project_name(p1), "main.yml",
+                                       "roles/app/tasks/setup.yml", "IMPORTS"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    write_temp_file(g_tmpdir, "roles/app/tasks/setup.yml",
+                    "- name: s\n  debug:\n    msg: two words\n");
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_TRUE(cross_file_edge_exists(s2, cbm_pipeline_project_name(p2), "main.yml",
+                                       "roles/app/tasks/setup.yml", "IMPORTS"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+/* The CALLS edges an Ansible notify draws (via notify); -1 on a query error. */
+static int ansible_notify_calls(cbm_store_t *s, const char *project) {
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT COUNT(*) FROM edges WHERE project=?1 AND type='CALLS' AND "
+                           "json_extract(properties,'$.via')='notify'",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* A task's notify CALLS the handlers of its role in another file. Editing
+ * either file alone must land on the full graph: the handler file (a listen
+ * topic renamed: one handler stops answering) re-creates its handlers, the
+ * unchanged task file is not re-walked; the task file (a notifying task
+ * added) is re-walked without the unchanged handler file. Both decline to
+ * the full rebuild (closure_ansible_decline); the repair route kept a stale
+ * edge in the first and lost every notify of the edited file in the second. */
+TEST(pipeline_incremental_keeps_ansible_notifies_across_files) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: configure\n  command: /bin/true\n  notify: restart app\n");
+    write_temp_file(g_tmpdir, "roles/app/handlers/main.yml",
+                    "- name: h1\n  command: one\n  listen: restart app\n"
+                    "- name: h2\n  command: two\n  listen: restart app\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_notify.db", g_tmpdir);
+    int want[] = {2, 1, 2};
+    for (int step = 0; step < 3; step++) {
+        if (step == 1) {
+            write_temp_file(g_tmpdir, "roles/app/handlers/main.yml",
+                            "- name: h1\n  command: one\n  listen: restart app\n"
+                            "- name: h2\n  command: two\n  listen: something else\n");
+        } else if (step == 2) {
+            write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                            "- name: configure\n  command: /bin/true\n  notify: restart app\n"
+                            "- name: reconfigure\n  command: /bin/false\n  notify: restart app\n");
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        int calls = ansible_notify_calls(s, cbm_pipeline_project_name(p));
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+        ASSERT_EQ(calls, want[step]);
+    }
+    teardown_test_repo();
+    PASS();
+}
+
+/* The files Ansible tasks DEPLOY (via ansible), ordered, one per line, into
+ * `out`; false on a query error. */
+static bool ansible_deploy_targets(cbm_store_t *s, const char *project, char *out, size_t sz) {
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT coalesce(group_concat(p, char(10)), '') FROM (SELECT "
+                           "t.file_path AS p FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+                           "e.project=?1 AND e.type='DEPLOYS' AND "
+                           "json_extract(e.properties,'$.via')='ansible' ORDER BY p)",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out, sz, "%s", (const char *)sqlite3_column_text(st, 0));
+        ok = true;
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* A kube task DEPLOYS the template its play rendered, read through a list of
+ * the role's defaults/main.yml -- a file holding no task. Editing it (the
+ * list names another template) or deleting it must land on the full graph,
+ * and so must deleting the deployed template while a file of that name sits
+ * in the task file's directory (the render falls back to it). The repair
+ * did not re-walk the task file for the list edit -- it kept the edge to the
+ * template the list no longer names -- and re-walked it for the deletion as
+ * a dependent of the template, without the role's defaults: no edge at all.
+ * Both decline to the full rebuild (closure_ansible_decline: a role's
+ * defaults / vars; closure_ansible_dependent_decline: a task file joining
+ * the repair as a dependent). A template body edit keeps the repair and the
+ * edge. */
+TEST(pipeline_incremental_keeps_ansible_deploys_across_files) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
+                    "- name: Render\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+                    "    dest: \"/etc/k/{{ item.file }}\"\n  loop: \"{{ app_list }}\"\n"
+                    "  register: out\n"
+                    "- name: Apply\n  kube:\n    filename: \"/etc/k/{{ item.item.file }}\"\n"
+                    "  loop: \"{{ out.results }}\"\n");
+    write_temp_file(g_tmpdir, "roles/app/defaults/main.yml", "app_list:\n  - {file: a.yml}\n");
+    write_temp_file(g_tmpdir, "roles/app/templates/a.yml.j2", "a: 1\n");
+    write_temp_file(g_tmpdir, "roles/app/templates/b.yml.j2", "b: 1\n");
+    write_temp_file(g_tmpdir, "roles/app/tasks/b.yml.j2", "b: 2\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_deploys.db", g_tmpdir);
+    static const char *const want[] = {
+        "roles/app/templates/a.yml.j2", /* the full index */
+        "roles/app/templates/a.yml.j2", /* a.yml.j2's body edited */
+        "roles/app/templates/b.yml.j2", /* the defaults list names b.yml */
+        "roles/app/tasks/b.yml.j2",     /* templates/b.yml.j2 deleted */
+        "",                             /* the defaults deleted */
+    };
+    char path[1024];
+    for (int step = 0; step < (int)(sizeof(want) / sizeof(want[0])); step++) {
+        if (step == 1) {
+            snprintf(path, sizeof(path), "%s/roles/app/templates/a.yml.j2", g_tmpdir);
+            ASSERT_EQ(th_append_file(path, "a2: 2\n"), 0);
+        } else if (step == 2) {
+            write_temp_file(g_tmpdir, "roles/app/defaults/main.yml",
+                            "app_list:\n  - {file: b.yml}\n");
+        } else if (step == 3) {
+            snprintf(path, sizeof(path), "%s/roles/app/templates/b.yml.j2", g_tmpdir);
+            ASSERT_EQ(th_unlink_force(path), 0);
+        } else if (step == 4) {
+            snprintf(path, sizeof(path), "%s/roles/app/defaults/main.yml", g_tmpdir);
+            ASSERT_EQ(th_unlink_force(path), 0);
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        char got[2048];
+        bool ok = ansible_deploy_targets(s, cbm_pipeline_project_name(p), got, sizeof(got));
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+        ASSERT_TRUE(ok);
+        if (strcmp(got, want[step]) != 0) {
+            fprintf(stderr, "step %d deploys got [%s] want [%s]\n", step, got, want[step]);
+        }
+        ASSERT_STR_EQ(got, want[step]);
+    }
+    teardown_test_repo();
+    PASS();
+}
+
+/* Regression: a Terraform module's output read lives in one file
+ * (infra/outputs.tf: module.net.vpc_id) and the module's source in another
+ * (infra/main.tf). Pointing the source elsewhere edits main.tf alone; the
+ * repair route recomputed the changed file's edges only, so the read -- held
+ * by two UNCHANGED files, outputs.tf and modules/net/main.tf -- stayed in the
+ * graph, which a full reindex no longer has. A Terraform input change now
+ * declines to the full rebuild (closure_terraform_decline). */
+TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    write_temp_file(g_tmpdir, "infra/main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n");
+    write_temp_file(g_tmpdir, "infra/outputs.tf",
+                    "output \"net_vpc\" {\n  value = module.net.vpc_id\n}\n");
+    write_temp_file(g_tmpdir, "infra/modules/net/main.tf",
+                    "output \"vpc_id\" {\n  value = \"x\"\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_tf.db", g_tmpdir);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_TRUE(cross_file_edge_exists(s1, cbm_pipeline_project_name(p1), "output.net_vpc",
+                                       "output.vpc_id", "USAGE"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    /* the module's source moves to a directory that does not exist */
+    write_temp_file(g_tmpdir, "infra/main.tf",
+                    "module \"net\" {\n  source = \"./modules/none\"\n}\n");
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_FALSE(cross_file_edge_exists(s2, cbm_pipeline_project_name(p2), "output.net_vpc",
+                                        "output.vpc_id", "USAGE"));
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
 
@@ -3587,6 +3827,49 @@ TEST(incremental_deleted_spawner_drops_its_process) {
     PASS();
 }
 
+/* Deleting the only script requesting a URL leaves no Route behind -- a full
+ * index never makes one without an edge; the Route a kept script requests
+ * stays. `legacy`: through the full-load route, else closure repair. Returns
+ * the Route count after the deletion, or -1; *route: the route taken. */
+static int incremental_caller_delete(bool legacy, cbm_incremental_route_t *route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_routegc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, "hack/a.sh", "#!/bin/sh\ncurl -fsSL https://dl.example.com/a.tgz\n");
+    write_temp_file(tmp, "hack/b.sh", "#!/bin/sh\nwget https://dl.example.com/b.tgz\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/routegc.db", tmp);
+    static const char routes[] = "SELECT COUNT(*) FROM nodes WHERE label='Route'";
+    int full = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#endif
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return full == 2 ? after : -1;
+}
+
+TEST(incremental_deleted_caller_drops_its_route) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int left = incremental_caller_delete(false, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(left, 1);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    left = incremental_caller_delete(true, &route);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(left, 1);
+#endif
+    PASS();
+}
+
 /* Deleting the only Dockerfile naming an image leaves no Image node behind;
  * the image another Dockerfile still names stays. `legacy`: through the
  * full-load route, else the closure-repair route. Returns the Image count
@@ -4779,6 +5062,117 @@ TEST(incremental_stem_mark_deletion_rebuilds) {
     PASS();
 }
 
+/* The env join on a closure repair: a reader file edited, the join edges of
+ * the files the repair leaves alone come back from the store (their setters,
+ * image references and readers are proxies there), the edited file's are
+ * recomputed -- the same set a full build gives. */
+TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_envjoin_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "k8s/shop.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: shop\nspec:\n"
+                    "  template:\n    spec:\n      containers:\n        - name: web\n"
+                    "          image: acme/web:1\n          env:\n            - name: PORT\n"
+                    "              value: \"8080\"\n            - name: MODE\n"
+                    "              value: prod\n");
+    write_temp_file(tmp, "compose.yaml",
+                    "services:\n  web:\n    image: acme/web:1\n    build: ./web\n");
+    write_temp_file(tmp, "web/Dockerfile",
+                    "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
+    write_temp_file(tmp, "web/src/server.js",
+                    "const port = process.env.PORT;\nconst mode = process.env.MODE;\n");
+    write_temp_file(tmp, "web/lib/conf.js", "module.exports = process.env.MODE;\n");
+    write_temp_file(tmp, "web/lib/more.js", "module.exports = process.env.PORT;\n");
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo other\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/envjoin.db", tmp);
+    static const char joins[] = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                "WHERE e.type='CONFIGURES' AND s.label='EnvVar'";
+#define ENVJOIN_PAIR(key, file)                                                                    \
+    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "               \
+    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE "   \
+    "'%#env/web/" key "' AND t.file_path='" file "'"
+    static const char mode_server[] = ENVJOIN_PAIR("MODE", "web/src/server.js");
+    static const char mode_conf[] = ENVJOIN_PAIR("MODE", "web/lib/conf.js");
+    static const char port_server[] = ENVJOIN_PAIR("PORT", "web/src/server.js");
+    static const char port_more[] = ENVJOIN_PAIR("PORT", "web/lib/more.js");
+#undef ENVJOIN_PAIR
+
+    int full_rc = stem_index(tmp, db);
+    int full_joins = k8s_inc_count(db, joins);
+    int full_mode_server = k8s_inc_count(db, mode_server);
+
+    write_temp_file(tmp, "web/src/server.js", "const port = process.env.PORT;\n");
+    int inc_rc = stem_index(tmp, db);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int inc_joins = k8s_inc_count(db, joins);
+    int inc_mode_server = k8s_inc_count(db, mode_server);
+    int inc_mode_conf = k8s_inc_count(db, mode_conf);
+    int inc_port_server = k8s_inc_count(db, port_server);
+    int inc_port_more = k8s_inc_count(db, port_more);
+
+    /* a repair far from every image: each join edge joins two files the
+     * repair leaves alone, and is written again although both ends are
+     * pre-existing rows */
+    write_temp_file(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo changed\n}\n");
+    int far_rc = stem_index(tmp, db);
+    cbm_incremental_route_t far_route = cbm_pipeline_incremental_test_last_route();
+    int far_joins = k8s_inc_count(db, joins);
+    int far_mode_conf = k8s_inc_count(db, mode_conf);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(full_joins, 4);
+    ASSERT_EQ(full_mode_server, 1);
+    ASSERT_EQ(inc_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(inc_joins, 3);
+    ASSERT_EQ(inc_mode_server, 0);
+    ASSERT_EQ(inc_mode_conf, 1);
+    ASSERT_EQ(inc_port_server, 1);
+    ASSERT_EQ(inc_port_more, 1);
+    ASSERT_EQ(far_rc, 0);
+    ASSERT_EQ(far_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(far_joins, 3);
+    ASSERT_EQ(far_mode_conf, 1);
+    PASS();
+}
+
+/* A script's request to a compose service keeps the host in its Route on a
+ * repair as in a full run: the repair holds the compose services already
+ * (a full run makes them after the scripts), yet only a Kubernetes Service
+ * of the repository makes a Route path-only. */
+TEST(incremental_script_request_to_compose_service_keeps_host) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_composeurl_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    write_temp_file(tmp, "compose.yaml", "services:\n  web:\n    image: acme/web:1\n");
+    write_temp_file(tmp, "hack/ping.sh", "#!/bin/sh\ncurl http://web:3000/x\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/composeurl.db", tmp);
+    static const char kept[] = "SELECT COUNT(*) FROM nodes WHERE label='Route' AND "
+                               "qualified_name='__route__GET__http://web:3000/y'";
+    static const char bare[] = "SELECT COUNT(*) FROM nodes WHERE label='Route' AND "
+                               "qualified_name LIKE '__route__GET__/%'";
+    int full_rc = stem_index(tmp, db);
+    write_temp_file(tmp, "hack/ping.sh", "#!/bin/sh\ncurl http://web:3000/y\n");
+    int inc_rc = stem_index(tmp, db);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int inc_kept = k8s_inc_count(db, kept);
+    int inc_bare = k8s_inc_count(db, bare);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(inc_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(inc_kept, 1);
+    ASSERT_EQ(inc_bare, 0);
+    PASS();
+}
+
 TEST(pipeline_closure_repair_budget_declines_to_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_budget_XXXXXX");
@@ -5759,6 +6153,177 @@ TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage) {
     PASS();
 }
 
+static int live_noop_run(const char *repo, const char *db_path, cbm_incremental_route_t *route) {
+    cbm_pipeline_incremental_test_reset_faults();
+    *route = CBM_INCREMENTAL_ROUTE_NONE;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_pipeline_run(p);
+    *route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+/* An unchanged re-index proves the exact no-op on the LIVE generation. It
+ * never copies the database into a stage, seals the copy and renames it back
+ * (on a kernel-scale index that copy alone was a 19 GB write per call): the
+ * live file keeps its identity, size and mtime, no stage artifact remains,
+ * and the graph still serves. */
+TEST(pipeline_unchanged_reindex_leaves_live_generation_untouched) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_live_noop_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+
+    cbm_incremental_route_t first_route;
+    int first_rc = live_noop_run(tmp, db_path, &first_route);
+    cbm_path_info_t before = {0};
+    struct stat before_st;
+    bool before_ok =
+        cbm_path_info_utf8(db_path, &before) == CBM_PATH_INFO_OK && stat(db_path, &before_st) == 0;
+
+    cbm_incremental_route_t noop_route;
+    int noop_rc = live_noop_run(tmp, db_path, &noop_route);
+    cbm_path_info_t after = {0};
+    struct stat after_st;
+    bool after_ok =
+        cbm_path_info_utf8(db_path, &after) == CBM_PATH_INFO_OK && stat(db_path, &after_st) == 0;
+    int defined_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &defined_count,
+                             &absent_count);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    free(project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(before_ok);
+    ASSERT_EQ(noop_rc, 0);
+    ASSERT_EQ(noop_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_TRUE(after_ok);
+    ASSERT_TRUE(after_st.st_ino == before_st.st_ino);
+    ASSERT_TRUE(after.mtime_ns == before.mtime_ns);
+    ASSERT_TRUE(after.size == before.size);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(defined_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    PASS();
+}
+
+/* The live proof answers only for an exact manifest. Every real change -- a
+ * same-size edit that keeps the original mtime, an addition, a deletion and
+ * a rename -- still routes past it into a rebuild that the graph shows, and
+ * only the unchanged re-index after them takes the no-op. */
+TEST(pipeline_live_noop_proof_never_hides_a_change) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_live_noop_change_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "alpha.py", "def AlphaDefined():\n    return 1\n");
+    write_temp_file(tmp, "beta.py", "def BetaDefined():\n    return 2\n");
+    char db_path[512];
+    char alpha_path[512];
+    char beta_path[512];
+    char gamma_path[512];
+    char delta_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(alpha_path, sizeof(alpha_path), "%s/alpha.py", tmp);
+    snprintf(beta_path, sizeof(beta_path), "%s/beta.py", tmp);
+    snprintf(gamma_path, sizeof(gamma_path), "%s/gamma.py", tmp);
+    snprintf(delta_path, sizeof(delta_path), "%s/delta.py", tmp);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+
+    cbm_incremental_route_t initial_route;
+    int initial_rc = live_noop_run(tmp, db_path, &initial_route);
+
+    /* Same size, original mtime restored: only the bytes differ. */
+    cbm_path_info_t alpha_info = {0};
+    bool alpha_stat_ok = cbm_path_info_utf8(alpha_path, &alpha_info) == CBM_PATH_INFO_OK;
+    write_temp_file(tmp, "alpha.py", "def AlphbDefined():\n    return 1\n");
+    int mtime_rc = pipeline_test_set_mtime(alpha_path, (time_t)(alpha_info.mtime_ns / 1000000000),
+                                           (long)(alpha_info.mtime_ns % 1000000000));
+    cbm_path_info_t edited_info = {0};
+    bool edited_same_stat = cbm_path_info_utf8(alpha_path, &edited_info) == CBM_PATH_INFO_OK &&
+                            edited_info.size == alpha_info.size &&
+                            edited_info.mtime_ns == alpha_info.mtime_ns;
+    cbm_incremental_route_t modify_route;
+    int modify_rc = live_noop_run(tmp, db_path, &modify_route);
+    int old_alpha = -1;
+    int new_alpha = -1;
+    observe_named_generation(db_path, project, "AlphaDefined", "AlphbDefined", &old_alpha,
+                             &new_alpha);
+
+    write_temp_file(tmp, "gamma.py", "def GammaDefined():\n    return 3\n");
+    cbm_incremental_route_t add_route;
+    int add_rc = live_noop_run(tmp, db_path, &add_route);
+    int gamma_added = -1;
+    int unused = -1;
+    observe_named_generation(db_path, project, "GammaDefined", "NeverDefined", &gamma_added,
+                             &unused);
+
+    int unlink_rc = cbm_unlink(beta_path);
+    cbm_incremental_route_t delete_route;
+    int delete_rc = live_noop_run(tmp, db_path, &delete_route);
+    int beta_left = -1;
+    observe_named_generation(db_path, project, "BetaDefined", "NeverDefined", &beta_left, &unused);
+
+    int rename_rc = cbm_rename_replace(gamma_path, delta_path);
+    cbm_incremental_route_t rename_route;
+    int renamed_rc = live_noop_run(tmp, db_path, &rename_route);
+    int gamma_renamed = -1;
+    observe_named_generation(db_path, project, "GammaDefined", "NeverDefined", &gamma_renamed,
+                             &unused);
+    int old_path_hash = CBM_STORE_OK;
+    int new_path_hash = CBM_STORE_NOT_FOUND;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        cbm_file_hash_t hash = {0};
+        old_path_hash = cbm_store_get_file_hash(store, project, "gamma.py", &hash);
+        cbm_store_clear_file_hash(&hash);
+        new_path_hash = cbm_store_get_file_hash(store, project, "delta.py", &hash);
+        cbm_store_clear_file_hash(&hash);
+        cbm_store_close(store);
+    }
+
+    cbm_incremental_route_t final_route;
+    int final_rc = live_noop_run(tmp, db_path, &final_route);
+    cbm_pipeline_incremental_test_reset_faults();
+    free(project);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(initial_rc, 0);
+    ASSERT_TRUE(alpha_stat_ok);
+    ASSERT_EQ(mtime_rc, 0);
+    ASSERT_TRUE(edited_same_stat);
+    ASSERT_EQ(modify_rc, 0);
+    ASSERT_TRUE(modify_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(old_alpha, 0);
+    ASSERT_EQ(new_alpha, 1);
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_TRUE(add_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(gamma_added, 1);
+    ASSERT_EQ(unlink_rc, 0);
+    ASSERT_EQ(delete_rc, 0);
+    ASSERT_TRUE(delete_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(beta_left, 0);
+    ASSERT_EQ(rename_rc, 0);
+    ASSERT_EQ(renamed_rc, 0);
+    ASSERT_TRUE(rename_route != CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(gamma_renamed, 1);
+    ASSERT_EQ(old_path_hash, CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(new_path_hash, CBM_STORE_OK);
+    ASSERT_EQ(final_rc, 0);
+    ASSERT_EQ(final_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
 static char g_route_log_capture[8192];
 static atomic_flag g_route_log_spin = ATOMIC_FLAG_INIT;
 
@@ -6368,15 +6933,15 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
     ASSERT_EQ(reindex_observer.rename_calls, 1);
     ASSERT_EQ(reindex_observer.exports_before_publish, 0);
     ASSERT_EQ(reindex_observer.export_count, 1);
+    /* The no-ops are proven on the live generation and publish nothing; the
+     * artifact is still refreshed, from that already published database. */
     ASSERT_EQ(explicit_rc, 0);
     ASSERT_EQ(explicit_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_EQ(explicit_observer.rename_calls, 1);
-    ASSERT_EQ(explicit_observer.exports_before_publish, 0);
+    ASSERT_EQ(explicit_observer.rename_calls, 0);
     ASSERT_EQ(explicit_observer.export_count, 1);
     ASSERT_EQ(unchanged_rc, 0);
     ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_EQ(observer.rename_calls, 1);
-    ASSERT_EQ(observer.exports_before_publish, 0);
+    ASSERT_EQ(observer.rename_calls, 0);
     ASSERT_EQ(observer.export_count, 1);
     ASSERT_TRUE(journal_ok);
     ASSERT_STR_EQ(journal_mode, "delete");
@@ -6754,11 +7319,15 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
         "package.json",
         "nested/.gitignore",
         "nested/deep/go.mod",
+        ".dockerignore",
+        "nested/Dockerfile.dockerignore",
     };
     write_temp_file(tmp, controls[0], "excluded/\n");
     write_temp_file(tmp, controls[1], "{}\n");
     write_temp_file(tmp, controls[2], "*.log\n");
     write_temp_file(tmp, controls[3], "module example.test/nested\n");
+    write_temp_file(tmp, controls[4], "build/\n");
+    write_temp_file(tmp, controls[5], "local/\n");
     write_temp_file(tmp, "node_modules/package.json", "{}\n");
     write_temp_file(tmp, "excluded/package.json", "{}\n");
     write_temp_file(tmp, "ordinary.txt", "not a semantic control\n");
@@ -6796,11 +7365,11 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
     int manifest_count = 0;
     int rc = cbm_pipeline_build_semantic_manifest("manifest-controls", tmp, NULL, 0, excluded, 1,
                                                   NULL, NULL, &manifest, &manifest_count);
-    bool found[4] = {false};
+    bool found[sizeof(controls) / sizeof(controls[0])] = {false};
     bool has_excluded = false;
     bool has_unrelated = false;
     for (int i = 0; i < manifest_count; i++) {
-        for (int j = 0; j < 4; j++) {
+        for (size_t j = 0; j < sizeof(controls) / sizeof(controls[0]); j++) {
             found[j] |= strcmp(manifest[i].rel_path, controls[j]) == 0;
         }
         has_excluded |= strcmp(manifest[i].rel_path, "node_modules/package.json") == 0 ||
@@ -6823,7 +7392,7 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
 #endif
     ASSERT_EQ(cleanup_rc, 0);
     ASSERT_EQ(rc, 0);
-    for (int i = 0; i < 4; i++) {
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
         ASSERT_TRUE(found[i]);
     }
     ASSERT_FALSE(has_excluded);
@@ -18938,8 +19507,9 @@ TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delet
     ASSERT_EQ(noop.rc, 0);
     ASSERT_EQ(noop.route, CBM_INCREMENTAL_ROUTE_NOOP);
     ASSERT_TRUE(noop.tools_excluded);
-    ASSERT_EQ(noop.publish.rename_calls, 1);
-    ASSERT_EQ(noop.publish.exports_before_publish, 0);
+    /* Proven on the live generation: nothing is published, the artifact is
+     * still refreshed from the live database. */
+    ASSERT_EQ(noop.publish.rename_calls, 0);
     ASSERT_EQ(noop.publish.export_count, 1);
 
     ASSERT_EQ(deleted.rc, 0);
@@ -23072,6 +23642,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module);
+    RUN_TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file);
+    RUN_TEST(pipeline_incremental_keeps_ansible_notifies_across_files);
+    RUN_TEST(pipeline_incremental_keeps_ansible_deploys_across_files);
     RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
@@ -23407,6 +23981,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_k8s_edits_reach_other_files);
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
+    RUN_TEST(incremental_deleted_caller_drops_its_route);
+    RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
     RUN_TEST(incremental_compose_edit_replaces_build_edges);
@@ -23424,6 +24000,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
     RUN_TEST(incremental_stem_mark_deletion_rebuilds);
+    RUN_TEST(incremental_env_join_repair_keeps_unchanged_pairs);
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -23437,6 +24014,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages);
     RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
     RUN_TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage);
+    RUN_TEST(pipeline_unchanged_reindex_leaves_live_generation_untouched);
+    RUN_TEST(pipeline_live_noop_proof_never_hides_a_change);
     RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
