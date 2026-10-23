@@ -1111,10 +1111,9 @@ TEST(daemon_application_reference_counts_one_shared_watch) {
     PASS();
 }
 
-/* #2167: index_status must say whether a project is kept fresh by the
- * watcher. Only the MCP session's own project is watched; any other indexed
- * project reports watched=false with the reason, instead of silently going
- * stale (the reporter indexed via the CLI and waited for auto-sync). */
+/* #2167: index_status reports physical watch registration. Seeding an unrelated
+ * cached project alone does not register a watch; successful explicit indexes
+ * and startup restoration can register persistent watches. */
 static bool app_test_seed_project_db(const char *cache, const char *project, const char *root,
                                      char *db_path, size_t db_path_size) {
     snprintf(db_path, db_path_size, "%s/%s.db", cache, project);
@@ -1953,6 +1952,12 @@ TEST(daemon_application_explicit_index_persists_watch_without_session) {
                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool registered = requested && response && strstr((char *)response, "indexed") &&
                       cbm_watcher_watch_count(watcher) == 1;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded = registered &&
+                  app_test_seed_project_db(cache, project, child, db_path, sizeof(db_path));
+    char *status = seeded ? app_test_index_status(&callbacks, session, project) : NULL;
+    bool explicit_watched = app_test_response_has(status, "watched", "true") &&
+                            app_test_response_has(status, "strategy", "\\\"pending\\\"");
     if (session) {
         callbacks.session_close(callbacks.context, session);
     }
@@ -1985,7 +1990,9 @@ TEST(daemon_application_explicit_index_persists_watch_without_session) {
     free(context);
     free(tool);
     free(response);
+    free(status);
     free(project);
+    app_test_unlink_project_db(db_path);
     (void)cbm_rmdir(child);
     (void)cbm_rmdir(root);
     (void)cbm_rmdir(cache);
@@ -2000,6 +2007,8 @@ TEST(daemon_application_explicit_index_persists_watch_without_session) {
     ASSERT_TRUE(requested);
     ASSERT_TRUE(failed_without_watch);
     ASSERT_TRUE(registered);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(explicit_watched);
     ASSERT_TRUE(persisted);
     ASSERT_EQ(watcher_index_status, 1);
     ASSERT_TRUE(watcher_refresh_submitted);
@@ -7972,10 +7981,10 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
+    RUN_TEST(daemon_application_explicit_index_persists_watch_without_session);
     RUN_TEST(daemon_application_index_status_reports_watch_issue2167);
     RUN_TEST(daemon_application_index_status_watcher_disabled_issue2167);
     RUN_TEST(daemon_application_index_status_reports_tree_strategy_issue2167);
-    RUN_TEST(daemon_application_explicit_index_persists_watch_without_session);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
@@ -8047,7 +8056,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
-    RUN_TEST(daemon_application_clean_exit_without_response_is_named_failure_issue1300);
     RUN_TEST(daemon_application_restore_watch_honors_auto_watch);
     RUN_TEST(daemon_application_restores_daemon_watch_without_session);
+    RUN_TEST(daemon_application_clean_exit_without_response_is_named_failure_issue1300);
 }

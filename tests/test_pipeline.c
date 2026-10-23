@@ -9001,11 +9001,15 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
         "package.json",
         "nested/.gitignore",
         "nested/deep/go.mod",
+        ".dockerignore",
+        "nested/Dockerfile.dockerignore",
     };
     write_temp_file(tmp, controls[0], "excluded/\n");
     write_temp_file(tmp, controls[1], "{}\n");
     write_temp_file(tmp, controls[2], "*.log\n");
     write_temp_file(tmp, controls[3], "module example.test/nested\n");
+    write_temp_file(tmp, controls[4], "build/\n");
+    write_temp_file(tmp, controls[5], "local/\n");
     write_temp_file(tmp, "node_modules/package.json", "{}\n");
     write_temp_file(tmp, "excluded/package.json", "{}\n");
     write_temp_file(tmp, "ordinary.txt", "not a semantic control\n");
@@ -9043,11 +9047,11 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
     int manifest_count = 0;
     int rc = cbm_pipeline_build_semantic_manifest("manifest-controls", tmp, NULL, 0, excluded, 1,
                                                   NULL, NULL, &manifest, &manifest_count);
-    bool found[4] = {false};
+    bool found[sizeof(controls) / sizeof(controls[0])] = {false};
     bool has_excluded = false;
     bool has_unrelated = false;
     for (int i = 0; i < manifest_count; i++) {
-        for (int j = 0; j < 4; j++) {
+        for (size_t j = 0; j < sizeof(controls) / sizeof(controls[0]); j++) {
             found[j] |= strcmp(manifest[i].rel_path, controls[j]) == 0;
         }
         has_excluded |= strcmp(manifest[i].rel_path, "node_modules/package.json") == 0 ||
@@ -9070,7 +9074,7 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
 #endif
     ASSERT_EQ(cleanup_rc, 0);
     ASSERT_EQ(rc, 0);
-    for (int i = 0; i < 4; i++) {
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
         ASSERT_TRUE(found[i]);
     }
     ASSERT_FALSE(has_excluded);

@@ -865,9 +865,8 @@ static const char *application_watch_strategy_name(cbm_watcher_strategy_t strate
 }
 
 /* index_status watch visibility (#2167). The physical watcher is the truth for
- * "watched"; session roots and successful explicit targets stay watched while
- * at least one owning MCP session remains open. Takes the
- * application mutex and the watcher lock one after the other, never nested. */
+ * session-owned and persistent project watches. Takes the application mutex
+ * and the watcher lock one after the other, never nested. */
 static void application_watch_status(void *context, const char *project,
                                      cbm_mcp_watch_status_t *out) {
     cbm_daemon_application_session_t *session = context;
@@ -3243,9 +3242,9 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     }
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
-    cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
     cbm_mcp_server_set_project_deleted_callback(session->mcp, application_mcp_project_deleted,
                                                 application);
+    cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_index_status_provider(session->mcp, application_index_status, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,

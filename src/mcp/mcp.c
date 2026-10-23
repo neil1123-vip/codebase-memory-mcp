@@ -7773,8 +7773,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 }
 
 /* index_status "watch" object (#2167): is this project kept fresh by the
- * background watcher right now, and if not, why. Active MCP sessions register
- * their root on connect and successful explicit index_repository targets. */
+ * background watcher right now, and if not, why. Successfully indexed projects
+ * retain a watcher when auto-watch is enabled. */
 static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   const char *project) {
     cbm_mcp_watch_status_t status = {0};
@@ -7799,9 +7799,9 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
         }
     } else {
         yyjson_mut_obj_add_str(doc, watch, "reason", status.reason ? status.reason : "unknown");
-        yyjson_mut_obj_add_str(doc, watch, "hint",
-                               "To register this project for auto-sync, successfully "
-                               "re-index it from an active MCP session with auto_watch enabled.");
+        yyjson_mut_obj_add_str(
+            doc, watch, "hint",
+            "Check watcher settings or re-run index_repository to refresh this index.");
     }
     yyjson_mut_obj_add_val(doc, root, "watch", watch);
 }
@@ -12785,6 +12785,11 @@ static void index_args_free(char *repo_path, char *mode_str, char *name_override
     free(name_override);
 }
 
+static bool auto_watch_enabled(cbm_mcp_server_t *srv);
+static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
+                                              const char *root);
+static bool index_response_is_success(const char *response);
+
 /* #2144: async and status are strict booleans. A present non-boolean value is
  * refused rather than read as false, so "async":"true" never silently blocks
  * for the whole index. */
@@ -12878,10 +12883,6 @@ static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *a
     safe_free(project);
     return result ? result : cbm_mcp_text_result("index job status is unavailable", true);
 }
-static bool auto_watch_enabled(cbm_mcp_server_t *srv);
-static void register_index_watcher_if_enabled(cbm_mcp_server_t *srv, const char *project,
-                                              const char *root);
-static bool index_response_is_success(const char *response);
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     bool async_mode = false;
