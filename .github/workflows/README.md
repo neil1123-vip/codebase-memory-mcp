@@ -1,15 +1,15 @@
 # Fork CI triggers
 
-`main` mirrors upstream `main` exactly. Local fixes and fork CI configuration
-live on `codex/cbm-local-fixes`, where upstream changes are merged.
+`main` keeps upstream business code and workflows, with only
+`sync-upstream.yml` added for this fork. Local fixes and other fork CI
+configuration live on `codex/cbm-local-fixes`.
 
-Scheduled sync requires `codex/cbm-local-fixes` to be the repository's default
-branch, since upstream `main` does not contain `sync-upstream.yml`. The main
-sync job mirrors the fetched upstream commit with an explicit lease; it fails
-if another writer updates `main` after checkout.
+`main` remains the repository's default branch so its sync workflow runs every
+6 hours. Both sync jobs merge upstream changes and push normally, preserving
+the sync workflow and failing on merge conflicts or concurrent branch updates.
 
 The following trigger policy applies to `codex/cbm-local-fixes`. The workflows
-on `main` remain identical to upstream.
+on `main` follow upstream policy, with the added scheduled sync.
 
 | Trigger | Workflows |
 | --- | --- |
