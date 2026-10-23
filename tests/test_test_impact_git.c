@@ -909,9 +909,11 @@ TEST(test_git_facts_gitfile_redirection_cannot_certify_false_ancestry) {
                         gf_write(graft_path, graft, (size_t)graft_length);
     int gitfile_length =
         target_ready ? snprintf(gitfile, sizeof(gitfile), "gitdir: %s\n", target_git) : -1;
+    /* Git hides .git on Windows; replace the gitfile instead of truncating it. */
     bool repointed = target_ready && gitfile_length > 0 &&
                      (size_t)gitfile_length < sizeof(gitfile) &&
                      gf_path(gitfile_path, original.repo, ".git") &&
+                     cbm_unlink(gitfile_path) == 0 &&
                      gf_write(gitfile_path, gitfile, (size_t)gitfile_length);
     const char *control[] = {"--no-replace-objects", "merge-base",  "--is-ancestor",
                              original.base,          original.head, NULL};
@@ -1682,7 +1684,9 @@ static bool gfa_topology_stays_pinned(void) {
     bool grafted=n>0 && (size_t)n<sizeof(graft) && gf_path(target,redirected.repo,".git") &&
         gf_path(info,target,"info") && th_mkdir_p(info)==0 && gf_path(graft_path,info,"grafts") && gf_write(graft_path,graft,(size_t)n);
     n=grafted?snprintf(gitfile,sizeof(gitfile),"gitdir: %s\n",target):-1;
-    bool repointed=n>0 && (size_t)n<sizeof(gitfile) && gf_path(gitfile_path,original.repo,".git") && gf_write(gitfile_path,gitfile,(size_t)n);
+    /* Git hides .git on Windows; replace the gitfile instead of truncating it. */
+    bool repointed=n>0 && (size_t)n<sizeof(gitfile) && gf_path(gitfile_path,original.repo,".git") &&
+        cbm_unlink(gitfile_path)==0 && gf_write(gitfile_path,gitfile,(size_t)n);
     const char *control[]={"--no-replace-objects","merge-base","--is-ancestor",original.p,original.q,NULL};
     bool false_yes=repointed && gf_git(&original,control,NULL,0);
     out=gfa_poisoned();int after=facts?cbm_git_facts_ancestor_changes(facts,original.p,original.oid_length,&out,&error):-9;
