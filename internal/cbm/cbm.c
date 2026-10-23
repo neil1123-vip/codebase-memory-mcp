@@ -4233,7 +4233,11 @@ static CBMFileResult *extract_file_ex_body(
         compat_source = cbm_grammar_compat_source(root, language, source, source_len);
         if (compat_source) {
             ts_parser_reset(parser);
-            CBMStringInput compat_input = {compat_source, (uint32_t)source_len};
+            CBMStringInput compat_input = {
+                .string = compat_source,
+                .length = (uint32_t)source_len,
+                .virtual_newline = false,
+            };
             TSInput compat_ts_input = {
                 &compat_input,
                 cbm_string_read,
