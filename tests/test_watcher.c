@@ -323,6 +323,27 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+typedef struct {
+    int parent_calls;
+    int child_calls;
+} watcher_project_probe_t;
+
+static int watcher_project_probe_callback(const char *name, const char *path, void *ud) {
+    watcher_project_probe_t *probe = ud;
+    (void)path;
+    if (!probe || !name) {
+        return -1;
+    }
+    if (strcmp(name, "parent-project") == 0) {
+        probe->parent_calls++;
+    } else if (strcmp(name, "child-project") == 0) {
+        probe->child_calls++;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
 /* Self-diagnosing count check: this suite's flake family blocked two
  * releases because a bare count assert cannot say WHY — print the
  * committed/pending dirty signatures on mismatch, so the next occurrence
@@ -355,27 +376,6 @@ static int wt_poll_until_count(cbm_watcher_t *w, const char *project, int expect
         cbm_watcher_poll_once(w);
     }
     return index_call_count;
-}
-
-typedef struct {
-    int parent_calls;
-    int child_calls;
-} watcher_project_probe_t;
-
-static int watcher_project_probe_callback(const char *name, const char *path, void *ud) {
-    watcher_project_probe_t *probe = ud;
-    (void)path;
-    if (!probe || !name) {
-        return -1;
-    }
-    if (strcmp(name, "parent-project") == 0) {
-        probe->parent_calls++;
-    } else if (strcmp(name, "child-project") == 0) {
-        probe->child_calls++;
-    } else {
-        return -1;
-    }
-    return 0;
 }
 
 TEST(watcher_poll_no_projects) {
@@ -2721,7 +2721,7 @@ TEST(watcher_nested_repo_membership_and_worktree) {
     PASS();
 }
 
-TEST(watcher_registers_nested_repo_as_independent_project) {
+static int watcher_nested_registration_case(bool poll_non_git) {
     char root[256] = "/tmp/cbm_watcher_nested_register_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(root));
     char child[400], file[600];
@@ -2733,6 +2733,7 @@ TEST(watcher_registers_nested_repo_as_independent_project) {
     cbm_watcher_t *w = cbm_watcher_new(store, nested_registration_index, &ctx);
     ASSERT_NOT_NULL(w);
     ctx.watcher = w;
+    cbm_watcher_set_poll_non_git(w, poll_non_git);
     cbm_watcher_set_repository_discovered_fn(w, nested_registration_discovered, &ctx);
     ASSERT_TRUE(cbm_watcher_watch(w, "outer-project", root));
 
@@ -2763,6 +2764,14 @@ TEST(watcher_registers_nested_repo_as_independent_project) {
     cbm_store_close(store);
     ASSERT_EQ(th_rmtree(root), 0);
     PASS();
+}
+
+TEST(watcher_registers_nested_repo_as_independent_project) {
+    return watcher_nested_registration_case(false);
+}
+
+TEST(watcher_non_git_opt_in_registers_nested_repo_as_independent_project) {
+    return watcher_nested_registration_case(true);
 }
 
 TEST(watcher_nested_retries_and_preserves_callback_edits) {
@@ -2898,6 +2907,54 @@ TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes) {
 static int nongit_poll(cbm_watcher_t *w, const char *project) {
     cbm_watcher_touch(w, project);
     return cbm_watcher_poll_once(w);
+}
+
+TEST(watcher_non_git_opt_in_preserves_nested_changes_and_callback_edits) {
+    char root[256] = "/tmp/cbm_watcher_ng_nested_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char repo[400], file[600];
+    wt_path(repo, sizeof(repo), root, "repo");
+    ASSERT_EQ(wt_init_nested_repo(repo), 0);
+    wt_path(file, sizeof(file), root, "app.py");
+    ASSERT_EQ(th_write_file(file, "def alpha():\n    return 1\n"), 0);
+    cbm_store_t *store = cbm_store_open_memory();
+    nested_index_ctx_t ctx = {.root = root};
+    cbm_watcher_t *w = cbm_watcher_new(store, nested_index_callback, &ctx);
+    ASSERT_NOT_NULL(w);
+    cbm_watcher_set_poll_non_git(w, true);
+    ASSERT_TRUE(cbm_watcher_watch(w, "nested-project", root));
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 1);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+
+    /* Ordinary edits must still be seen when child repositories exist. */
+    ASSERT_EQ(th_append_file(file, "\ndef beta():\n    return 2\n"), 0);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 1);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+
+    /* A Git-only change leaves the tree signature unchanged. */
+    ASSERT_EQ(wt_git(repo, "commit -q --allow-empty -m empty"), 0);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 1);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+
+    /* Failed/busy indexes and callback edits must not advance the baseline. */
+    ASSERT_EQ(th_append_file(file, "\ndef gamma():\n    return 3\n"), 0);
+    ctx.result = -1;
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+    ctx.result = 1;
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+    ctx.result = 0;
+    ctx.edit_path = file;
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 1);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 1);
+    ASSERT_EQ(nongit_poll(w, "nested-project"), 0);
+    ASSERT_EQ(ctx.calls, 7);
+    ASSERT_FALSE(ctx.wrong_target);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
 }
 
 /* Control: with the opt-in OFF (the default) a non-git root is never
@@ -4543,15 +4600,17 @@ SUITE(watcher) {
 
     /* Non-git project */
     RUN_TEST(watcher_non_git_skips);
+    RUN_TEST(watcher_nested_repos_share_outer_project);
+    RUN_TEST(watcher_nested_repo_membership_and_worktree);
+    RUN_TEST(watcher_registers_nested_repo_as_independent_project);
+    RUN_TEST(watcher_non_git_opt_in_registers_nested_repo_as_independent_project);
+    RUN_TEST(watcher_nested_retries_and_preserves_callback_edits);
+    RUN_TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes);
+    RUN_TEST(watcher_non_git_opt_in_preserves_nested_changes_and_callback_edits);
     RUN_TEST(watcher_non_git_opt_in_off_never_polls_issue1948);
     RUN_TEST(watcher_non_git_opt_in_detects_edit_add_delete_issue1948);
     RUN_TEST(watcher_non_git_opt_in_ignores_skipped_paths_issue1948);
     RUN_TEST(watcher_non_git_opt_in_leaves_git_roots_unchanged_issue1948);
-    RUN_TEST(watcher_nested_repos_share_outer_project);
-    RUN_TEST(watcher_nested_repo_membership_and_worktree);
-    RUN_TEST(watcher_registers_nested_repo_as_independent_project);
-    RUN_TEST(watcher_nested_retries_and_preserves_callback_edits);
-    RUN_TEST(watcher_nested_empty_and_broken_repos_do_not_hide_changes);
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);
