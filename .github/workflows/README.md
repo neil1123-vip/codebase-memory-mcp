@@ -7,8 +7,9 @@ configuration live on `codex/cbm-local-fixes`.
 `main` remains the repository's default branch so its sync workflow runs every
 6 hours. Its sync job rebases the fork's sync workflow commits onto upstream,
 then pushes with an explicit lease against the checked-out `main` commit.
-It fails on rebase conflicts or concurrent branch updates. The local-fixes
-sync job continues to merge upstream changes and push normally.
+The local-fixes job also rebases its patches onto upstream and pushes with an
+explicit lease against its checked-out commit. Both jobs fail on rebase
+conflicts or concurrent branch updates, without adding sync merge commits.
 
 The following trigger policy applies to `codex/cbm-local-fixes`. The workflows
 on `main` follow upstream policy, with the added scheduled sync.
