@@ -47,13 +47,14 @@ jobs:
           ref: codex/cbm-local-fixes
           token: ${{ secrets.SYNC_TOKEN }}
 
-      - name: Merge upstream main into local fixes
+      - name: Rebase local fixes onto upstream
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          patch_before_rebase=$(git rev-parse HEAD)
           git remote add upstream https://github.com/DeusData/codebase-memory-mcp.git
           git fetch --prune upstream main
-          git merge --no-edit upstream/main
-          git push origin HEAD:codex/cbm-local-fixes
+          git rebase upstream/main
+          git push --force-with-lease="refs/heads/codex/cbm-local-fixes:$patch_before_rebase" origin HEAD:refs/heads/codex/cbm-local-fixes
