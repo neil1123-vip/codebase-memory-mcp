@@ -1003,6 +1003,72 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
 #endif
 }
 
+/* Root-set discovery must not silently drop unreadable ignore rules. Keep
+ * these control-file reads bounded; source files are never opened in this mode.
+ * ponytail: 1 MiB ignore-file cap; stream parsing if larger rules are needed. */
+static cbm_gitignore_t *git_roots_load_ignore(const char *path, file_list_t *out) {
+    struct stat st;
+    bool is_symlink = false;
+    errno = 0;
+    if (safe_stat(path, &st, &is_symlink) != 0) {
+        if (is_symlink || errno != ENOENT) {
+            out->failed = true;
+        }
+        return NULL;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 1024 * 1024 ||
+        file_list_should_stop(out)) {
+        out->failed = true;
+        return NULL;
+    }
+    FILE *file = cbm_fopen(path, "rb");
+    char *content = file ? malloc((size_t)st.st_size + 1) : NULL;
+    cbm_gitignore_t *ignore = NULL;
+    if (content) {
+        size_t size = fread(content, 1, (size_t)st.st_size + 1, file);
+        if (size == (size_t)st.st_size && !ferror(file) && !file_list_should_stop(out)) {
+            content[size] = '\0';
+            ignore = cbm_gitignore_parse(content);
+        }
+    }
+    free(content);
+    if (file) {
+        (void)fclose(file);
+    }
+    if (!ignore) {
+        out->failed = true;
+    }
+    return ignore;
+}
+
+/* Return true when this frame is a root, so the walker stops at its boundary. */
+static bool walk_git_root(const char *directory, file_list_t *out) {
+    char marker[CBM_SZ_4K];
+    int length = snprintf(marker, sizeof(marker), "%s/.git", directory);
+    if (length <= 0 || (size_t)length >= sizeof(marker)) {
+        out->failed = true;
+        return false;
+    }
+    struct stat st;
+    bool is_symlink = false;
+    errno = 0;
+    if (safe_stat(marker, &st, &is_symlink) != 0) {
+        if (!is_symlink && errno != ENOENT) {
+            out->failed = true;
+        }
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (out->excluded_count >= 1024) {
+        out->limit_exceeded = true;
+    } else {
+        file_list_add_excluded(out, directory);
+    }
+    return true;
+}
+
 /* ── Sphinx documentation sets ────────────────────────────────────
  * A directory with a conf.py is a Sphinx documentation set, and its
  * `source_suffix` says which file suffixes are reStructuredText (Django's
@@ -1147,72 +1213,6 @@ static bool sphinx_is_rst(const sphinx_suffixes_t *set, const char *name) {
         }
     }
     return false;
-}
-
-/* Root-set discovery must not silently drop unreadable ignore rules. Keep
- * these control-file reads bounded; source files are never opened in this mode.
- * ponytail: 1 MiB ignore-file cap; stream parsing if larger rules are needed. */
-static cbm_gitignore_t *git_roots_load_ignore(const char *path, file_list_t *out) {
-    struct stat st;
-    bool is_symlink = false;
-    errno = 0;
-    if (safe_stat(path, &st, &is_symlink) != 0) {
-        if (is_symlink || errno != ENOENT) {
-            out->failed = true;
-        }
-        return NULL;
-    }
-    if (!S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 1024 * 1024 ||
-        file_list_should_stop(out)) {
-        out->failed = true;
-        return NULL;
-    }
-    FILE *file = cbm_fopen(path, "rb");
-    char *content = file ? malloc((size_t)st.st_size + 1) : NULL;
-    cbm_gitignore_t *ignore = NULL;
-    if (content) {
-        size_t size = fread(content, 1, (size_t)st.st_size + 1, file);
-        if (size == (size_t)st.st_size && !ferror(file) && !file_list_should_stop(out)) {
-            content[size] = '\0';
-            ignore = cbm_gitignore_parse(content);
-        }
-    }
-    free(content);
-    if (file) {
-        (void)fclose(file);
-    }
-    if (!ignore) {
-        out->failed = true;
-    }
-    return ignore;
-}
-
-/* Return true when this frame is a root, so the walker stops at its boundary. */
-static bool walk_git_root(const char *directory, file_list_t *out) {
-    char marker[CBM_SZ_4K];
-    int length = snprintf(marker, sizeof(marker), "%s/.git", directory);
-    if (length <= 0 || (size_t)length >= sizeof(marker)) {
-        out->failed = true;
-        return false;
-    }
-    struct stat st;
-    bool is_symlink = false;
-    errno = 0;
-    if (safe_stat(marker, &st, &is_symlink) != 0) {
-        if (!is_symlink && errno != ENOENT) {
-            out->failed = true;
-        }
-        return false;
-    }
-    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
-        return false;
-    }
-    if (out->excluded_count >= 1024) {
-        out->limit_exceeded = true;
-    } else {
-        file_list_add_excluded(out, directory);
-    }
-    return true;
 }
 
 /* Process a single regular file entry during directory walk. */
@@ -1475,7 +1475,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
         }
 
         sphinx_suffixes_t set;
-        if (sphinx_load(frame.dir, &set)) {
+        if (!out->git_roots_only && sphinx_load(frame.dir, &set)) {
             frame.sphinx = set; /* a (nested) documentation set starts here */
         }
 
