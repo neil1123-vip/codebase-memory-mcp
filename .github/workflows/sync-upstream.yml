@@ -24,16 +24,17 @@ jobs:
           ref: main
           token: ${{ secrets.SYNC_TOKEN }}
 
-      - name: Merge upstream main
+      - name: Rebase main onto upstream
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          main_before_rebase=$(git rev-parse HEAD)
           git remote add upstream https://github.com/DeusData/codebase-memory-mcp.git
           git fetch --prune upstream main
-          git merge --no-edit upstream/main
-          git push origin HEAD:main
+          git rebase upstream/main
+          git push --force-with-lease="refs/heads/main:$main_before_rebase" origin HEAD:refs/heads/main
 
   sync-patch:
     if: github.repository == 'neil1123-vip/codebase-memory-mcp'
