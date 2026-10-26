@@ -1882,6 +1882,12 @@ static void app_fake_worker_destroy(void *opaque, cbm_daemon_application_worker_
     free(handle);
 }
 
+static bool app_test_initialize_existing_context(
+    const cbm_daemon_runtime_application_callbacks_t *callbacks,
+    cbm_daemon_runtime_application_session_t *session);
+static bool app_test_mcp_index_request(const char *root, const char *name, const char *extra_args,
+                                        uint8_t **request_out, uint32_t *request_length_out);
+
 TEST(daemon_application_explicit_index_persists_watch_without_session) {
     static const char failed_response[] =
         "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"status\\\":\\\"error\\\"}\"}],"
@@ -1930,32 +1936,33 @@ TEST(daemon_application_explicit_index_persists_watch_without_session) {
     uint32_t tool_length = 0;
     uint8_t *response = NULL;
     uint32_t response_length = 0;
-    char args[APP_TEST_PATH_CAP + 64];
-    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", child);
     bool setup = child_ok && project && env_ok && session &&
                  app_test_context_request(root, root, &context, &context_length) &&
-                 app_test_tool_request("index_repository", args, &tool, &tool_length);
+                 app_test_mcp_index_request(child, project, ",\"mode\":\"fast\"", &tool,
+                                              &tool_length);
     bool requested =
         setup && app_test_request(&callbacks, session, context, context_length, &response,
                                   &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     free(response);
     response = NULL;
     requested =
-        requested && app_test_request(&callbacks, session, tool, tool_length, &response,
-                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+        requested && app_test_initialize_existing_context(&callbacks, session) &&
+        app_test_request(&callbacks, session, tool, tool_length, &response,
+                          &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool failed_without_watch = requested && response && strstr((char *)response, "isError") &&
                                 cbm_watcher_watch_count(watcher) == 0;
     free(response);
     response = NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded = failed_without_watch &&
+                  app_test_seed_project_db(cache, project, child, db_path, sizeof(db_path));
     requested =
-        requested && app_test_request(&callbacks, session, tool, tool_length, &response,
-                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+        requested && seeded && app_test_request(&callbacks, session, tool, tool_length, &response,
+                                                 &response_length) ==
+                                   CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool registered = requested && response && strstr((char *)response, "indexed") &&
                       cbm_watcher_watch_count(watcher) == 1;
-    char db_path[APP_TEST_PATH_CAP] = {0};
-    bool seeded = registered &&
-                  app_test_seed_project_db(cache, project, child, db_path, sizeof(db_path));
-    char *status = seeded ? app_test_index_status(&callbacks, session, project) : NULL;
+    char *status = registered ? app_test_index_status(&callbacks, session, project) : NULL;
     bool explicit_watched = app_test_response_has(status, "watched", "true") &&
                             app_test_response_has(status, "strategy", "\\\"pending\\\"");
     if (session) {
@@ -5185,8 +5192,15 @@ static int app_watch_preserves_doc_candidates(int explicit_value) {
         indexed && default_updated
             ? cbm_daemon_application_watcher_index("options-target", target, fixture.application)
             : -1;
+    bool refresh_finished = refreshed == 1 &&
+                            app_wait_for_atomic_int_at_least(&fixture.fake.starts, 2) &&
+                            app_wait_for_active_jobs(fixture.application, 0);
+    int refresh_result = refresh_finished
+                             ? cbm_daemon_application_watcher_index(
+                                   "options-target", target, fixture.application)
+                             : -1;
     const char *args = fixture.fake.args_json[1];
-    yyjson_doc *doc = refreshed == 0 ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_doc *doc = refresh_result == 0 ? yyjson_read(args, strlen(args), 0) : NULL;
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     yyjson_val *choice = yyjson_obj_get(root, "doc_candidates");
     int forwarded = !choice ? -1 : !yyjson_is_bool(choice) ? -2 : yyjson_get_bool(choice) ? 1 : 0;
@@ -5208,7 +5222,9 @@ static int app_watch_preserves_doc_candidates(int explicit_value) {
     ASSERT_TRUE(configured);
     ASSERT_TRUE(indexed);
     ASSERT_TRUE(default_updated);
-    ASSERT_EQ(refreshed, 0);
+    ASSERT_EQ(refreshed, 1);
+    ASSERT_TRUE(refresh_finished);
+    ASSERT_EQ(refresh_result, 0);
     ASSERT_TRUE(cleaned);
     ASSERT_TRUE(mode_preserved);
     ASSERT_TRUE(persistence_preserved);
@@ -5281,6 +5297,11 @@ TEST(daemon_application_explicit_index_registers_target_watch_for_live_session) 
     bool watcher_done =
         watcher_worker_started && app_wait_for_atomic_bool(&watcher_request.done, true);
     bool watcher_thread_joined = watcher_thread_started && cbm_thread_join(&watcher_thread) == 0;
+    bool refresh_finished = watcher_done && app_wait_for_active_jobs(fixture.application, 0);
+    int refresh_result = refresh_finished
+                             ? cbm_daemon_application_watcher_index(
+                                   "custom-target", targets[0], fixture.application)
+                             : -1;
     bool saved_options = watcher_worker_started &&
                          strstr(fixture.fake.args_json[3], "\"mode\":\"fast\"") &&
                          strstr(fixture.fake.args_json[3], "\"persistence\":true");
@@ -5314,14 +5335,16 @@ TEST(daemon_application_explicit_index_registers_target_watch_for_live_session) 
     ASSERT_TRUE(watcher_worker_started);
     ASSERT_TRUE(watcher_done);
     ASSERT_TRUE(watcher_thread_joined);
-    ASSERT_EQ(watcher_request.result, 0);
+    ASSERT_EQ(watcher_request.result, 1);
+    ASSERT_TRUE(refresh_finished);
+    ASSERT_EQ(refresh_result, 0);
     ASSERT_TRUE(saved_options);
     ASSERT_TRUE(strstr(fixture.fake.args_json[0], "custom-target") != NULL);
     ASSERT_EQ(after_first, 2);
     ASSERT_EQ(after_second, 3);
     ASSERT_EQ(after_shared, 3);
-    ASSERT_EQ(after_first_close, 2);
-    ASSERT_EQ(after_last_close, 3);
+    ASSERT_EQ(after_first_close, 3);
+    ASSERT_EQ(after_last_close, 2);
     ASSERT_TRUE(cleaned);
     PASS();
 }
@@ -5521,7 +5544,7 @@ TEST(daemon_application_async_index_interest_survives_cancelled_sync_join) {
     ASSERT_TRUE(sync_thread_joined);
     ASSERT_TRUE(drained);
     ASSERT_EQ(watches_after_success, 2);
-    ASSERT_EQ(watches_after_close, 0);
+    ASSERT_EQ(watches_after_close, 1);
     ASSERT_TRUE(cleaned);
     PASS();
 }

@@ -802,6 +802,7 @@ static void application_index_watch_subscribe_locked(cbm_daemon_application_sess
         if (job->successful) {
             application_register_watch_locked(session, job->project_key, job->root_path,
                                               job->args_json);
+            application_promote_watch_locked(session, job->project_key, job->root_path);
         }
         return;
     }
@@ -846,6 +847,7 @@ static void application_index_watch_publish_locked(cbm_daemon_application_job_t 
         if (job->successful) {
             application_register_watch_locked(owner->session, job->project_key, job->root_path,
                                               job->args_json);
+            application_promote_watch_locked(owner->session, job->project_key, job->root_path);
         }
         cbm_free(CBM_MEM_CLASS_OTHER, owner);
     }
@@ -2901,12 +2903,6 @@ static char *application_job_wait_for_session(cbm_daemon_application_session_t *
         }
         if (job->terminal) {
             char *response = job->response ? strdup(job->response) : NULL;
-            if (job->successful && !session->one_shot_request &&
-                session->background_eligible && !session->session_cancelled) {
-                application_register_watch_locked(session, job->project_key, job->root_path,
-                                                  job->args_json);
-                application_promote_watch_locked(session, job->project_key, job->root_path);
-            }
             session->active_job = NULL;
             session->active_job_subscribed = false;
             application_job_unsubscribe_locked(job);
