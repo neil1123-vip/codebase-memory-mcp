@@ -11656,10 +11656,8 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
  * same-named project afterwards starts with no ADR (round-2 review item 7c). */
 TEST(tool_delete_project_removes_adr_sidecar) {
     char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-adr-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        PASS();
-    }
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-delete-adr-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
