@@ -9760,7 +9760,7 @@ TEST(pipeline_semantic_manifest_filters_control_walk) {
     char *excluded[] = {"excluded"};
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = 0;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-controls", tmp, NULL, 0, excluded, 1,
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-controls", tmp, NULL, 0, excluded, 1,
                                                   NULL, NULL, &manifest, &manifest_count);
     bool found[sizeof(controls) / sizeof(controls[0])] = {false};
     bool has_excluded = false;
