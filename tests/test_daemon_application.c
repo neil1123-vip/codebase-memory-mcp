@@ -3190,7 +3190,7 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
  * a workspace-policy release is not a disconnect: once the session's root is
  * no longer allowed (here its approval is revoked), the next request's
  * refresh must still end the watch in a permanent generation too. */
-TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
+static int app_workspace_release_still_ends_watch(bool daemon_owned) {
     app_env_backup_t cache_environment;
     app_env_backup_t home_environment;
     bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
@@ -3245,11 +3245,15 @@ TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
 
     bool initialized = app_test_initialize_profile(&callbacks, session, sensitive,
                                                    CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool ownership_ready =
+        initialized &&
+        (!daemon_owned ||
+         cbm_daemon_application_register_project_watch(application, project, sensitive, false));
     int watch_while_approved = watcher ? cbm_watcher_watch_count(watcher) : -1;
 
     /* Revoke the approval. Every request ends with a synchronous watch
      * refresh, so one ping is the point where the policy is re-read. */
-    bool revoked = initialized && cbm_unlink(grant_path) == 0;
+    bool revoked = ownership_ready && cbm_unlink(grant_path) == 0;
     uint8_t *ping = NULL;
     uint32_t ping_length = 0;
     uint8_t *response = NULL;
@@ -3291,6 +3295,7 @@ TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
     ASSERT_TRUE(approved);
     ASSERT_TRUE(grant_path_ok);
     ASSERT_TRUE(initialized);
+    ASSERT_TRUE(ownership_ready);
     ASSERT_EQ(watch_while_approved, 1);
     ASSERT_TRUE(revoked);
     ASSERT_TRUE(pinged);
@@ -3300,6 +3305,14 @@ TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
     ASSERT_TRUE(cache_restored);
     ASSERT_TRUE(home_restored);
     PASS();
+}
+
+TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
+    return app_workspace_release_still_ends_watch(false);
+}
+
+TEST(daemon_application_daemon_owned_workspace_release_still_ends_watch) {
+    return app_workspace_release_still_ends_watch(true);
 }
 
 TEST(daemon_application_programmatic_index_injects_resource_policy) {
@@ -8569,6 +8582,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
     RUN_TEST(daemon_application_permanent_workspace_release_still_ends_watch);
+    RUN_TEST(daemon_application_daemon_owned_workspace_release_still_ends_watch);
     RUN_TEST(daemon_application_ui_index_accepts_non_ascii_directory);
     RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
     RUN_TEST(daemon_application_async_index_returns_before_completion_and_status_polls);
