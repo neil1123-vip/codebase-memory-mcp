@@ -606,6 +606,20 @@ function readCoverageRows(value: unknown): CoverageRow[] {
             });
             if (ranges.length > 0) row.detail = `Source lines: ${ranges.join(', ')}`;
         }
+        if (row.kind === 'unresolved_calls' && !row.detail) {
+            const count = entry['count'];
+            const relation = entry['count_relation'];
+            if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0
+                && (relation === 'eq' || relation === 'gte')) {
+                const reasons = isRecord(entry['reasons']) ? Object.entries(entry['reasons'])
+                    .filter(([, value]) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
+                    .map(([reason, value]) => `${reason}: ${value}`) : [];
+                row.detail = `${relation === 'gte' ? 'At least ' : ''}${count} unresolved calls`
+                    + (reasons.length > 0 ? `: ${reasons.join(', ')}` : '');
+            } else if (entry['summary_unavailable'] === true) {
+                row.detail = 'Unresolved call summary unavailable';
+            }
+        }
         const match = coverageString(entry['match']);
         if (match.length > 0) {
             row.match = match;

@@ -797,8 +797,8 @@ static const tool_def_t TOOLS[] = {
      "\"project\"]}"},
 
     {"check_index_coverage",
-     "Best-effort exact-path/scope coverage and freshness, paged separately. full diagnostics "
-     "adds raw detail. Clean is not proof of completeness.",
+     "Best-effort exact-path/scope coverage and freshness, paged separately. Counts, ranges and "
+     "reasons by default; full diagnostics adds raw detail. Clean is not proof of completeness.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128},"
@@ -7499,11 +7499,44 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
         (strcmp(row->kind, "parse_partial") == 0 || strcmp(row->kind, "parse_unusable") == 0)) {
         ranges_added = coverage_add_ranges(doc, item, row->detail);
     }
-    /* A parse_partial detail such as "3-4,9" is byte-for-byte redundant once
-     * represented as typed ranges. Preserve raw storage diagnostics on request,
-     * and preserve every non-range detail by default because it may explain why
-     * a file was skipped or excluded. */
-    if (diagnostics_full || !ranges_added) {
+    bool calls_summarized = !diagnostics_full && row->kind &&
+                            strcmp(row->kind, "unresolved_calls") == 0;
+    if (calls_summarized) {
+        yyjson_doc *calls_doc = row->detail ? yyjson_read(row->detail, strlen(row->detail), 0) : NULL;
+        yyjson_val *calls = calls_doc ? yyjson_doc_get_root(calls_doc) : NULL;
+        if (yyjson_is_arr(calls)) {
+            size_t count = 0;
+            bool truncated = false;
+            yyjson_mut_val *reasons = yyjson_mut_obj(doc);
+            size_t index, maximum;
+            yyjson_val *call;
+            yyjson_arr_foreach(calls, index, maximum, call) {
+                if (yyjson_is_true(yyjson_obj_get(call, "truncated"))) {
+                    truncated = true;
+                    continue;
+                }
+                count++;
+                const char *reason = yyjson_get_str(yyjson_obj_get(call, "reason"));
+                reason = reason && reason[0] ? reason : "unknown";
+                yyjson_mut_val *seen = yyjson_mut_obj_get(reasons, reason);
+                if (seen) {
+                    yyjson_mut_set_uint(seen, yyjson_mut_get_uint(seen) + 1);
+                } else {
+                    yyjson_mut_obj_add(reasons, yyjson_mut_strcpy(doc, reason),
+                                       yyjson_mut_uint(doc, 1));
+                }
+            }
+            yyjson_mut_obj_add_uint(doc, item, "count", count);
+            yyjson_mut_obj_add_str(doc, item, "count_relation", truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_val(doc, item, "reasons", reasons);
+        } else {
+            yyjson_mut_obj_add_bool(doc, item, "summary_unavailable", true);
+        }
+        yyjson_doc_free(calls_doc);
+    }
+    /* Keep skip/exclusion reasons, but reserve raw call records and redundant
+     * range strings for explicit diagnostics. */
+    if (diagnostics_full || (!ranges_added && !calls_summarized)) {
         yyjson_mut_obj_add_strcpy(doc, item, "detail", row->detail ? row->detail : "");
     }
     yyjson_mut_arr_add_val(array, item);

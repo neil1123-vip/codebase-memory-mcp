@@ -7430,6 +7430,109 @@ TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics) {
     PASS();
 }
 
+TEST(tool_check_index_coverage_summarizes_calls_and_keeps_full_diagnostics) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "coverage-call-summary";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/coverage-call-summary"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "src/a.c", "fixture", 1, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "src/skipped.c", "fixture", 1, 1),
+              CBM_STORE_OK);
+
+    cbm_sb_t details;
+    cbm_sb_init(&details);
+    cbm_sb_append(&details, "[");
+    for (int i = 0; i < 200; i++) {
+        cbm_sb_append(&details, i ? "," : "");
+        cbm_sb_append(&details,
+                      "{\"caller\":\"project.src.large_file.repeated_caller\","
+                      "\"leaf\":\"external_function\",\"start_byte\":0,\"end_byte\":0,"
+                      "\"source_origin\":0,\"reason\":\"function_not_in_registry\"}");
+    }
+    cbm_sb_append(&details, ",{\"truncated\":true}]");
+    char *raw = cbm_sb_finish(&details);
+    ASSERT_NOT_NULL(raw);
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "src/a.c", .kind = "unresolved_calls", .detail = raw},
+        {.rel_path = "src/a.c", .kind = "parse_partial", .detail = "11-19"},
+        {.rel_path = "src/skipped.c", .kind = "skipped", .detail = "unsupported definition"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(store, project, rows, 3), CBM_STORE_OK);
+    static const char *const formats[] = {"json", "tree"};
+    for (size_t i = 0; i < 2; i++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"paths\":[\"src/a.c\",\"src/skipped.c\"],"
+                 "\"scopes\":[\"src\"],\"format\":\"%s\"}", project, formats[i]);
+        char *response = cbm_mcp_handle_tool(srv, "check_index_coverage", args);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_LT(strlen(inner), 6000);
+        ASSERT_NULL(strstr(inner, "repeated_caller"));
+        ASSERT_NOT_NULL(strstr(inner, "function_not_in_registry"));
+        ASSERT_NOT_NULL(strstr(inner, "unsupported definition"));
+        if (i == 0) {
+            ASSERT_NOT_NULL(strstr(inner, "\"count\":200"));
+            ASSERT_NOT_NULL(strstr(inner, "\"count_relation\":\"gte\""));
+            ASSERT_NOT_NULL(strstr(inner, "\"function_not_in_registry\":200"));
+            ASSERT_NOT_NULL(strstr(inner, "\"start\":11"));
+            ASSERT_NOT_NULL(strstr(inner, "\"end\":19"));
+        }
+        free(inner);
+        free(response);
+    }
+    char *response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-call-summary\",\"paths\":[\"src/a.c\"],"
+        "\"diagnostics\":\"full\",\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *paths = yyjson_obj_get(yyjson_doc_get_root(doc), "paths");
+    yyjson_val *coverage = yyjson_obj_get(yyjson_arr_get_first(paths), "coverage");
+    bool restored = false;
+    size_t index, maximum;
+    yyjson_val *row;
+    yyjson_arr_foreach(coverage, index, maximum, row) {
+        const char *kind = yyjson_get_str(yyjson_obj_get(row, "kind"));
+        if (kind && strcmp(kind, "unresolved_calls") == 0) {
+            restored = strcmp(yyjson_get_str(yyjson_obj_get(row, "detail")), raw) == 0;
+        }
+    }
+    ASSERT_TRUE(restored);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    free(raw);
+
+    static const char *const remaining[] = {
+        "[{\"reason\":\"unknown_target\"},{}]", "invalid diagnostics",
+    };
+    for (size_t i = 0; i < 2; i++) {
+        rows[0].detail = (char *)remaining[i];
+        ASSERT_EQ(cbm_store_coverage_replace(store, project, rows, 1), CBM_STORE_OK);
+        response = cbm_mcp_handle_tool(
+            srv, "check_index_coverage",
+            "{\"project\":\"coverage-call-summary\",\"paths\":[\"src/a.c\"],\"format\":\"json\"}");
+        inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, i == 0 ? "\"count_relation\":\"eq\""
+                                            : "\"summary_unavailable\":true"));
+        if (i == 0) {
+            ASSERT_NOT_NULL(strstr(inner, "\"count\":2"));
+            ASSERT_NOT_NULL(strstr(inner, "\"unknown\":1"));
+        }
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The range string can carry a trailing ",+<N>" marker saying the producer hit
  * its own cap and threw ranges away. The reader must emit every range in front
  * of the marker, must not turn the marker itself into a range, and must say
@@ -28909,6 +29012,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
     RUN_TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics);
+    RUN_TEST(tool_check_index_coverage_summarizes_calls_and_keeps_full_diagnostics);
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
     RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
