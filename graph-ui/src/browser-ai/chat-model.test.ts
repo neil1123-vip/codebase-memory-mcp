@@ -4,6 +4,7 @@ import { buildChatMessages, selectionLocation, snapshotAttachment, snapshotReade
 const source: BrowserChatAttachment = { id: 'selection-1', text: '\t partial(\r\n  a + b\n', path: 'src/math.ts', project: 'sample', startLine: 3, startColumn: 8, endLine: 5, endColumn: 1, sourceVersion: 'sha256:test' };
 const attached = (content: string) => JSON.parse(content.slice(content.indexOf('\n{') + 1).split('\n')[0]);
 const reader = (text = source.text, kind: 'file' | 'selection' = 'selection'): BrowserChatReaderContext => ({ project: source.project, path: source.path, status: 'ready', source: { ...source, text, kind } });
+const completedTurn = (extra: Partial<BrowserChatTurn> = {}): BrowserChatTurn => ({ id: '1', prompt: 'Explain', answer: 'A sum.', request: [], modelId: 'test', status: 'complete', ...extra });
 
 describe('browser chat context', () => {
     it('preserves partial selection characters, whitespace, line endings and range exactly', () => {
@@ -26,6 +27,74 @@ describe('browser chat context', () => {
         expect(messages.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
         expect(messages[1].content).toContain(source.text);
         expect(messages[3].content).toBe('And why?');
+    });
+
+    it('sends an identical code snapshot once and refers repeated attachments to its original message', () => {
+        const turns = [
+            completedTurn({ attachment: source }),
+            completedTurn({ id: '2', prompt: 'Again', attachment: { ...source, id: 'reselected' } }),
+        ];
+        const before = JSON.stringify(turns);
+        const messages = buildChatMessages(turns, 'What about this code?', { ...source, id: 'current' });
+        expect(messages.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'user', 'assistant', 'user']);
+        expect(messages[1].content).toBe(userMessage('Explain', source));
+        expect(messages[3].content).toBe('Again\n\nAttached snapshot: same as the code snapshot in user message 1.');
+        expect(messages[5].content).toBe('What about this code?\n\nAttached snapshot: same as the code snapshot in user message 1.');
+        expect(messages.map(message => message.content).join('\n').split('--- BEGIN EXACT CODE SNAPSHOT ---')).toHaveLength(2);
+        expect(JSON.stringify(turns)).toBe(before);
+    });
+
+    it.each<Partial<BrowserChatAttachment>>([
+        { project: 'other' }, { path: 'other.ts' }, { sourceVersion: 'sha256:changed' },
+        { startLine: 4 }, { startColumn: 9 }, { endLine: 6 }, { endColumn: 2 },
+        { text: source.text.replace('\r\n', '\n') },
+    ])('keeps distinct code snapshots even when attachment IDs match: %j', change => {
+        const messages = buildChatMessages([completedTurn({ attachment: source })], 'Compare', { ...source, ...change });
+        expect(messages.map(message => message.content).join('\n').split('--- BEGIN EXACT CODE SNAPSHOT ---')).toHaveLength(3);
+    });
+
+    it('deduplicates explicit context by label and exact text and keeps references unambiguous', () => {
+        const first = { id: 'g1', label: 'Callers', text: 'entry calls helper' };
+        const second = { id: 'g2', label: 'Callers', text: 'other calls helper' };
+        const turns = [completedTurn({ context: [first, second] })];
+        const messages = buildChatMessages(turns, 'Why the second list?', undefined, [
+            { ...second, id: 'reselected' },
+            { ...first, label: 'Callees' },
+            { ...first, text: 'changed calls helper' },
+        ]);
+        expect(messages.at(-1)?.content).toContain('Attached snapshot: same as context snapshot 2 in user message 1.');
+        const all = messages.map(message => message.content).join('\n');
+        expect(all.split('--- BEGIN CONTEXT SNAPSHOT ---')).toHaveLength(5);
+        expect(messages.at(-1)?.content).toContain('changed calls helper');
+        expect(messages.at(-1)?.content).toContain('"label":"Callees"');
+        const repeated = buildChatMessages([], 'Explain', undefined, [first, { ...first, id: 'duplicate' }]);
+        expect(repeated[1].content.split('--- BEGIN CONTEXT SNAPSHOT ---')).toHaveLength(2);
+    });
+
+    it('numbers full context snapshots without counting earlier references in the same message', () => {
+        const first = { id: 'g1', label: 'Callers', text: 'entry calls helper' };
+        const second = { id: 'g2', label: 'Callees', text: 'helper calls other' };
+        const messages = buildChatMessages([
+            completedTurn({ context: [first] }),
+            completedTurn({ id: '2', context: [first, second] }),
+        ], 'Why the second list?', undefined, [second]);
+        expect(messages[3].content.split('--- BEGIN CONTEXT SNAPSHOT ---')).toHaveLength(2);
+        expect(messages.at(-1)?.content).toBe('Why the second list?\n\nAttached snapshot: same as context snapshot 1 in user message 2.');
+        const withinOneMessage = buildChatMessages([
+            completedTurn({ context: [first, first, second] }),
+        ], 'Why?', undefined, [second]);
+        expect(withinOneMessage.at(-1)?.content).toBe('Why?\n\nAttached snapshot: same as context snapshot 2 in user message 1.');
+    });
+
+    it('rebuilds snapshot references after skipped or trimmed history and never reuses another request', () => {
+        const failed = completedTurn({ status: 'error', attachment: source });
+        const hint = completedTurn({ answeredFrom: 'hint', attachment: source });
+        const valid = completedTurn({ id: 'valid', attachment: source });
+        const messages = buildChatMessages([failed, hint, valid], 'Follow up', source);
+        expect(messages[1].content).toBe(userMessage(valid.prompt, source));
+        expect(messages.at(-1)?.content).toContain('the code snapshot in user message 1');
+        const trimmed = trimChatHistory([valid], 1);
+        expect(buildChatMessages(trimmed, 'Now', source).at(-1)?.content).toBe(userMessage('Now', source));
     });
 
     it('does not fabricate answers or reuse a failed request as conversation evidence', () => {
@@ -68,7 +137,8 @@ describe('browser chat context', () => {
         expect(messages[1].content).toBe('Earlier manual question');
         expect(messages[2].content).toBe('Earlier answer');
         expect(messages[3].content).toContain(graph.text);
-        expect(messages.at(-1)?.content).toContain(graph.text);
+        expect(messages.at(-1)?.content).toContain('Attached snapshot: same as context snapshot 1 in user message 2.');
+        expect(all.split(graph.text)).toHaveLength(2);
     });
 
     it('never promotes automatic snapshots into history after leaving Explorer', () => {
