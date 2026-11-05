@@ -361,12 +361,12 @@ export default function BrowserChatDock({ proactiveSelection, selectionScope = "
         setExplanation(previous => previous?.key === cached.key ? previous : cached);
     }, [selected?.key, selected?.evidence]);
     useEffect(() => {
-        if (!historyReady || !proactive || !automatic || !selected || selected.waiting || phase !== 'ready' || manualRequest.current || pending.current
+        if (!open || !historyReady || !proactive || !automatic || !selected || selected.waiting || phase !== 'ready' || manualRequest.current || pending.current
             || lastAttempt.current === selected.key || explanations.current.has(selected.key)) return;
         const snapshot = selected;
         const timer = setTimeout(() => { void explain(snapshot); }, EXPLANATION_DELAY_MS);
         return () => clearTimeout(timer);
-    }, [selected?.key, selected?.waiting, selected?.evidence, phase, automatic, proactive, retryExplanation, historyReady]);
+    }, [open, selected?.key, selected?.waiting, selected?.evidence, phase, automatic, proactive, retryExplanation, historyReady]);
     /** The selection's own source: what the view already read, or the selected symbol read
      * once through get_code_snippet. A failed read is retried on the next request. */
     const sourceFor = (context: BrowserChatContext | undefined): Promise<BrowserChatSource | undefined> => {

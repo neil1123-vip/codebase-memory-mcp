@@ -493,6 +493,46 @@ describe('proactive selection explanations', () => {
         expect(container.querySelector('[aria-label="Current selection explanation"]')).toBeNull();
     });
 
+    it('defers automatic explanations while collapsed and resumes only the latest selection', async () => {
+        vi.useFakeTimers(); const { props, runtime } = fixture();
+        const first = { ...props, proactive: true, readerContext: reader('FIRST_SOURCE') };
+        await render(first); await click('Download & load');
+        await render({ ...first, open: false });
+        await settleSelection();
+        expect(runtime.countTokens).not.toHaveBeenCalled();
+        expect(runtime.chat).not.toHaveBeenCalled();
+        await render({ ...first, open: false, readerContext: reader('UNSEEN_SOURCE') });
+        await settleSelection();
+        const latest = { ...first, readerContext: reader('LATEST_SOURCE') };
+        await render({ ...latest, open: false });
+        await settleSelection();
+        expect(runtime.countTokens).not.toHaveBeenCalled();
+        expect(runtime.chat).not.toHaveBeenCalled();
+        await render(latest); await settleSelection();
+        expect(runtime.chat).toHaveBeenCalledOnce();
+        const request = runtime.chat.mock.calls[0][0].at(-1)!.content;
+        expect(request).toContain('LATEST_SOURCE');
+        expect(request).not.toContain('FIRST_SOURCE');
+        expect(request).not.toContain('UNSEEN_SOURCE');
+        expect(props.createRuntime).toHaveBeenCalledOnce();
+    });
+
+    it('lets an active automatic explanation finish while collapsed and reuses it on reopening', async () => {
+        vi.useFakeTimers(); const { props, runtime } = fixture(); const answer = deferred<string>();
+        runtime.chat.mockReturnValueOnce(answer.promise);
+        const selected = { ...props, proactive: true, readerContext: reader('SOURCE') };
+        await render(selected); await click('Download & load'); await settleSelection();
+        expect(runtime.chat).toHaveBeenCalledOnce();
+        await render({ ...selected, open: false });
+        expect(runtime.stop).not.toHaveBeenCalled();
+        await act(async () => answer.resolve('Finished while folded.'));
+        await settleSelection();
+        await render(selected); await settleSelection();
+        expect(container.querySelector('[aria-label="Current selection explanation"]')?.textContent).toContain('Finished while folded.');
+        expect(runtime.chat).toHaveBeenCalledOnce();
+        expect(runtime.dispose).not.toHaveBeenCalled();
+    });
+
     it('stops stale generation and waits for its settlement before starting the latest selection', async () => {
         vi.useFakeTimers();
         const { props, runtime } = fixture(); const old = deferred<string>();
