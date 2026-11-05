@@ -3202,6 +3202,14 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (read_status != PROJECT_RECORD_OK) {
             continue;
         }
+        /* Old automatic indexes remain on disk, but need the same sensitive-root approval. */
+        if (cbm_workspace_classify_root(record.root_path, cbm_workspace_home_dir(), dir_path) ==
+                CBM_WS_DENY_SENSITIVE &&
+            !cbm_workspace_root_allowed(record.root_path, cbm_workspace_home_dir(), dir_path, NULL,
+                                        NULL, 0)) {
+            project_record_clear(&record);
+            continue;
+        }
         if (record_count == record_cap) {
             int new_cap = record_cap ? record_cap * 2 : 16;
             void *grown = realloc(records, (size_t)new_cap * sizeof(*records));

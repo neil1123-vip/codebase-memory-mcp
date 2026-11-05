@@ -2182,8 +2182,11 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
 TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
     int sensitive =
         issue403_initialize_count_calls("C:/Users/dev/AppData/Local/Programs/Antigravity", false);
+    int codex = issue403_initialize_count_calls(
+        "C:/Users/neil1/AppData/Local/OpenAI/Codex/bin/23f7d7f110b19ac3", false);
     int ordinary = issue403_initialize_count_calls("C:/Users/dev/projects/app", false);
     ASSERT_EQ(sensitive, 0);
+    ASSERT_EQ(codex, 0);
     ASSERT_EQ(ordinary, 1);
     PASS();
 }
@@ -6509,15 +6512,23 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-    enum { PROJECTS = 12 };
-    for (int i = 0; i < PROJECTS; i++) {
+    enum { PROJECTS = 12, INSTALL_PROJECTS = 2 };
+    const char *install_roots[] = {
+        "C:/Users/neil1/AppData/Local/OpenAI/Codex/bin/23f7d7f110b19ac3",
+        "C:/Users/dev/AppData/Local/Programs/Antigravity",
+    };
+    for (int i = 0; i < PROJECTS + INSTALL_PROJECTS; i++) {
         char project[32];
         char db_path[512];
         char root_path[512];
         snprintf(project, sizeof(project), "lean-project-%02d", i);
         snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-        snprintf(root_path, sizeof(root_path),
-                 "/workspaces/organization/shared/services/lean-project-%02d", i);
+        if (i < PROJECTS) {
+            snprintf(root_path, sizeof(root_path),
+                     "/workspaces/organization/shared/services/lean-project-%02d", i);
+        } else {
+            snprintf(root_path, sizeof(root_path), "%s", install_roots[i - PROJECTS]);
+        }
         cbm_store_t *store = cbm_store_open_path(db_path);
         ASSERT_NOT_NULL(store);
         ASSERT_EQ(cbm_store_upsert_project(store, project, root_path), CBM_STORE_OK);
@@ -6544,6 +6555,9 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     char *json = extract_text_content(json_response);
     char *page_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":5}");
     char *page = extract_text_content(page_response);
+    char *metadata_response =
+        cbm_mcp_handle_tool(srv, "list_projects", "{\"metadata_only\":true,\"format\":\"json\"}");
+    char *metadata = extract_text_content(metadata_response);
 
     bool tree_shape =
         tree && strstr(tree, "projects_refs:") &&
@@ -6558,6 +6572,15 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     bool tree_not_duplicated = tree_response && !strstr(tree_response, "structuredContent");
     bool page_truthful = page && strstr(page, "projects: 5") && strstr(page, "returned: 5") &&
                          strstr(page, "has_more: true") && strstr(page, "next_offset: 5");
+    bool installs_hidden = identity && tree && json && metadata &&
+                           !strstr(identity, "lean-project-12") &&
+                           !strstr(tree, "lean-project-12") && !strstr(json, "lean-project-12") &&
+                           !strstr(metadata, "lean-project-12") &&
+                           !strstr(metadata, "lean-project-13") &&
+                           strstr(metadata, "\"total\":12");
+    char install_db[512];
+    snprintf(install_db, sizeof(install_db), "%s/lean-project-12.db", cache);
+    bool install_preserved = cbm_file_exists(install_db);
     bool json_direct = false;
     bool json_structured = json_response && strstr(json_response, "structuredContent");
     yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
@@ -6579,10 +6602,12 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     free(json_response);
     free(page);
     free(page_response);
+    free(metadata);
+    free(metadata_response);
     cbm_mcp_server_free(srv);
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
-    for (int i = 0; i < PROJECTS; i++) {
+    for (int i = 0; i < PROJECTS + INSTALL_PROJECTS; i++) {
         char project[32];
         snprintf(project, sizeof(project), "lean-project-%02d", i);
         cleanup_project_db(cache, project);
@@ -6596,6 +6621,56 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     ASSERT_TRUE(page_truthful);
     ASSERT_TRUE(json_direct);
     ASSERT_TRUE(json_structured);
+    ASSERT_TRUE(installs_hidden);
+    ASSERT_TRUE(install_preserved);
+    PASS();
+}
+
+TEST(tool_list_projects_preserves_approved_sensitive_root) {
+    char *cache = th_mktempdir("cbm-list-approved");
+    ASSERT_NOT_NULL(cache);
+    char sensitive[512];
+    snprintf(sensitive, sizeof(sensitive), "%s/.ssh", cache);
+    ASSERT_EQ(cbm_mkdir(sensitive), 0);
+    char canonical[4096];
+    ASSERT_TRUE(cbm_canonical_path(sensitive, canonical, sizeof(canonical)));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/approved-sensitive.db", cache);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "approved-sensitive", canonical), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *hidden_response = cbm_mcp_handle_tool(
+        srv, "list_projects", "{\"metadata_only\":true,\"format\":\"json\"}");
+    char *hidden = extract_text_content(hidden_response);
+    bool hidden_without_approval = hidden && strstr(hidden, "\"total\":0");
+    char err[1024];
+    bool granted = cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), canonical, true, false,
+                                         err, sizeof(err));
+    char *approved_response = cbm_mcp_handle_tool(
+        srv, "list_projects", "{\"metadata_only\":true,\"format\":\"json\"}");
+    char *approved = extract_text_content(approved_response);
+    bool visible_with_approval = approved && strstr(approved, "\"total\":1") &&
+                                 strstr(approved, "approved-sensitive");
+
+    free(hidden);
+    free(hidden_response);
+    free(approved);
+    free(approved_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_cleanup(cache);
+
+    ASSERT_TRUE(hidden_without_approval);
+    ASSERT_TRUE(granted);
+    ASSERT_TRUE(visible_with_approval);
     PASS();
 }
 
@@ -28476,6 +28551,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
     RUN_TEST(tool_project_discovery_agrees_across_store_switches_issue1115);
+    RUN_TEST(tool_list_projects_preserves_approved_sensitive_root);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_ingest_traces_stores_observed_calls);

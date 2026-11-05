@@ -205,12 +205,15 @@ TEST(ws_windows_system_trees_are_sensitive) {
     PASS();
 }
 
-TEST(ws_windows_user_programs_tree_has_exact_sensitive_boundaries) {
+TEST(ws_windows_user_application_tree_has_exact_sensitive_boundaries) {
     static const char *const sensitive[] = {
         "C:/Users/dev/AppData/Local/Programs",
         "C:/Users/dev/AppData/Local/Programs/Antigravity",
         "D:/Users/runneradmin/AppData/Local/Programs/Editor",
         "c:\\uSeRs\\Dev\\aPpDaTa\\LoCaL\\pRoGrAmS\\IDE",
+        "C:/Users/dev/AppData/Local/OpenAI/Codex",
+        "C:/Users/neil1/AppData/Local/OpenAI/Codex/bin/23f7d7f110b19ac3",
+        "d:\\uSeRs\\Dev\\aPpDaTa\\LoCaL\\oPeNaI\\cOdEx\\bin\\build",
     };
     for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++) {
         ASSERT_EQ(cbm_workspace_classify_root(sensitive[i], HOME, CACHE),
@@ -224,6 +227,12 @@ TEST(ws_windows_user_programs_tree_has_exact_sensitive_boundaries) {
         "C:/Users/dev/AppData/Local/ProgramsBackup",
         "C:/workspace/Users/dev/AppData/Local/Programs",
         "C:/Users/dev/team/AppData/Local/Programs",
+        "C:/Users/dev/AppData/Local/OpenAI",
+        "C:/Users/dev/AppData/Local/OpenAI/Codex-src",
+        "C:/Users/dev/AppData/Local/OpenAI/CodexBackup",
+        "C:/Users/dev/AppData/Local/OpenAI-src/Codex",
+        "C:/workspace/Users/dev/AppData/Local/OpenAI/Codex",
+        "C:/Users/dev/team/AppData/Local/OpenAI/Codex",
     };
     for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
         ASSERT_EQ(cbm_workspace_classify_root(allowed[i], HOME, CACHE), CBM_WS_ALLOW);
@@ -993,7 +1002,7 @@ SUITE(workspace) {
     RUN_TEST(ws_home_itself_is_sensitive_but_subdirs_are_fine);
     RUN_TEST(ws_credential_directories_are_sensitive_at_any_depth);
     RUN_TEST(ws_windows_system_trees_are_sensitive);
-    RUN_TEST(ws_windows_user_programs_tree_has_exact_sensitive_boundaries);
+    RUN_TEST(ws_windows_user_application_tree_has_exact_sensitive_boundaries);
     RUN_TEST(ws_sensitive_root_explicit_approval_is_preserved);
     RUN_TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant);
     RUN_TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor);
