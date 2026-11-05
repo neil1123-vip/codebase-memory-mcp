@@ -212,15 +212,14 @@ static bool ws_any_component_matches(const char *path, const char *const *names,
     return false;
 }
 
-/* The default per-user Windows application prefix. Match from the drive root,
- * by whole segments, so a project merely containing the same sequence (or a
- * sibling such as Programs-src) is not captured. The second segment is the one
- * and only user name; its spelling is deliberately unrestricted. */
-static bool ws_is_windows_user_programs_tree(const char *path) {
+/* Per-user Windows application trees that contain installed runtimes. Match
+ * whole segments from the drive root, so siblings such as Programs-src or
+ * CodexBackup are not captured. */
+static bool ws_is_windows_user_application_tree(const char *path) {
     if (!ws_is_windows_style(path)) {
         return false;
     }
-    static const char *const expected[] = {"Users", NULL, "AppData", "Local", "Programs"};
+    static const char *const expected[] = {"Users", NULL, "AppData", "Local"};
     const char *p = path + ws_volume_prefix_len(path);
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
         while (ws_is_sep(*p)) {
@@ -237,7 +236,28 @@ static bool ws_is_windows_user_programs_tree(const char *path) {
             return false;
         }
     }
-    return true;
+    while (ws_is_sep(*p)) {
+        p++;
+    }
+    const char *start = p;
+    while (*p && !ws_is_sep(*p)) {
+        p++;
+    }
+    size_t len = (size_t)(p - start);
+    if (ws_component_equals(start, len, "Programs", true)) {
+        return true;
+    }
+    if (!ws_component_equals(start, len, "OpenAI", true)) {
+        return false;
+    }
+    while (ws_is_sep(*p)) {
+        p++;
+    }
+    start = p;
+    while (*p && !ws_is_sep(*p)) {
+        p++;
+    }
+    return ws_component_equals(start, (size_t)(p - start), "Codex", true);
 }
 
 /* strncmp that treats "/" and "\" as the same character. On Windows a
@@ -351,7 +371,7 @@ cbm_ws_verdict_t cbm_workspace_classify_root(const char *canonical_path, const c
         return CBM_WS_DENY_SENSITIVE;
     }
 
-    if (ws_is_windows_user_programs_tree(canonical_path)) {
+    if (ws_is_windows_user_application_tree(canonical_path)) {
         return CBM_WS_DENY_SENSITIVE;
     }
 
