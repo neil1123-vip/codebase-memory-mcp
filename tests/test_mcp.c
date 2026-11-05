@@ -753,6 +753,58 @@ TEST(json_to_tree_keeps_multiline_source_readable) {
     PASS();
 }
 
+TEST(json_to_tree_expands_nested_table_fields_under_their_row) {
+    const char *json =
+        "{\"paths\":["
+        "{\"path\":\"a.c\",\"status\":\"partial\",\"coverage\":["
+        "{\"kind\":\"parse_partial\",\"ranges\":[{\"start\":3,\"end\":5},{\"start\":9,\"end\":9}],"
+        "\"ranges_truncated\":true,\"reasons\":{\"bad\\u0000key\":2}}]},"
+        "{\"coverage\":[],\"status\":\"null\",\"path\":\"b.c\"}],"
+        "\"path_total\":3,\"path_returned\":2,\"path_has_more\":true,\"path_next_offset\":2}";
+    char *tree = cbm_json_to_tree(json);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_STR_EQ(tree, "paths: 2  (cols: path status)\n"
+                        "  a.c partial\n"
+                        "    coverage: 1  (cols: kind ranges_truncated)\n"
+                        "      parse_partial true\n"
+                        "        ranges: 2  (cols: start end)\n"
+                        "          3 5\n"
+                        "          9 9\n"
+                        "        reasons:\n"
+                        "          \"bad\\u0000key\": 2\n"
+                        "  b.c \"null\"\n"
+                        "    coverage: 0\n"
+                        "path_total: 3\n"
+                        "path_returned: 2\n"
+                        "path_has_more: true\n"
+                        "path_next_offset: 2\n");
+    free(tree);
+    PASS();
+}
+
+TEST(json_to_tree_keeps_mixed_and_container_only_rows_distinct) {
+    const char *json =
+        "{\"rows\":[{\"id\":1,\"value\":[{\"n\":3}]},{\"id\":2,\"value\":null}],"
+        "\"nested\":[{\"value\":[]},{\"value\":{}}]}";
+    char *tree = cbm_json_to_tree(json);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_STR_EQ(tree, "rows: 2\n"
+                        "  -\n"
+                        "    id: 1\n"
+                        "    value: 1  (cols: n)\n"
+                        "      3\n"
+                        "  -\n"
+                        "    id: 2\n"
+                        "    value: null\n"
+                        "nested: 2\n"
+                        "  -\n"
+                        "    value: 0\n"
+                        "  -\n"
+                        "    value:\n");
+    free(tree);
+    PASS();
+}
+
 TEST(json_to_tree_quotes_dynamic_keys_without_line_injection) {
     const char *json = "{\"bad\\nkey\":{\"colon:key\":1,\"\":2},"
                        "\"rows\":[{\"col\\tname\":\"x\",\"close)\":\"y\"}]}";
@@ -7390,6 +7442,27 @@ TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics) {
     ASSERT_NULL(strstr(inner, "\"detail\":\"11-19,27\""));
     ASSERT_NULL(strstr(inner, "path-20.c"));
     yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    (void)snprintf(args + used, sizeof(args) - used,
+                   "],\"path_limit\":1,\"scopes\":[\".\"],\"scope_limit\":1,\"format\":\"tree\"}");
+    response = cbm_mcp_handle_tool(srv, "check_index_coverage", args);
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "paths: 1  (cols:"));
+    ASSERT_NOT_NULL(strstr(inner, "\n    coverage: 1  (cols: path kind match)\n"));
+    ASSERT_NOT_NULL(strstr(inner, "\n        ranges: 2  (cols: start end)\n"
+                                 "          11 19\n"
+                                 "          27 27\n"));
+    ASSERT_NOT_NULL(strstr(inner, "\n    entries: 1  (cols: path kind)\n"));
+    ASSERT_NOT_NULL(strstr(inner, "\npath_total: 25\npath_returned: 1\npath_has_more: true\n"
+                                 "path_next_offset: 1\n"));
+    ASSERT_NOT_NULL(strstr(inner, "\nscope_total: 1\nscope_returned: 1\nscope_truncated: false\n"
+                                 "has_more: false\n"));
+    ASSERT_NULL(strstr(inner, "[{"));
+    ASSERT_NULL(strstr(inner, "path-01.c"));
     free(inner);
     free(response);
 
@@ -28894,6 +28967,8 @@ SUITE(mcp) {
     RUN_TEST(output_text_accepts_embedded_nul_as_valid_utf8);
     RUN_TEST(json_to_tree_uses_header_once_rows_without_losing_metadata);
     RUN_TEST(json_to_tree_keeps_multiline_source_readable);
+    RUN_TEST(json_to_tree_expands_nested_table_fields_under_their_row);
+    RUN_TEST(json_to_tree_keeps_mixed_and_container_only_rows_distinct);
     RUN_TEST(json_to_tree_quotes_dynamic_keys_without_line_injection);
     RUN_TEST(json_to_tree_preserves_embedded_nul_keys_values_and_table_cells);
     RUN_TEST(tree_table_uses_prefix_dictionary_only_when_it_materially_wins);

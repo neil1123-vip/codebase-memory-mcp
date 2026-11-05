@@ -1028,6 +1028,7 @@ static bool json_tree_array_is_object_table(yyjson_val *array, yyjson_val **firs
         return false;
     }
     size_t expected = yyjson_obj_size(first);
+    bool has_scalar = false;
     size_t index;
     size_t maximum;
     yyjson_val *item;
@@ -1038,15 +1039,17 @@ static bool json_tree_array_is_object_table(yyjson_val *array, yyjson_val **firs
         size_t key_index;
         size_t key_maximum;
         yyjson_val *key;
-        yyjson_val *unused;
-        yyjson_obj_foreach(first, key_index, key_maximum, key, unused) {
-            if (!yyjson_obj_getn(item, yyjson_get_str(key), yyjson_get_len(key))) {
+        yyjson_val *first_cell;
+        yyjson_obj_foreach(first, key_index, key_maximum, key, first_cell) {
+            yyjson_val *cell = yyjson_obj_getn(item, yyjson_get_str(key), yyjson_get_len(key));
+            if (!cell || yyjson_is_ctn(cell) != yyjson_is_ctn(first_cell)) {
                 return false;
             }
+            has_scalar |= !yyjson_is_ctn(cell);
         }
     }
     *first_out = first;
-    return true;
+    return has_scalar;
 }
 
 static void json_tree_value(cbm_sb_t *sb, const char *key_name, size_t key_len, yyjson_val *value,
@@ -1066,8 +1069,11 @@ static void json_tree_object_table(cbm_sb_t *sb, const char *key_name, size_t ke
     size_t key_index;
     size_t key_maximum;
     yyjson_val *column;
-    yyjson_val *unused;
-    yyjson_obj_foreach(first, key_index, key_maximum, column, unused) {
+    yyjson_val *first_value;
+    yyjson_obj_foreach(first, key_index, key_maximum, column, first_value) {
+        if (yyjson_is_ctn(first_value)) {
+            continue;
+        }
         cbm_sb_append_n(sb, " ", 1);
         append_key_n(sb, yyjson_get_str(column), yyjson_get_len(column));
     }
@@ -1079,7 +1085,10 @@ static void json_tree_object_table(cbm_sb_t *sb, const char *key_name, size_t ke
     yyjson_arr_foreach(array, row_index, row_maximum, row) {
         json_tree_indent(sb, depth + 1);
         bool first_cell = true;
-        yyjson_obj_foreach(first, key_index, key_maximum, column, unused) {
+        yyjson_obj_foreach(first, key_index, key_maximum, column, first_value) {
+            if (yyjson_is_ctn(first_value)) {
+                continue;
+            }
             if (!first_cell) {
                 cbm_sb_append_n(sb, " ", 1);
             }
@@ -1088,6 +1097,15 @@ static void json_tree_object_table(cbm_sb_t *sb, const char *key_name, size_t ke
             first_cell = false;
         }
         cbm_sb_append_n(sb, "\n", 1);
+        /* Child fields stay under their owning row instead of becoming JSON strings. */
+        yyjson_obj_foreach(first, key_index, key_maximum, column, first_value) {
+            if (yyjson_is_ctn(first_value)) {
+                yyjson_val *cell = yyjson_obj_getn(row, yyjson_get_str(column),
+                                                  yyjson_get_len(column));
+                json_tree_value(sb, yyjson_get_str(column), yyjson_get_len(column), cell,
+                                depth + 2);
+            }
+        }
     }
 }
 

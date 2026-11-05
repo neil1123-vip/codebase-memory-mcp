@@ -76,8 +76,8 @@ void cbm_tree_table_rows_profiled(cbm_sb_t *sb, const char *key, int nrows, cons
                                   const bool *prefix_cols);
 
 /* Convert an arbitrary JSON value to the compact tree representation used by
- * lean MCP responses. Homogeneous object arrays become header-once tables;
- * nested values remain lossless JSON cells. Returns a heap string. */
+ * lean MCP responses. Homogeneous object arrays share scalar column headers;
+ * nested fields expand below their owning row. Returns a heap string. */
 char *cbm_json_to_tree(const char *json);
 
 #endif /* CBM_MCP_COMPACT_OUT_H */
