@@ -365,6 +365,28 @@ describe('readCoverageAnswer', () => {
         expect(index.records.get('unknown.c')?.reason).toBe('');
     });
 
+    it('preserves compact call summaries for scopes and paths without replacing full diagnostics', () => {
+        const entries = [
+            { path: 'calls.c', kind: 'unresolved_calls', count: 200, count_relation: 'gte', reasons: { function_not_in_registry: 199, unknown: 1, invalid: 'many' } },
+            { path: 'exact.c', kind: 'unresolved_calls', count: 0, count_relation: 'eq', reasons: {} },
+            { path: 'missing.c', kind: 'unresolved_calls', summary_unavailable: true },
+            { path: 'legacy.c', kind: 'unresolved_calls', detail: 'original diagnostics', count: 1, count_relation: 'eq' },
+            { path: 'invalid.c', kind: 'unresolved_calls', count: -1, count_relation: 'gte' },
+        ];
+        const parsed = readCoverageAnswer({
+            scopes: [{ scope: '.', entries }],
+            paths: [{ path: 'calls.c', coverage: [entries[0]] }],
+        });
+        const expected = 'At least 200 unresolved calls: function_not_in_registry: 199, unknown: 1';
+        const index = buildCoverageIndex({ scopes: parsed.scopes });
+        expect(index.records.get('calls.c')?.reason).toBe(expected);
+        expect(parsed.paths[0]?.coverage[0]?.detail).toBe(expected);
+        expect(index.records.get('exact.c')?.reason).toBe('0 unresolved calls');
+        expect(index.records.get('missing.c')?.reason).toBe('Unresolved call summary unavailable');
+        expect(index.records.get('legacy.c')?.reason).toBe('original diagnostics');
+        expect(index.records.get('invalid.c')?.reason).toBe('');
+    });
+
     it('liest den Scope samt Seitenansage', () => {
         expect(answer.scopes[0]?.scope).toBe('.');
         expect(answer.scopes[0]?.total).toBe(3);

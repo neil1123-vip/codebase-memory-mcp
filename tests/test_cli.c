@@ -15468,10 +15468,7 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     PASS();
 }
 
-/* A search that found symbols closes with cbm's own follow-up line, after the
- * untrusted symbol list and on its own line, naming the graph tools for the
- * next question; it carries no repository-derived value. */
-TEST(cli_hook_augment_context_names_graph_follow_ups) {
+TEST(cli_hook_augment_context_omits_repeated_tool_guidance) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -15498,14 +15495,11 @@ TEST(cli_hook_augment_context_names_graph_follow_ups) {
     ASSERT_FALSE(is_error);
     ASSERT_NOT_NULL(ctx);
     const char *list = strstr(ctx, "\n- hookproj.mod.someIndexedSymbol");
-    const char *follow = strstr(ctx, "\n[codebase-memory] For these symbols, trace_path lists "
-                                     "callers and callees, get_code_snippet returns the exact "
-                                     "source, and search_graph finds related symbols by name.");
     ASSERT_NOT_NULL(list);
-    ASSERT_NOT_NULL(follow);
-    ASSERT_TRUE(follow > list);
-    ASSERT_NULL(strstr(follow, "someIndexedSymbol"));
-    ASSERT_NULL(strstr(follow, "mod.py"));
+    ASSERT_NOT_NULL(strstr(ctx, "mod.py"));
+    ASSERT_NOT_NULL(strstr(ctx, "untrusted repository metadata"));
+    ASSERT_NULL(strstr(ctx, "For these symbols"));
+    ASSERT_NULL(strstr(ctx, "trace_path lists"));
     free(ctx);
     free(envelope);
     cbm_mcp_server_free(srv);
@@ -16294,6 +16288,181 @@ TEST(cli_hook_augment_cline_lifecycle_contract) {
     }
     ASSERT_NULL(cbm_hook_augment_lifecycle_json_for_dialect("{\"hookName\":\"SubagentStart\"}",
                                                             "SubagentStart", "cline"));
+    PASS();
+}
+
+TEST(cli_hook_augment_repeats_only_after_session_or_context_changes) {
+    static const struct {
+        const char *dialect;
+        const char *event;
+        const char *reset;
+        const char *identity;
+    } cases[] = {
+        {"devin", "UserPromptSubmit", "PostCompaction", "session_id"},
+        {"cline", "UserPromptSubmit", "TaskResume", "taskId"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char input[512], switched[512], reset[512], other_session[512];
+        snprintf(input, sizeof(input),
+                 "{\"cwd\":\"/unindexed/hook-cache-a\",\"%s\":\"hook-cache-%zu\"}",
+                 cases[i].identity, i);
+        char *output = cbm_hook_augment_lifecycle_json_for_dialect(
+            input, cases[i].event, cases[i].dialect);
+        ASSERT_NOT_NULL(output);
+        ASSERT_NOT_NULL(strstr(output, "check_index_coverage"));
+        free(output);
+        ASSERT_NULL(cbm_hook_augment_lifecycle_json_for_dialect(
+            input, cases[i].event, cases[i].dialect));
+
+        snprintf(other_session, sizeof(other_session),
+                 "{\"cwd\":\"/unindexed/hook-cache-a\",\"%s\":\"hook-cache-other-%zu\"}",
+                 cases[i].identity, i);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(
+            other_session, cases[i].event, cases[i].dialect);
+        ASSERT_NOT_NULL(output);
+        free(output);
+        snprintf(switched, sizeof(switched),
+                 "{\"cwd\":\"/unindexed/hook-cache-b\",\"%s\":\"hook-cache-%zu\"}",
+                 cases[i].identity, i);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(
+            switched, cases[i].event, cases[i].dialect);
+        ASSERT_NOT_NULL(output);
+        free(output);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(
+            input, cases[i].event, cases[i].dialect);
+        ASSERT_NOT_NULL(output);
+        free(output);
+
+        snprintf(reset, sizeof(reset),
+                 "{\"cwd\":\"/unindexed/hook-cache-a\",\"%s\":\"hook-cache-%zu\","
+                 "\"source\":\"compact\"}", cases[i].identity, i);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(
+            reset, cases[i].reset, cases[i].dialect);
+        ASSERT_NOT_NULL(output);
+        ASSERT_NOT_NULL(strstr(output, "search_graph"));
+        free(output);
+        ASSERT_NULL(cbm_hook_augment_lifecycle_json_for_dialect(
+            input, cases[i].event, cases[i].dialect));
+    }
+
+    const char *shared = "{\"cwd\":\"/unindexed/hook-cache\","
+                         "\"session_id\":\"hook-cache-shared\"}";
+    static const char *const dialects[] = {"devin", "cline"};
+    for (size_t i = 0; i < 2; i++) {
+        char *output = cbm_hook_augment_lifecycle_json_for_dialect(
+            shared, "UserPromptSubmit", dialects[i]);
+        ASSERT_NOT_NULL(output);
+        free(output);
+        ASSERT_NULL(cbm_hook_augment_lifecycle_json_for_dialect(
+            shared, "UserPromptSubmit", dialects[i]));
+    }
+    const char *subagent = "{\"cwd\":\"/unindexed/hook-cache\","
+                           "\"session_id\":\"hook-cache-shared\",\"agent_type\":\"auditor\"}";
+    for (int i = 0; i < 2; i++) {
+        char *output =
+            cbm_hook_augment_lifecycle_json_for_dialect(subagent, "SubagentStart", "qoder");
+        ASSERT_NOT_NULL(output);
+        ASSERT_NOT_NULL(strstr(output, "Tier 3"));
+        free(output);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(
+            "{\"cwd\":\"/unindexed/hook-cache\"}", "UserPromptSubmit", "devin");
+        ASSERT_NOT_NULL(output);
+        free(output);
+        output = cbm_hook_augment_lifecycle_json_for_dialect(shared, "SessionStart", "devin");
+        ASSERT_NOT_NULL(output);
+        free(output);
+        ASSERT_NULL(cbm_hook_augment_lifecycle_json_for_dialect(
+            shared, "UserPromptSubmit", "devin"));
+    }
+    PASS();
+}
+
+TEST(cli_hook_augment_turn_only_clients_keep_short_reset_safe_guidance) {
+    static const char *const dialects[] = {"hermes", "kimi"};
+    static const char *const events[] = {"pre_llm_call", "UserPromptSubmit"};
+    for (size_t i = 0; i < 2; i++) {
+        char input[256], compact[256];
+        snprintf(input, sizeof(input), "{\"cwd\":\"/unindexed/turn-only\","
+                                       "\"session_id\":\"turn-only-%zu\"}", i);
+        char *first =
+            cbm_hook_augment_lifecycle_json_for_dialect(input, events[i], dialects[i]);
+        char *again =
+            cbm_hook_augment_lifecycle_json_for_dialect(input, events[i], dialects[i]);
+        ASSERT_NOT_NULL(first);
+        ASSERT_NOT_NULL(again);
+        ASSERT_LT(strlen(again), strlen(first));
+        ASSERT_NOT_NULL(strstr(again, "search_graph"));
+        ASSERT_NOT_NULL(strstr(again, "check_index_coverage"));
+        ASSERT_NOT_NULL(strstr(again, "missed lines"));
+        ASSERT_NOT_NULL(strstr(again, "index_repository"));
+        snprintf(compact, sizeof(compact), "{\"cwd\":\"/unindexed/turn-only\","
+                                           "\"session_id\":\"turn-only-%zu\","
+                                           "\"source\":\"compact\"}", i);
+        char *reset =
+            cbm_hook_augment_lifecycle_json_for_dialect(compact, events[i], dialects[i]);
+        ASSERT_NOT_NULL(reset);
+        ASSERT_STR_EQ(reset, first);
+        free(first);
+        free(again);
+        free(reset);
+    }
+    PASS();
+}
+
+TEST(cli_hook_augment_cache_preserves_worktree_policy) {
+    char *tmpdir = th_mktempdir("cbm-hook-cache-wt");
+    ASSERT_NOT_NULL(tmpdir);
+    char cache[512], worktree[512], gitdir[512], path[600];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(worktree, sizeof(worktree), "%s/worktree", tmpdir);
+    snprintf(gitdir, sizeof(gitdir), "%s/git-meta", tmpdir);
+    cbm_normalize_path_sep(worktree);
+    ASSERT_EQ(test_mkdirp(cache), 0);
+    ASSERT_EQ(test_mkdirp(worktree), 0);
+    ASSERT_EQ(test_mkdirp(gitdir), 0);
+    snprintf(path, sizeof(path), "%s/.git", worktree);
+    ASSERT_EQ(write_test_file(path, "gitdir: ../git-meta\n"), 0);
+    snprintf(path, sizeof(path), "%s/commondir", gitdir);
+    ASSERT_EQ(write_test_file(path, "..\n"), 0);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    static const char *const dialects[] = {"devin", "hermes", "kimi"};
+    bool policy_kept = true;
+    for (int phase = 0; phase < 3; phase++) {
+        cbm_config_t *cfg = cbm_config_open(cache);
+        policy_kept &= cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES,
+                                            phase ? "true" : "false") == 0;
+        cbm_config_close(cfg);
+        if (phase == 2) {
+            snprintf(path, sizeof(path), "%s/cache-parent.db", cache);
+            cbm_store_t *store = cbm_store_open_path(path);
+            policy_kept &= store &&
+                           cbm_store_upsert_project(store, "cache-parent", tmpdir) == CBM_STORE_OK;
+            cbm_store_close(store);
+        }
+        for (size_t i = 0; i < 3; i++) {
+            char input[1024];
+            snprintf(input, sizeof(input), "{\"cwd\":\"%s\",\"session_id\":\"wt-policy-%zu\"}",
+                     worktree, i);
+            const char *event = i == 1 ? "pre_llm_call" : "UserPromptSubmit";
+            char *first = cbm_hook_augment_lifecycle_json_for_dialect(input, event, dialects[i]);
+            char *again = cbm_hook_augment_lifecycle_json_for_dialect(input, event, dialects[i]);
+            const char *expected = phase ? "ignore_worktrees is enabled" : "Run index_repository";
+            policy_kept &= phase == 2 && i == 0
+                               ? first == NULL
+                               : first && strstr(first, expected) && !strstr(first, "cache-parent");
+            policy_kept &= i == 0 ? again == NULL
+                                 : again && strstr(again, expected) &&
+                                       !strstr(again, "cache-parent") &&
+                                       (!phase || !strstr(again, "Run index_repository"));
+            free(first);
+            free(again);
+        }
+    }
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    th_cleanup(tmpdir);
+    ASSERT_TRUE(policy_kept);
     PASS();
 }
 
@@ -17700,6 +17869,10 @@ TEST(cli_installed_skill_limits_match_server_contract) {
     ASSERT(strstr(installed[0].content, "default to 50") != NULL);
     ASSERT(strstr(installed[0].content, "200-row cap") == NULL);
     ASSERT(strstr(installed[0].content, "default to 10") == NULL);
+    ASSERT(strstr(installed[0].content, "Reuse the known project") != NULL);
+    ASSERT(strstr(installed[0].content, "get_graph_schema` only when") != NULL);
+    ASSERT(strstr(installed[0].content, "Recheck freshness after") != NULL);
+    ASSERT(strstr(installed[0].content, "call `check_index_coverage` once") != NULL);
     PASS();
 }
 
@@ -21334,7 +21507,7 @@ SUITE(cli) {
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
-    RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
+    RUN_TEST(cli_hook_augment_context_omits_repeated_tool_guidance);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
     RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
     RUN_TEST(cli_hook_augment_copilot_posttooluse_search);
@@ -21354,6 +21527,9 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_kimi_user_prompt_contract);
     RUN_TEST(cli_hook_augment_devin_lifecycle_contract);
     RUN_TEST(cli_hook_augment_cline_lifecycle_contract);
+    RUN_TEST(cli_hook_augment_repeats_only_after_session_or_context_changes);
+    RUN_TEST(cli_hook_augment_turn_only_clients_keep_short_reset_safe_guidance);
+    RUN_TEST(cli_hook_augment_cache_preserves_worktree_policy);
     RUN_TEST(cli_hook_upsert_rejects_malformed_settings);
     RUN_TEST(cli_hook_upsert_rejects_concurrent_same_event_update);
 #ifndef _WIN32
