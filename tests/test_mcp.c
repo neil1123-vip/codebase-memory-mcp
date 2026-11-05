@@ -21906,6 +21906,49 @@ TEST(snippet_exact_qn) {
     PASS();
 }
 
+TEST(snippet_coverage_notes_stay_compact_and_keep_risks) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 1, 100),
+              CBM_STORE_OK);
+    const char *kinds[] = {"parse_partial", "parse_unusable"};
+    for (int i = 0; i < 2; i++) {
+        const cbm_coverage_row_t row = {
+            .rel_path = "main.go", .kind = kinds[i], .detail = "3-5,7-9"};
+        ASSERT_EQ(cbm_store_coverage_replace(store, "test-project", &row, 1), CBM_STORE_OK);
+        char *resp = call_snippet(
+            srv, "{\"qualified_name\":\"HandleRequest\",\"project\":\"test-project\"}");
+        ASSERT_NOT_NULL(resp);
+        yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+        ASSERT_NOT_NULL(source);
+        ASSERT_NOT_NULL(strstr(source, "return nil"));
+        const char *note = yyjson_get_str(yyjson_obj_get(root, "coverage_note"));
+        ASSERT_NOT_NULL(note);
+        ASSERT_LT(strlen(note), 170);
+        ASSERT_NOT_NULL(strstr(note, "source"));
+        ASSERT_NOT_NULL(strstr(note, "best-effort"));
+        ASSERT_NOT_NULL(strstr(note, "graph"));
+        if (i == 0) {
+            ASSERT_NOT_NULL(strstr(note, "PARTIALLY indexed"));
+            ASSERT_NOT_NULL(strstr(note, "3-5,7-9"));
+            ASSERT_NOT_NULL(strstr(note, "callers/callees"));
+        } else {
+            ASSERT_NOT_NULL(strstr(note, "most constructs are missing"));
+            ASSERT_NULL(strstr(note, "3-5,7-9"));
+        }
+        yyjson_doc_free(doc);
+        free(resp);
+    }
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* Doc -> code candidates on get_code_snippet: a Section lists the functions
  * it is possibly about (highest p first, evidence included), a function the
  * sections that possibly describe it; a row whose other end no longer exists
@@ -28615,6 +28658,7 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_coverage_notes_stay_compact_and_keep_risks);
     RUN_TEST(snippet_doc_candidates_both_directions);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);

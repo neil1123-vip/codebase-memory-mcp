@@ -14199,16 +14199,13 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
         char note[CBM_SZ_1K];
         if (strcmp(rows[i].kind, "parse_unusable") == 0) {
             snprintf(note, sizeof(note),
-                     "The parse of this file failed across nearly the whole of it, so most "
-                     "constructs are missing from the graph and naming line ranges would not "
-                     "help. Read the source directly — the source above is ground truth. "
+                     "Parsing failed for most of this file; most constructs are missing from "
+                     "the graph. Read the source directly. "
                      "(best-effort signal)");
         } else if (strcmp(rows[i].kind, "parse_partial") == 0) {
             snprintf(note, sizeof(note),
-                     "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                     "parsed, so constructs there may be missing from the graph (callers/callees "
-                     "and search results can under-report this file). The source above is ground "
-                     "truth. (best-effort signal)",
+                     "PARTIALLY indexed: unparsed lines %s; graph search and callers/callees "
+                     "may omit constructs. Verify against the source. (best-effort signal)",
                      rows[i].detail && rows[i].detail[0] ? rows[i].detail : "?");
         } else {
             continue;
