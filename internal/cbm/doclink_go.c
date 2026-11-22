@@ -61,6 +61,7 @@
 #include "foundation/arena.h"
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
+#include "foundation/sha256.h"
 #include "tree_sitter/api.h"
 
 #include <stdbool.h>
@@ -1233,6 +1234,7 @@ typedef struct {
     go_claim_t *claims;
     int nclaims;
     int claims_cap;
+    bool unsafe_build_import;
     bool failed;
 } go_scan_t;
 
@@ -1724,6 +1726,8 @@ static void go_scan_import_spec(go_scan_t *s, TSNode spec) {
     const char *path =
         go_import_path(s, ts_node_child_by_field_name(spec, TS_FIELD("path")), &path_len);
     TSNode name = ts_node_child_by_field_name(spec, TS_FIELD("name"));
+    if (!path || (path_len == 1 && path[0] == 'C') || go_kind_is(name, "dot"))
+        s->unsafe_build_import = true;
     size_t len = 0;
     const char *local = go_node_span(s, name, &len);
     if (ts_node_is_null(name)) {
@@ -1934,6 +1938,7 @@ static const char *go_blob(go_scan_t *s) {
 typedef struct {
     const char *pkg;
     size_t pkg_len;
+    uint32_t pkg_end;
     bool seen_package;
     bool ignored;
     bool constrained;
@@ -1953,6 +1958,7 @@ static void go_scan_top(go_scan_t *s, TSNode ch, go_head_t *h) {
         if (!h->pkg && ts_node_named_child_count(ch) > 0) {
             const char *t = go_node_span(s, ts_node_named_child(ch, 0), &h->pkg_len);
             h->pkg = go_is_ident(t, h->pkg_len) ? t : NULL;
+            h->pkg_end = ts_node_end_byte(ch);
         }
     } else if (go_kind_is(ch, "import_declaration")) {
         go_scan_imports(s, ch);
@@ -1999,6 +2005,10 @@ const char *cbm_doclink_go_scan_scope(CBMExtractCtx *ctx) {
         go_head_flags(&h, flags);
         (void)go_push_rec(&s,
                           cbm_arena_sprintf(s.tmp, "P\t%.*s\t%s", (int)h.pkg_len, h.pkg, flags));
+        if (ctx->result && !h.has_error && !h.ignored && !s.unsafe_build_import && h.pkg_end > 0 &&
+            h.pkg_end <= (uint32_t)ctx->source_len) {
+            cbm_sha256_hex(ctx->source, h.pkg_end, ctx->result->go_build_header_sha256);
+        }
     }
     go_finish_claims(&s);
     return go_blob(&s);

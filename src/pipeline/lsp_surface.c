@@ -48,8 +48,12 @@
  * inputs (the def's type texts, the file's imports in "dl" / "py"), which
  * the planner's probe computes exactly as a full index does; the outputs
  * also depend on other files' type definitions, which the planner gates
- * itself (closure_identity_decline, pipeline_incremental.c). */
-enum { SURFACE_CODEC_VERSION = 5 };
+ * itself (closure_identity_decline, pipeline_incremental.c).
+ * 6: Go underlying types and declaration-side import maps survive restoration;
+ * a version-5 surface cannot prove named function/container shapes. Raw Go
+ * imports feed the hash, and resolved maps are stored with identities.
+ * 7: generic Go declarations survive the shared-registry restoration path. */
+enum { SURFACE_CODEC_VERSION = 7 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -89,6 +93,32 @@ static void add_str_array_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, cons
         }
     }
     yyjson_mut_obj_add_val(doc, obj, key, arr);
+}
+
+static bool surface_go_type_imports_valid(const CBMLSPDef *def) {
+    const char **names = def->go_type_import_names;
+    const char **qns = def->go_type_import_qns;
+    if ((def->go_underlying_type || def->go_generic_declaration || names || qns) &&
+        def->lang != CBM_LANG_GO)
+        return false;
+    if (def->go_underlying_type && !def->go_underlying_type[0])
+        return false;
+    if (def->go_generic_declaration && !def->go_generic_declaration[0])
+        return false;
+    if (!names || !qns)
+        return !names && !qns;
+    if (!def->go_underlying_type && !def->go_generic_declaration &&
+        (!def->return_types || !strchr(def->return_types, '.')) &&
+        (!def->embedded_types || !strchr(def->embedded_types, '.')) &&
+        (!def->field_defs || !strchr(def->field_defs, '.')))
+        return false;
+    int i = 0;
+    for (; names[i] && qns[i]; i++) {
+        /* The writer sorts unique locals; a duplicate must never pick a QN. */
+        if (!names[i][0] || !qns[i][0] || (i && strcmp(names[i - 1], names[i]) >= 0))
+            return false;
+    }
+    return !names[i] && !qns[i];
 }
 
 /* The namespace payload is content-only. Its ordered records never depend on
@@ -806,9 +836,8 @@ int cbm_lsp_surface_scope_from_json(CBMArena *arena, const char *json, cbm_lsp_s
 
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
  * symbols from its raw extraction defs. Returns the JSON string (malloc'd, or
- * from `alc` when given) and its length. With identities, each def's
- * declared-type identities ("ty") are written as well: the stored row carries
- * them, the hashed bytes do not. */
+ * from `alc` when given) and its length. With identities, the stored row also
+ * carries declared-type identities and resolved Go import maps. */
 static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage language,
                                   const char *rel_path, const CBMLSPDef *defs, int def_count,
                                   bool identities, const yyjson_alc *alc, size_t *out_len) {
@@ -828,6 +857,10 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
     yyjson_mut_val *lsp = yyjson_mut_arr(doc);
     for (int i = 0; i < def_count; i++) {
         const CBMLSPDef *d = &defs[i];
+        if (!surface_go_type_imports_valid(d)) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
         yyjson_mut_val *o = yyjson_mut_obj(doc);
         add_str_or_null(doc, o, "qn", d->qualified_name);
         add_str_or_null(doc, o, "sn", d->short_name);
@@ -852,6 +885,14 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         if (identities && d->type_scope) {
             yyjson_mut_obj_add_str(doc, o, "ty", d->type_scope);
         }
+        add_str_or_null(doc, o, "gu", d->go_underlying_type);
+        add_str_or_null(doc, o, "gd", d->go_generic_declaration);
+        if (d->go_source_path) {
+            add_str_or_null(doc, o, "gsp", d->go_source_path);
+            add_str_or_null(doc, o, "gpk", d->go_source_package);
+        }
+        add_str_array_or_null(doc, o, "gin", identities ? d->go_type_import_names : NULL, -1);
+        add_str_array_or_null(doc, o, "giq", identities ? d->go_type_import_qns : NULL, -1);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -871,6 +912,25 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         }
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
+
+    /* The probe has source imports but no graph-derived package QNs. */
+    if (language == CBM_LANG_GO && result && result->imports.count > 0) {
+        yyjson_mut_val *imports = yyjson_mut_arr(doc);
+        for (int i = 0; imports && i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            yyjson_mut_val *entry = yyjson_mut_arr(doc);
+            if (!entry || !surface_arr_add_str_or_null(doc, entry, imp->local_name) ||
+                !surface_arr_add_str_or_null(doc, entry, imp->module_path) ||
+                !yyjson_mut_arr_append(imports, entry)) {
+                yyjson_mut_doc_free(doc);
+                return NULL;
+            }
+        }
+        if (!imports || !yyjson_mut_obj_add_val(doc, root, "go_imports", imports)) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
+    }
 
     yyjson_mut_val *swift = NULL;
     for (int i = 0; result && i < result->defs.count; i++) {
@@ -1030,7 +1090,7 @@ static void surface_row_build(int i, void *arg) {
     const CBMLSPDef *slice = job->all_defs ? job->all_defs + start : NULL;
     bool identities = false;
     for (int d = 0; slice && d < end - start && !identities; d++) {
-        identities = slice[d].type_scope != NULL;
+        identities = slice[d].type_scope || slice[d].go_type_import_names;
     }
     size_t json_len = 0;
     /* The hash covers the row without identities; a row that has some is
@@ -1201,6 +1261,61 @@ static const char **arena_str_array(CBMArena *arena, yyjson_val *arr, bool null_
     return items;
 }
 
+static bool surface_go_type_fields_from_json(CBMArena *arena, yyjson_val *object,
+                                               CBMLSPDef *def) {
+    const char *underlying = NULL;
+    const char *declaration = NULL;
+    if (yyjson_obj_get(object, "gsp") || yyjson_obj_get(object, "gpk")) {
+        const char *path = NULL, *package = NULL;
+        if (def->lang != CBM_LANG_GO ||
+            !surface_py_string(surface_unique_field(object, "gsp"), false, &path) || !path[0] ||
+            !surface_py_string(surface_unique_field(object, "gpk"), false, &package) || !package[0])
+            return false;
+        def->go_source_path = cbm_arena_strdup(arena, path);
+        def->go_source_package = cbm_arena_strdup(arena, package);
+        if (!def->go_source_path || !def->go_source_package)
+            return false;
+    }
+    yyjson_val *names = surface_unique_field(object, "gin");
+    yyjson_val *qns = surface_unique_field(object, "giq");
+    if (!surface_py_string(surface_unique_field(object, "gu"), true, &underlying) ||
+        !surface_py_string(surface_unique_field(object, "gd"), true, &declaration) ||
+        !names || !qns)
+        return false;
+    def->go_underlying_type = underlying ? cbm_arena_strdup(arena, underlying) : NULL;
+    if (underlying && !def->go_underlying_type)
+        return false;
+    def->go_generic_declaration = declaration ? cbm_arena_strdup(arena, declaration) : NULL;
+    if (declaration && !def->go_generic_declaration)
+        return false;
+    if (yyjson_is_null(names) || yyjson_is_null(qns))
+        return yyjson_is_null(names) && yyjson_is_null(qns) &&
+               surface_go_type_imports_valid(def);
+    if (!yyjson_is_arr(names) || !yyjson_is_arr(qns) ||
+        yyjson_arr_size(names) != yyjson_arr_size(qns) || yyjson_arr_size(names) >= INT_MAX)
+        return false;
+    yyjson_val *arrays[] = {names, qns};
+    for (size_t i = 0; i < sizeof(arrays) / sizeof(arrays[0]); i++) {
+        yyjson_arr_iter iter = yyjson_arr_iter_with(arrays[i]);
+        yyjson_val *entry;
+        while ((entry = yyjson_arr_iter_next(&iter))) {
+            const char *text = NULL;
+            if (!surface_py_string(entry, false, &text) || !text[0])
+                return false;
+        }
+    }
+    int count = 0;
+    def->go_type_import_names = arena_str_array(arena, names, true, &count);
+    def->go_type_import_qns = arena_str_array(arena, qns, true, &count);
+    if (!def->go_type_import_names || !def->go_type_import_qns)
+        return false;
+    for (int i = 0; i < count; i++) {
+        if (!def->go_type_import_names[i] || !def->go_type_import_qns[i])
+            return false;
+    }
+    return surface_go_type_imports_valid(def);
+}
+
 int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLSPDef **out_defs) {
     *out_defs = NULL;
     if (!defs_json) {
@@ -1263,9 +1378,10 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
         d->type_scope = arena_str_or_null(arena, yyjson_obj_get(o, "ty"));
-        if (!d->qualified_name || !d->short_name || !d->label) {
-            /* A def the writer could not have produced: qn/sn/label are
-             * unconditionally present in build_lsp_def output. Corrupt row. */
+        if (!d->qualified_name || !d->short_name || !d->label ||
+            !surface_go_type_fields_from_json(arena, o, d)) {
+            /* A def the writer could not have produced: required identity or
+             * declaration-side Go type evidence is corrupt. */
             yyjson_doc_free(doc);
             return -1;
         }

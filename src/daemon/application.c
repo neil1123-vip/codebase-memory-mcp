@@ -241,6 +241,9 @@ struct cbm_daemon_application {
     cbm_project_lock_manager_t *project_locks;
     size_t physical_job_limit;
     size_t aggregate_memory_budget_bytes;
+#ifdef _WIN64
+    bool go_prewarm_active;
+#endif
     size_t active_mutations;
     size_t update_owners;
     cbm_daemon_application_update_worker_t update_worker;
@@ -271,6 +274,7 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
 static void *application_job_thread(void *opaque);
+static size_t application_active_job_count_locked(cbm_daemon_application_t *application);
 static char *application_auto_index_args(cbm_daemon_application_t *application,
                                          const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
@@ -1609,6 +1613,9 @@ static bool application_job_wait_for_mutations(cbm_daemon_application_job_t *job
         cbm_mutex_lock(&application->mutex);
         bool cancelled = job->cancel_requested || application->stopping;
         bool busy = application_mutation_conflicts_locked(application, job->project_key);
+#ifdef _WIN64
+        busy = busy || application->go_prewarm_active;
+#endif
         cbm_mutex_unlock(&application->mutex);
         if (cancelled) {
             return false;
@@ -1619,6 +1626,99 @@ static bool application_job_wait_for_mutations(cbm_daemon_application_job_t *job
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
 }
+
+#ifdef _WIN64
+/* The Go compiler needs its own Job before the smaller index Worker Job starts. */
+static bool application_go_prewarm(cbm_daemon_application_job_t *job) {
+    cbm_daemon_application_t *application = job->application;
+    if (application->worker_ops.start != application_worker_start_default) {
+        return true;
+    }
+    char helper[APPLICATION_PATH_CAP];
+    if (!cbm_safe_getenv("CBM_GO_FACTS_HELPER", helper, sizeof(helper), NULL) || !helper[0]) {
+        return true;
+    }
+    char module[APPLICATION_PATH_CAP];
+    int length = snprintf(module, sizeof(module), "%s/go.mod", job->root_path);
+    if (length <= 0 || length >= (int)sizeof(module) || !cbm_file_exists(module)) {
+        return true;
+    }
+    cbm_index_resource_policy_t policy;
+    if (!cbm_mcp_index_policy_from_internal_args(job->args_json, &policy, NULL, 0) ||
+        cbm_index_policy_discovery_enabled(&policy) || policy.max_rss_bytes.enabled) {
+        return true;
+    }
+    cbm_mutex_lock(&application->mutex);
+    bool admitted = !job->cancel_requested && !application->stopping &&
+                    application_active_job_count_locked(application) == 1;
+    if (admitted) {
+        application->go_prewarm_active = true;
+    }
+    cbm_mutex_unlock(&application->mutex);
+    if (!admitted) {
+        return true;
+    }
+
+    uint64_t started = cbm_index_worker_now_ms();
+    job->request_started_ms = started;
+    const uint64_t helper_budget_ms = 60000;
+    uint64_t deadline_ms = helper_budget_ms + 5000;
+    if (policy.max_duration_ms.enabled && policy.max_duration_ms.value < deadline_ms) {
+        deadline_ms = policy.max_duration_ms.value;
+    }
+    char budget[CBM_SZ_32];
+    uint64_t budget_ms = helper_budget_ms < deadline_ms ? helper_budget_ms : deadline_ms;
+    snprintf(budget, sizeof(budget), "%llu", (unsigned long long)budget_ms);
+    const char *argv[] = {helper, "--prewarm", "--root", job->root_path, "--budget-ms", budget, NULL};
+    char log[APPLICATION_PATH_CAP];
+    bool have_log = application_unique_recovery_file(log, "go-prewarm");
+    cbm_proc_opts_t options = {
+        .bin = helper,
+        .argv = argv,
+        .log_file = have_log ? log : NULL,
+        .memory_limit_bytes = 6U * UINT64_C(1024) * 1024U * 1024U,
+    };
+    cbm_subprocess_t *process = NULL;
+    application_tmp_lock();
+    int spawn_status = cbm_subprocess_spawn(&options, &process);
+    application_tmp_unlock();
+    bool safe = true;
+    if (spawn_status == 0) {
+        cbm_proc_result_t result = {0};
+        cbm_proc_poll_t state;
+        while ((state = cbm_subprocess_poll(process, &result)) == CBM_PROC_POLL_RUNNING) {
+            if (application_job_cancel_requested(job) ||
+                cbm_index_worker_now_ms() - started >= deadline_ms) {
+                (void)cbm_subprocess_request_cancel(process);
+            }
+            cbm_usleep(APPLICATION_JOB_POLL_US);
+        }
+        cbm_subprocess_destroy(process);
+        safe = state == CBM_PROC_POLL_TERMINAL && result.tree_quiesced && !result.supervision_failed;
+        char elapsed[CBM_SZ_32], peak[CBM_SZ_32];
+        snprintf(elapsed, sizeof(elapsed), "%llu",
+                 (unsigned long long)(cbm_index_worker_now_ms() - started));
+        snprintf(peak, sizeof(peak), "%zu", result.peak_job_memory_bytes);
+        if (safe && result.outcome == CBM_PROC_CLEAN) {
+            cbm_log_info("daemon.index.go_prewarm", "project", job->project_key,
+                         "elapsed_ms", elapsed, "peak_job_bytes", peak);
+            if (have_log) {
+                (void)cbm_unlink(log);
+            }
+        } else {
+            cbm_log_warn("daemon.index.go_prewarm_failed", "project", job->project_key,
+                         "outcome", cbm_proc_outcome_str(result.outcome),
+                         "log", have_log ? log : "unavailable");
+        }
+    } else if (have_log) {
+        (void)cbm_unlink(log);
+    }
+    cbm_mutex_lock(&application->mutex);
+    application->go_prewarm_active = false;
+    cbm_mutex_unlock(&application->mutex);
+    return safe;
+}
+#endif
 
 static void application_cancelled_result(cbm_index_worker_result_t *result) {
     memset(result, 0, sizeof(*result));
@@ -2181,6 +2281,10 @@ static void *application_job_thread(void *opaque) {
      * so the daemon must not pre-acquire that same native lease here. */
     if (!application_job_wait_for_mutations(job)) {
         application_job_execution_cancel(&execution);
+#ifdef _WIN64
+    } else if (!application_go_prewarm(job)) {
+        execution.supervision_failed = true;
+#endif
     } else {
         application_attempt_t attempt;
         application_attempt_status_t status =

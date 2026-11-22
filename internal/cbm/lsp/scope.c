@@ -168,7 +168,7 @@ static CBMVarBinding *scope_frame_find(const CBMScope *scope, const char *name) 
  * needing that distinction must use the checked form and consult the LOCAL
  * result, not a chain lookup. */
 static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMType *type,
-                                 const char *callable_qn) {
+                                 const char *callable_qn, bool is_type) {
     if (!scope || !name) {
         return false;
     }
@@ -176,6 +176,7 @@ static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMTyp
     if (existing) {
         existing->type = type;
         existing->callable_qn = callable_qn;
+        existing->is_type = is_type;
         return true;
     }
     CBMScopeChunk* head = scope->chunks;
@@ -189,6 +190,7 @@ static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMTyp
     b->name = name;
     b->type = type;
     b->callable_qn = callable_qn;
+    b->is_type = is_type;
     head->used++;
     scope->binding_count++;
     scope_index_note(scope, b);
@@ -196,21 +198,25 @@ static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMTyp
 }
 
 void cbm_scope_bind(CBMScope *scope, const char *name, const CBMType *type) {
-    (void)cbm_scope_bind_value(scope, name, type, NULL);
+    (void)cbm_scope_bind_value(scope, name, type, NULL, false);
 }
 
 bool cbm_scope_bind_checked(CBMScope *scope, const char *name, const CBMType *type) {
-    return cbm_scope_bind_value(scope, name, type, NULL);
+    return cbm_scope_bind_value(scope, name, type, NULL, false);
+}
+
+bool cbm_scope_bind_type(CBMScope *scope, const char *name) {
+    return cbm_scope_bind_value(scope, name, cbm_type_unknown(), NULL, true);
 }
 
 void cbm_scope_bind_callable(CBMScope *scope, const char *name, const CBMType *type,
                              const char *callable_qn) {
-    (void)cbm_scope_bind_value(scope, name, type, callable_qn);
+    (void)cbm_scope_bind_value(scope, name, type, callable_qn, false);
 }
 
 bool cbm_scope_bind_callable_checked(CBMScope *scope, const char *name, const CBMType *type,
                                      const char *callable_qn) {
-    return cbm_scope_bind_value(scope, name, type, callable_qn);
+    return cbm_scope_bind_value(scope, name, type, callable_qn, false);
 }
 
 const CBMVarBinding *cbm_scope_lookup_local(const CBMScope *scope, const char *name) {

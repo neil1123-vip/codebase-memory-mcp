@@ -10,7 +10,7 @@
  * unchanged — a body edit — and skip recomputing its dependents, and
  * (b) rehydrate the cross registries for files it does not re-parse.
  *
- * The JSON is a versioned object {"v":2,"lang":N,"lsp":[...],"reg":[...],"py":...}.
+ * The JSON is a versioned object {"v":7,"lang":N,"lsp":[...],"reg":[...],"py":...}.
  * Python rows carry content-only namespace facts, including ordered binding
  * events and unknown effects; other languages carry an explicit null.
  * Field order and array order are fixed by the writer, so byte equality of the

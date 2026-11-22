@@ -59,7 +59,8 @@ void cbm_c_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
 static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node);
 static void c_emit_resolved_call(CLSPContext *ctx, const char *callee_qn, const char *strategy,
                                  float confidence);
-static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason);
+static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason,
+                                   TSNode site);
 static const CBMType *c_lookup_field_type(CLSPContext *ctx, const char *type_qn,
                                           const char *field_name, int depth);
 static const CBMRegisteredType *c_resolve_field_owner_type(CLSPContext *ctx, const char *type_qn);
@@ -4650,17 +4651,10 @@ static void c_resolve_callable_argument_references(CLSPContext *ctx, TSNode call
     }
 }
 
-static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason) {
-    if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
-        return;
-    CBMResolvedCall rc = {0};
-    rc.caller_qn = ctx->enclosing_func_qn;
-    rc.callee_qn = expr_text ? expr_text : "?";
-    rc.strategy = "lsp_unresolved";
-    rc.confidence = 0.0f;
-    rc.reason = reason;
-    rc.source_origin = ctx->source_origin;
-    c_publish_resolved_call(ctx, rc);
+static void c_emit_unresolved_call(CLSPContext *ctx, const char *expr_text, const char *reason,
+                                   TSNode site) {
+    c_emit_resolved_call_orig_at(ctx, expr_text ? expr_text : "?", reason, "lsp_unresolved", 0.0f,
+                                 site);
 }
 
 // ============================================================================
@@ -4822,11 +4816,11 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                                                    cbm_arena_sprintf(ctx->arena, "%s.%s",
                                                                      arg_text ? arg_text : "?",
                                                                      field_name),
-                                                   "unknown_receiver_type");
+                                                   "unknown_receiver_type", node);
                         } else if (type_qn) {
                             c_emit_unresolved_call(
                                 ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, field_name),
-                                "method_not_found");
+                                "method_not_found", node);
                         }
                     }
                 }
@@ -4940,7 +4934,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             goto recurse;
                         }
                     }
-                    c_emit_unresolved_call(ctx, qn, "scoped_not_in_registry");
+                    c_emit_unresolved_call(ctx, qn, "scoped_not_in_registry", node);
                 }
                 goto recurse;
             }
@@ -4998,7 +4992,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             }
                         } else {
                             c_emit_unresolved_call(ctx, c_build_qn(ctx, name),
-                                                   "template_not_in_registry");
+                                                   "template_not_in_registry", node);
                         }
                     }
                 }
@@ -5091,7 +5085,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         if (adl_qn) {
                             c_emit_resolved_call_at(ctx, adl_qn, "lsp_adl", 0.90f, node);
                         } else {
-                            c_emit_unresolved_call(ctx, name, "function_not_in_registry");
+                            c_emit_unresolved_call(ctx, name, "function_not_in_registry", node);
                         }
                     }
                 }

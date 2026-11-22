@@ -17,6 +17,7 @@
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -191,11 +192,18 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang) {
+    if (lang == CBM_LANG_GO && name) {
+        while (*name == '*')
+            name++;
+    }
     cbm_resolution_t res =
         cbm_registry_resolve_lang(reg, name, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
+    if (lang == CBM_LANG_GO &&
+        (!res.strategy || strcmp(res.strategy, strchr(name, '.') ? "import_map" : "same_module")))
+        return NULL;
 
     /* Verify it's a type-like container (Class/Struct/Interface/Enum/Type/Trait):
      * a base/embedded type, impl receiver, or inheritance target must resolve to
@@ -291,19 +299,25 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     /* For each interface method, find the matching struct method node. */
     const cbm_gbuf_node_t *matched[CBM_SZ_128];
     for (int m = 0; m < im_count; m++) {
+        char method_qn[CBM_SZ_512];
+        snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
         const cbm_gbuf_node_t *found = NULL;
         /* (a) DEFINES_METHOD edge by name */
         for (int d = 0; d < cls_dm_count; d++) {
             const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_id(ctx->gbuf, cls_dm[d]->target_id);
             if (cm && cm->name && strcmp(cm->name, imethods[m].name) == 0) {
-                found = cm;
-                break;
+                /* Prefer the shared logical node over build-specific declarations. */
+                if (cm->qualified_name && strcmp(cm->qualified_name, method_qn) == 0) {
+                    found = cm;
+                    break;
+                }
+                if (!found) {
+                    found = cm;
+                }
             }
         }
         /* (b) reconstructed "<ClassQN>.<methodName>" */
         if (!found) {
-            char method_qn[CBM_SZ_512];
-            snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
             found = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
         }
         if (!found) {
@@ -784,7 +798,12 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        if (files[i].language == CBM_LANG_GO) {
+            cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
+                                     &imp_keys, &imp_vals, &imp_count);
+        } else {
+            build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        }
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -804,7 +823,11 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        if (files[i].language == CBM_LANG_GO) {
+            cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        } else {
+            free_import_map(imp_keys, imp_vals, imp_count);
+        }
         if (result_owned) {
             cbm_free_result(result);
         }

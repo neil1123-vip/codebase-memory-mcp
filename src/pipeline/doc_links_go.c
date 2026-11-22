@@ -574,7 +574,7 @@ static bool go_word_in(go_str_t word, const char *const *list, size_t count) {
  * The two lists are the toolchain's own closed lists (go/build syslist); a
  * name they do not know leaves the file unconstrained, which can only make
  * this resolver more careful (see go_free_t). */
-static bool go_name_constrained(const char *rel_path) {
+bool cbm_doclinks_go_name_constrained(const char *rel_path) {
     static const char *const known_os[] = {
         "aix",     "android", "darwin",  "dragonfly", "freebsd", "hurd",
         "illumos", "ios",     "js",      "linux",     "nacl",    "netbsd",
@@ -614,7 +614,7 @@ static void go_set_package(go_index_t *ix, go_file_t *f, const char *name, const
         return;
     }
     f->ignored = strchr(flags, 'i') != NULL;
-    f->constrained = strchr(flags, 'c') != NULL || go_name_constrained(f->rel_path);
+    f->constrained = strchr(flags, 'c') != NULL || cbm_doclinks_go_name_constrained(f->rel_path);
     f->pkg = go_pkg_get(ix, f->dir, go_str(name));
     if (!f->pkg) {
         ix->oom = true;

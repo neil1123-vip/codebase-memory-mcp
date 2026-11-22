@@ -760,6 +760,7 @@ int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project);
 
 /* Delete edges by type. */
 int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const char *type);
+int cbm_store_delete_node_builtin_imports(cbm_store_t *s, const char *project, int *removed);
 
 /* ── File hash CRUD ─────────────────────────────────────────────── */
 
@@ -786,6 +787,7 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
+ * "call_summary" holds complete per-file invocation counters and is not a gap.
  * "oversized" = not indexed at all (detail = reason). "unresolved_calls" is
  * indexed source whose invocation targets were not resolved (detail = JSON
  * array of caller, leaf, source byte span, and reason). Stored in the separate

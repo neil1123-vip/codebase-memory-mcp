@@ -3716,6 +3716,19 @@ static const cbm_gbuf_node_t *resolve_php_declared_use(const cbm_pipeline_ctx_t 
     return hit;
 }
 
+void cbm_pipeline_format_import_edge(char *props, size_t capacity, CBMLanguage language,
+                                     const CBMImport *imp) {
+    char local_name[CBM_SZ_128];
+    cbm_json_escape(local_name, sizeof(local_name), imp->local_name ? imp->local_name : "");
+    bool node_builtin = (language == CBM_LANG_JAVASCRIPT || language == CBM_LANG_TYPESCRIPT ||
+                         language == CBM_LANG_TSX) &&
+                        strncmp(imp->module_path, "node:", sizeof("node:") - 1) == 0;
+    /* Keep the binding through existing resolution passes. With the marker appended,
+     * equal-key graph dedup prefers the unmarked JSON of any real import ('}' > ','). */
+    snprintf(props, capacity, "{\"local_name\":\"%s\"%s}", local_name,
+             node_builtin ? ",\"node_builtin_compat\":true" : "");
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,

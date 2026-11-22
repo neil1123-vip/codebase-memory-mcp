@@ -160,11 +160,13 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
      * all 27 cgo files pointed their IMPORTS edge at the same unrelated `C`
      * member of a test helper. Drop it — the C side is not a graph package, and
      * the file's remaining imports are unaffected. */
-    if (strcmp(path, "C") == 0) {
+    TSNode name_node = ts_node_child_by_field_name(spec, TS_FIELD("name"));
+    if (strcmp(path, "C") == 0 || strcmp(path, "`C`") == 0) {
+        if (ts_node_is_null(name_node))
+            ctx->go_has_cgo_import = true;
         return;
     }
 
-    TSNode name_node = ts_node_child_by_field_name(spec, TS_FIELD("name"));
     const char *local_name =
         !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : path_last(a, path);
 

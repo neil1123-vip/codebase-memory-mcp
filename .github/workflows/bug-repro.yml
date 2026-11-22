@@ -26,8 +26,76 @@ permissions:
   contents: read
 
 jobs:
+  magpie-darwin-wails:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/stage4-darwin-wails' && inputs.platforms == 'macos' }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yetone/magpie
+          ref: 803d7747e7eb4599b21b84e9e035071f22ad19df
+          path: .tmp-darwin-magpie-public
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - name: Verify public Magpie inputs and cache Go modules
+        shell: bash
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(go env GOHOSTOS GOHOSTARCH | paste -sd ' ' -)" = 'darwin arm64'
+          xcrun --sdk macosx --show-sdk-path
+          export GOTOOLCHAIN=local GOENV=off GOWORK=off GOTELEMETRY=off
+          export GOMODCACHE="$RUNNER_TEMP/magpie-go-modules"
+          echo "GOMODCACHE=$GOMODCACHE" >> "$GITHUB_ENV"
+          mkdir "$RUNNER_TEMP/magpie-darwin-inputs"
+          source_dir="$GITHUB_WORKSPACE/.tmp-darwin-magpie-public"
+          script_dir="$GITHUB_WORKSPACE/scripts/ci/magpie-darwin"
+          cd "$source_dir"
+          test "$(git rev-parse HEAD)" = 803d7747e7eb4599b21b84e9e035071f22ad19df
+          go mod download all
+          go mod verify
+          go mod download -json github.com/wailsapp/wails/v3@v3.0.0-beta.24 > "$RUNNER_TEMP/magpie-darwin-inputs/wails-module.json"
+          git diff --exit-code HEAD
+          python3 "$script_dir/verify-native-inputs.py" "$source_dir" "$script_dir/source-sites.json" "$RUNNER_TEMP/magpie-darwin-inputs/wails-module.json" > "$RUNNER_TEMP/magpie-darwin-inputs/verified.json"
+
+      - name: Build candidate and verify Wails calls
+        shell: bash
+        run: |
+          script_dir="$GITHUB_WORKSPACE/scripts/ci/magpie-darwin"
+          git apply --check "$script_dir/admit-native-darwin.patch"
+          git apply "$script_dir/admit-native-darwin.patch"
+          CBM_NO_CCACHE=1 scripts/build.sh CC=cc CXX=c++
+          sh "$script_dir/index-darwin.sh" "$GITHUB_WORKSPACE/build/c/codebase-memory-mcp" \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.tmp-darwin-magpie-public" \
+            "$script_dir/source-sites.json" "$RUNNER_TEMP/magpie-darwin-output"
+
+      - name: Archive native macOS result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: magpie-darwin-arm64-wails
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/magpie-darwin-inputs/verified.json
+            ${{ runner.temp }}/magpie-darwin-output/acceptance.json
+            ${{ runner.temp }}/magpie-darwin-output/input-hashes.txt
+            ${{ runner.temp }}/magpie-darwin-output/sdk-version.txt
+            ${{ runner.temp }}/magpie-darwin-output/toolchain.txt
+            ${{ runner.temp }}/magpie-darwin-output/*.stderr
+
   repro-unix:
-    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'linux' || inputs.platforms == 'macos' }}
+    if: ${{ github.ref != 'refs/heads/codex/stage4-darwin-wails' && (github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'linux' || inputs.platforms == 'macos') }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,7 +131,7 @@ jobs:
         run: scripts/repro.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
 
   repro-windows:
-    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    if: ${{ github.ref != 'refs/heads/codex/stage4-darwin-wails' && (github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'windows') }}
     runs-on: windows-latest
     timeout-minutes: 240
     steps:

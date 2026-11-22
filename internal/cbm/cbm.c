@@ -5,12 +5,15 @@
 #include "foundation/mem_core.h"   // class accounting for the bound allocators
 #include "foundation/mem_events.h" // waste sanitizer: the bound allocators bypass every observer
 #include "foundation/log.h"        // cbm_log_warn -- extract.lsp.skipped
+#include "foundation/sha256.h"
 #include "cbm.h"
 #include "arena.h"   // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "doclink.h" // cbm_doclinks_extract: doc-comment references + doc-link scope
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
+#include "extract_plan9.h"
+#include "extract_sqlite.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/php_lsp.h"
@@ -544,6 +547,9 @@ static TSPoint cbm_source_end_point(const char *source, uint32_t len) {
     return end;
 }
 
+static char *cbm_grammar_compat_source(TSNode root, CBMLanguage language, const char *source,
+                                       int source_len, const char *original, bool sqlite_dialect);
+
 /* #2078: parse every file as if its last line were terminated.
  *
  * Many grammars treat the line terminator as part of the construct it ends --
@@ -561,7 +567,8 @@ static TSPoint cbm_source_end_point(const char *source, uint32_t len) {
  * row/column points -- so every consumer (def line ranges, node text, call
  * byte spans, parse-coverage ranges, the retained tree the LSP passes reuse)
  * sees only real bytes and real lines; nothing downstream needs to know. The
- * caller's buffer is never copied or written.
+ * caller's buffer is never written. Compatibility reparses copy only
+ * recognized grammar failures.
  *
  * A file that is empty or already ends in "\n" is parsed exactly as before. */
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
@@ -569,6 +576,53 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
     CBMStringInput input = {source, source_len, source_len > 0 && source[source_len - 1] != '\n'};
     TSInput ts_input = {&input, cbm_string_read, TSInputEncodingUTF8, NULL};
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+    /* Extraction and uncached cross-file LSP passes must consume the same
+     * compatibility tree, under the same budget and included ranges. */
+    if (tree && source_len <= INT_MAX && ts_node_has_error(ts_tree_root_node(tree))) {
+        static const CBMLanguage compat_languages[] = {
+            CBM_LANG_GO, CBM_LANG_JAVASCRIPT, CBM_LANG_CSS, CBM_LANG_SCSS,
+            CBM_LANG_POWERSHELL, CBM_LANG_SQL, CBM_LANG_ASSEMBLY,
+        };
+        const TSLanguage *parser_language = ts_parser_language(parser);
+        for (size_t i = 0; i < sizeof(compat_languages) / sizeof(compat_languages[0]); i++) {
+            if (parser_language != cbm_ts_language(compat_languages[i])) {
+                continue;
+            }
+            char *compat_source = NULL;
+            bool sqlite_dialect = compat_languages[i] == CBM_LANG_SQL &&
+                                  cbm_sqlite_dialect_evidence(source, (int)source_len);
+            /* shortcut: compatibility deeper than 32 recovery layers remains
+             * partial; raise this only with a bounded-cost parser strategy. */
+            for (int attempt = 0; attempt < 32 && ts_node_has_error(ts_tree_root_node(tree));
+                 attempt++) {
+                const char *view = compat_source ? compat_source : source;
+                char *next_source = cbm_grammar_compat_source(
+                    ts_tree_root_node(tree), compat_languages[i], view, (int)source_len,
+                    source, sqlite_dialect);
+                if (!next_source) {
+                    break;
+                }
+                if (memcmp(next_source, view, source_len) == 0) {
+                    free(next_source);
+                    break;
+                }
+                ts_parser_reset(parser);
+                input.string = next_source;
+                TSTree *compat_tree =
+                    ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+                if (!compat_tree) {
+                    free(next_source);
+                    break;
+                }
+                free(compat_source);
+                compat_source = next_source;
+                ts_tree_delete(tree);
+                tree = compat_tree;
+            }
+            free(compat_source);
+            break;
+        }
+    }
     if (tree && input.virtual_newline) {
         TSPoint end = cbm_source_end_point(source, source_len);
         TSInputEdit drop_virtual_newline = {
@@ -1597,7 +1651,8 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
  * level of the indexed file, and a deep enough nest ran the worker thread out
  * of stack. The cursor keeps that path on the heap. The nodes visited and
  * their order are those of the child-index loop it replaced: the cursor
- * stops on exactly the visible children ts_node_child enumerates. */
+ * stops on the visible children ts_node_child enumerates. A hidden missing
+ * token is reported through its nearest visible owner. */
 typedef void (*cbm_error_node_fn)(TSNode node, void *arg);
 
 static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len,
@@ -1605,10 +1660,7 @@ static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len
     /* The thread's reusable cursor: the walk completes before anything else on
      * this thread can ask for it, and the callbacks never do. */
     TSTreeCursor *cursor = cbm_thread_cursor(root);
-    if (!ts_tree_cursor_goto_first_child(cursor)) {
-        return;
-    }
-    int depth = 0; /* 0 while on a direct child of root */
+    int depth = 0;
     for (;;) {
         TSNode c = ts_tree_cursor_current_node(cursor);
         bool descend = false;
@@ -1619,7 +1671,20 @@ static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len
                 fn(c, arg);
             }
         } else if (ts_node_has_error(c)) {
-            descend = true;
+            uint32_t children = ts_node_child_count(c);
+            for (uint32_t i = 0; i < children; i++) {
+                if (ts_node_has_error(ts_node_child(c, i))) {
+                    descend = true;
+                    break;
+                }
+            }
+            /* SQL can hide MISSING _identifier under a visible zero-width
+             * identifier. Preserve the existing exact-EOF terminator exemption. */
+            uint32_t start = ts_node_start_byte(c), end = ts_node_end_byte(c);
+            bool eof_miss = start == end && source_len >= 0 && end == (uint32_t)source_len;
+            if (!descend && !eof_miss) {
+                fn(c, arg);
+            }
         }
         if (descend && ts_tree_cursor_goto_first_child(cursor)) {
             depth++;
@@ -1660,16 +1725,140 @@ static void cbm_mask_compat_bytes(char *source, uint32_t start, uint32_t end) {
     }
 }
 
+static bool cbm_sql_compat_word(const char *source, uint32_t end, uint32_t *at,
+                                 const char *word) {
+    uint32_t p = *at;
+    while (p < end && isspace((unsigned char)source[p])) {
+        p++;
+    }
+    for (const char *c = word; *c; c++, p++) {
+        if (p >= end || toupper((unsigned char)source[p]) != *c) {
+            return false;
+        }
+    }
+    if (p < end && (isalnum((unsigned char)source[p]) || source[p] == '_')) {
+        return false;
+    }
+    *at = p;
+    return true;
+}
+
+static bool cbm_sql_grammar_compat_error(TSNode node, const char *source, char *masked,
+                                         bool sqlite_dialect) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    uint32_t at = start;
+    if (cbm_sql_compat_word(source, end, &at, "PRAGMA") && at == start + 6) {
+        while (at < end && isspace((unsigned char)source[at])) {
+            at++;
+        }
+        uint32_t name_start = at;
+        while (at < end && (isalnum((unsigned char)source[at]) || source[at] == '_')) {
+            at++;
+        }
+        uint32_t name_end = at;
+        while (at < end && isspace((unsigned char)source[at])) {
+            at++;
+        }
+        if (name_end > name_start && at < end && source[at] == '=') {
+            at++;
+            while (at < end && isspace((unsigned char)source[at])) {
+                at++;
+            }
+            if (at < end && source[at] != ';') {
+                memcpy(masked + start, "SET   ", 6);
+                return true;
+            }
+        }
+    }
+
+    at = start;
+    if (cbm_sql_compat_word(source, end, &at, "WITHOUT") &&
+        cbm_sql_compat_word(source, end, &at, "ROWID") && at == end) {
+        TSNode previous = ts_node_prev_named_sibling(node);
+        TSNode declaration = {0};
+        if (!ts_node_is_null(previous)) {
+            declaration = ts_node_named_child(previous, 0);
+        }
+        if (!ts_node_is_null(declaration) &&
+            strcmp(ts_node_type(declaration), "create_table") == 0) {
+            uint32_t p = ts_node_end_byte(previous);
+            while (p < start && isspace((unsigned char)source[p])) {
+                p++;
+            }
+            if (p == start) {
+                cbm_mask_compat_bytes(masked, start, end);
+                return true;
+            }
+        }
+    }
+
+    TSNode parent = ts_node_parent(node);
+    if (!sqlite_dialect && !ts_node_is_null(parent) &&
+        strcmp(ts_node_type(parent), "constraints") == 0 &&
+        ts_node_named_child_count(node) == 2) {
+        TSNode keyword = ts_node_named_child(node, 0);
+        TSNode name = ts_node_named_child(node, 1);
+        at = ts_node_end_byte(name);
+        if (strcmp(ts_node_type(keyword), "keyword_constraint") == 0 &&
+            strcmp(ts_node_type(name), "identifier") == 0 &&
+            cbm_sql_compat_word(source, end, &at, "FOREIGN") && at == end) {
+            cbm_mask_compat_bytes(masked, start, ts_node_end_byte(name));
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool cbm_mask_grammar_compat_error(TSNode node, CBMLanguage language, const char *source,
-                                          int source_len, char *masked) {
+                                          int source_len, char *masked, bool sqlite_dialect) {
     const char *type = ts_node_type(node);
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);
     if (strcmp(type, "ERROR") != 0 || end > (uint32_t)source_len || start >= end) {
         return false;
     }
+    if (language == CBM_LANG_SQL) {
+        return cbm_sql_grammar_compat_error(node, source, masked, sqlite_dialect);
+    }
 
-    if (language == CBM_LANG_CSS) {
+    if (language == CBM_LANG_JAVASCRIPT && end - start == 1 && source[start] == '.') {
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "using_declaration") == 0) {
+            TSNode keyword = cbm_find_child_by_kind(parent, "using");
+            if (!ts_node_is_null(keyword)) {
+                uint32_t begin = ts_node_start_byte(keyword);
+                uint32_t after = ts_node_end_byte(keyword);
+                uint32_t i = after;
+                while (i < start && isspace((unsigned char)source[i]))
+                    i++;
+                if (after <= start && after - begin == 5 &&
+                    memcmp(source + begin, "using", 5) == 0 && i == start) {
+                    // Only the misread member receiver changes; resource declarations stay intact.
+                    masked[begin] = '_';
+                    return true;
+                }
+            }
+        }
+    } else if (language == CBM_LANG_CSS) {
+        TSNode parent = ts_node_parent(node);
+        TSNode keyword = ts_node_prev_named_sibling(node);
+        TSNode query = ts_node_next_named_sibling(node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "at_rule") == 0 &&
+            !ts_node_is_null(keyword) && strcmp(ts_node_type(keyword), "at_keyword") == 0 &&
+            ts_node_end_byte(keyword) - ts_node_start_byte(keyword) == 10 &&
+            memcmp(source + ts_node_start_byte(keyword), "@container", 10) == 0 &&
+            ts_node_named_child_count(node) == 1 &&
+            strcmp(ts_node_type(ts_node_named_child(node, 0)), "keyword_query") == 0 &&
+            !ts_node_is_null(query) && strcmp(ts_node_type(query), "feature_query") == 0 &&
+            !ts_node_has_error(query) &&
+            !(end - start == 3 && (memcmp(source + start, "not", 3) == 0 ||
+                                  memcmp(source + start, "and", 3) == 0)) &&
+            !(end - start == 2 && memcmp(source + start, "or", 2) == 0)) {
+            // The pinned grammar accepts the full query/body once its optional name is hidden.
+            cbm_mask_compat_bytes(masked, start, end);
+            return true;
+        }
         uint32_t line_start = start;
         while (line_start > 0 && source[line_start - 1] != '\n') {
             line_start--;
@@ -1707,24 +1896,84 @@ static bool cbm_mask_grammar_compat_error(TSNode node, CBMLanguage language, con
     return false;
 }
 
-static bool cbm_collect_grammar_compat_errors(TSNode node, CBMLanguage language,
-                                               const char *source, int source_len, char *masked) {
-    bool changed = cbm_mask_grammar_compat_error(node, language, source, source_len, masked);
-    uint32_t child_count = ts_node_child_count(node);
-    for (uint32_t i = 0; i < child_count; i++) {
-        if (cbm_collect_grammar_compat_errors(ts_node_child(node, i), language, source, source_len,
-                                               masked)) {
+static bool cbm_collect_grammar_compat_errors(TSNode root, CBMLanguage language,
+                                               const char *source, int source_len, char *masked,
+                                               bool sqlite_dialect) {
+    TSTreeCursor *cursor = cbm_thread_cursor(root);
+    int depth = 0;
+    bool changed = false;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(cursor);
+        bool descend = ts_node_has_error(node);
+        if (descend &&
+            cbm_mask_grammar_compat_error(node, language, source, source_len, masked,
+                                          sqlite_dialect)) {
             changed = true;
         }
+        if (descend && ts_tree_cursor_goto_first_child(cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            if (depth == 0)
+                return changed;
+            (void)ts_tree_cursor_goto_parent(cursor);
+            depth--;
+        }
     }
-    return changed;
+}
+
+/* The Go grammar reserves new's first argument for a type. Reparse failed
+ * expression arguments as ordinary calls; extraction retains the source's
+ * actual callee and every argument byte instead of masking the expression. */
+static bool cbm_go_new_expression_compat(TSNode root, const char *source, int source_len,
+                                         char *masked) {
+    TSTreeCursor *cursor = cbm_thread_cursor(root);
+    int depth = 0;
+    bool changed = false;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(cursor);
+        bool descend = ts_node_has_error(node);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "type_identifier") == 0) {
+            uint32_t start = ts_node_start_byte(node);
+            uint32_t end = ts_node_end_byte(node);
+            if (end <= (uint32_t)source_len && end - start == 3 &&
+                memcmp(source + start, "new", 3) == 0) {
+                uint32_t next = end;
+                while (next < (uint32_t)source_len &&
+                       isspace((unsigned char)source[next])) {
+                    next++;
+                }
+                if (next < (uint32_t)source_len && source[next] == '(') {
+                    masked[start + 1] = '_';
+                    changed = true;
+                }
+            }
+        }
+        if (descend && ts_tree_cursor_goto_first_child(cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            if (depth == 0) {
+                return changed;
+            }
+            (void)ts_tree_cursor_goto_parent(cursor);
+            depth--;
+        }
+    }
 }
 
 static char *cbm_grammar_compat_source(TSNode root, CBMLanguage language, const char *source,
-                                       int source_len) {
+                                       int source_len, const char *original, bool sqlite_dialect) {
+    if (language == CBM_LANG_ASSEMBLY) {
+        return cbm_plan9_compat_source(source, source_len);
+    }
     if (!source || source_len <= 0 ||
         (language != CBM_LANG_CSS && language != CBM_LANG_SCSS &&
-         language != CBM_LANG_POWERSHELL)) {
+         language != CBM_LANG_POWERSHELL && language != CBM_LANG_GO &&
+         language != CBM_LANG_JAVASCRIPT && language != CBM_LANG_SQL)) {
         return NULL;
     }
     char *masked = (char *)malloc((size_t)source_len + 1);
@@ -1733,7 +1982,18 @@ static char *cbm_grammar_compat_source(TSNode root, CBMLanguage language, const 
     }
     memcpy(masked, source, (size_t)source_len);
     masked[source_len] = '\0';
-    if (!cbm_collect_grammar_compat_errors(root, language, source, source_len, masked)) {
+    bool changed = language == CBM_LANG_GO
+                       ? cbm_go_new_expression_compat(root, source, source_len, masked)
+                       : cbm_collect_grammar_compat_errors(root, language, source, source_len,
+                                                            masked, sqlite_dialect);
+    if (language == CBM_LANG_SQL) {
+        changed |= cbm_sqlite_strict_compat_source(root, original, source_len, masked);
+        changed |= cbm_sqlite_trigger_compat_source(source, source_len, masked);
+        changed |= cbm_sqlite_default_not_null_compat_source(root, source, source_len, masked);
+        if (sqlite_dialect)
+            changed |= cbm_sqlite_column_compat_source(root, original, source_len, masked);
+    }
+    if (!changed) {
         free(masked);
         return NULL;
     }
@@ -3990,6 +4250,109 @@ static void record_included_files(CBMArena *a, CBMFileResult *result,
     result->included_files = list;
 }
 
+#ifdef __linux__
+static TSNode cgo_preamble_comment(const CBMExtractCtx *ctx) {
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 1; i < count; i++) {
+        TSNode decl = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(decl), "import_declaration") != 0 ||
+            ts_node_named_child_count(decl) != 1)
+            continue;
+        TSNode spec = ts_node_named_child(decl, 0);
+        if (strcmp(ts_node_type(spec), "import_spec") != 0 ||
+            !ts_node_is_null(ts_node_child_by_field_name(spec, TS_FIELD("name"))))
+            continue;
+        TSNode path = ts_node_child_by_field_name(spec, TS_FIELD("path"));
+        uint32_t start = ts_node_start_byte(path), end = ts_node_end_byte(path);
+        if (end - start != sizeof("\"C\"") - 1 || memcmp(ctx->source + start, "\"C\"", 3) != 0)
+            continue;
+
+        TSNode comment = ts_node_named_child(ctx->root, i - 1);
+        if (strcmp(ts_node_type(comment), "comment") != 0 ||
+            ts_node_end_point(comment).row + 1 != ts_node_start_point(decl).row)
+            return (TSNode){0};
+        start = ts_node_start_byte(comment);
+        end = ts_node_end_byte(comment);
+        if (end - start <= 4 || memcmp(ctx->source + start, "/*", 2) != 0 ||
+            memcmp(ctx->source + end - 2, "*/", 2) != 0)
+            return (TSNode){0};
+        uint32_t column = ts_node_start_point(comment).column;
+        for (uint32_t j = start - column; j < start; j++) {
+            if (ctx->source[j] != ' ' && ctx->source[j] != '\t')
+                return (TSNode){0};
+        }
+        TSNode preceding = ts_node_prev_named_sibling(comment);
+        if (!ts_node_is_null(preceding) && strcmp(ts_node_type(preceding), "comment") == 0 &&
+            ts_node_end_point(preceding).row + 1 >= ts_node_start_point(comment).row)
+            return (TSNode){0};
+        return comment;
+    }
+    return (TSNode){0};
+}
+
+static void extract_go_cgo_preamble(CBMExtractCtx *ctx, TSParseOptions options) {
+    TSNode comment = cgo_preamble_comment(ctx);
+    if (ts_node_is_null(comment))
+        return;
+    TSRange range = {.start_point = ts_node_start_point(comment),
+                     .end_point = ts_node_end_point(comment),
+                     .start_byte = ts_node_start_byte(comment) + 2,
+                     .end_byte = ts_node_end_byte(comment) - 2};
+    range.start_point.column += 2;
+    range.end_point.column -= 2;
+    /* shortcut: single attached block and direct C definitions only, extend with cgo's full comment grouping if needed. */
+    if (range.end_byte - range.start_byte > 128 * 1024)
+        return;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return;
+    TSTree *tree = ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)) &&
+                           ts_parser_set_included_ranges(parser, &range, 1)
+                       ? cbm_parse_source(parser, ctx->source, (uint32_t)ctx->source_len, options)
+                       : NULL;
+    ts_parser_delete(parser);
+    if (!tree)
+        return;
+
+    TSNode root = ts_tree_root_node(tree);
+    uint32_t count = ts_node_named_child_count(root);
+    char path_sha[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(ctx->rel_path, strlen(ctx->rel_path), path_sha);
+    static const char *properties[] = {CBM_CGO_PREAMBLE_PROPERTY, "true", NULL};
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(node), "function_definition") != 0 || ts_node_has_error(node))
+            continue;
+        TSNode name = cbm_resolve_func_name(node, CBM_LANG_C);
+        if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0)
+            continue;
+        const char *text = cbm_func_name_node_text(ctx->arena, name, ctx->source, CBM_LANG_C);
+        uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+        if (!text || start < range.start_byte || end > range.end_byte || start >= end)
+            continue;
+        char *suffix = cbm_arena_sprintf(ctx->arena, CBM_CGO_PREAMBLE_QN_PREFIX "%s:%u:%s",
+                                         path_sha, (unsigned)start, text);
+        if (!suffix)
+            break;
+        const char *qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, suffix);
+        if (!qn)
+            break;
+        CBMDefinition def = {.name = text,
+                             .qualified_name = qn,
+                             .label = "Function",
+                             .file_path = ctx->rel_path,
+                             .start_line = ts_node_start_point(node).row + 1,
+                             .end_line = ts_node_end_point(node).row + 1,
+                             .name_start_byte = start,
+                             .name_end_byte = end,
+                             .name_source_origin = CBM_SOURCE_ORIGIN_RAW,
+                             .extra_props = properties};
+        cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+    }
+    ts_tree_delete(tree);
+}
+#endif
+
 static CBMFileResult *extract_file_ex_body(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
@@ -4000,6 +4363,9 @@ static CBMFileResult *extract_file_ex_body(
     CBMFileResult *result = cbm_result_alloc();
     if (!result) {
         return NULL;
+    }
+    if (source && source_len >= 0) {
+        cbm_sha256_hex(source, (size_t)source_len, result->raw_source_sha256);
     }
 
     result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
@@ -4165,6 +4531,7 @@ static CBMFileResult *extract_file_ex_body(
      * supplies (#2078) stays outside a ranged parse. */
     CBMSqlKeptRanges sql_kept = {NULL, 0};
     bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
+                      !cbm_sqlite_keep_replay_values(source, (uint32_t)source_len) &&
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
@@ -4190,32 +4557,6 @@ static CBMFileResult *extract_file_ex_body(
     }
 
     TSNode root = ts_tree_root_node(tree);
-    char *compat_source = NULL;
-    if (ts_node_has_error(root)) {
-        compat_source = cbm_grammar_compat_source(root, language, source, source_len);
-        if (compat_source) {
-            ts_parser_reset(parser);
-            CBMStringInput compat_input = {
-                .string = compat_source,
-                .length = (uint32_t)source_len,
-                .virtual_newline = false,
-            };
-            TSInput compat_ts_input = {
-                &compat_input,
-                cbm_string_read,
-                TSInputEncodingUTF8,
-                NULL,
-            };
-            TSTree *compat_tree =
-                ts_parser_parse_with_options(parser, NULL, compat_ts_input, opts);
-            if (compat_tree) {
-                ts_tree_delete(tree);
-                tree = compat_tree;
-                root = ts_tree_root_node(tree);
-            }
-            free(compat_source);
-        }
-    }
     uint64_t t1 = now_ns() + parse_wall_offset_ns;
 
     /* No file is disqualified from the LSP walks by how long its parse took.
@@ -4279,13 +4620,25 @@ static CBMFileResult *extract_file_ex_body(
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
-    cbm_extract_definitions(&ctx);
+    bool plan9_assembly = cbm_extract_plan9_assembly(&ctx);
+    if (!plan9_assembly)
+        cbm_extract_definitions(&ctx);
     cbm_test_declarations_finish(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
     cbm_extract_scope(&ctx);
     cbm_swift_type_imports(result, language);
+    int parsed_def_count = plan9_assembly ? 0 : result->defs.count;
+    cbm_extract_sqlite_triggers(&ctx);
+    if (language == CBM_LANG_SQL) {
+        cbm_sqlite_discard_unproven_schema_usages(&ctx);
+        bool require_replay;
+        TSNode verified_top_level_alter;
+        TSNode verified_transaction =
+            cbm_sqlite_verified_schema(&ctx, &require_replay, &verified_top_level_alter);
+        cbm_bind_sql_columns(&ctx, verified_transaction, require_replay, verified_top_level_alter);
+    }
     if (cbm_lang_needs_cpp_branch_views(language)) {
         extract_cpp_branch_views(&ctx, ts_lang, timeout_micros);
     }
@@ -4936,11 +5289,11 @@ static CBMFileResult *extract_file_ex_body(
      * subtracted first — a region fully re-extracted as definitions is not a
      * miss, and a fully recovered file is not flagged at all. Detection aid
      * only: the absence of this flag is NOT a completeness guarantee. */
-    if (ts_node_has_error(root)) {
+    if (ts_node_has_error(root) || language == CBM_LANG_SQL) {
         cbm_error_regions_t regs = {{0}, {0}, 0, 0};
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
-        } else {
+        } else if (ts_node_has_error(root)) {
             cbm_collect_error_regions(root, &regs, source, source_len);
         }
         /* Recovery subtraction runs on the RAW ranges, before the Phase 2
@@ -4950,7 +5303,13 @@ static CBMFileResult *extract_file_ex_body(
          * splitting a brace inside a recovered function looks unrecovered:
          * the refinement keeps only the discarded branch, the function starts
          * above it, and the evidence falls outside the range. */
-        cbm_subtract_recovered_regions(&regs, &result->defs, source, source_len);
+        /* A SQL definition/header does not prove its columns or body parsed. */
+        CBMDefArray recovery_defs = result->defs;
+        if (language == CBM_LANG_SQL)
+            recovery_defs.count = 0;
+        else if (plan9_assembly)
+            recovery_defs.count = parsed_def_count;
+        cbm_subtract_recovered_regions(&regs, &recovery_defs, source, source_len);
         /* Phase 2: cut what is left down to the lines the preprocessed parse
          * could not explain. */
         if (pp_line_map) {
@@ -4962,6 +5321,9 @@ static CBMFileResult *extract_file_ex_body(
          * refinement, because its evidence is per-line: a narrow range points at
          * the call itself instead of the whole blob around it. */
         cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
+        if (language == CBM_LANG_SQL) {
+            cbm_sqlite_diagnostics(root, source, source_len, cbm_collect_error_region, &regs);
+        }
         /* A file whose kept list is empty but whose cap still bound is NOT clean:
          * the ranges the cap threw away were never judged by the two rules
          * above, so nothing proves they were recovered. Flag it. */
@@ -4994,6 +5356,11 @@ static CBMFileResult *extract_file_ex_body(
     /* Doc-comment references of the documented definitions, and the file's
      * doc-link scope: both read the complete docstrings and the tree. */
     cbm_doclinks_extract(&ctx);
+
+#ifdef __linux__
+    if (ctx.go_has_cgo_import && rel_path && cbm_go_cgo_enabled())
+        extract_go_cgo_preamble(&ctx, opts);
+#endif
 
     // Accumulate profiling counters
     atomic_fetch_add(&total_parse_ns, t1 - t0);

@@ -1367,6 +1367,9 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * extractor bakes it into the def QN. Compose it identically here — otherwise
      * an in-body call sources to a QN one or more segments short of the def, and
      * the edge is dropped at write. */
+    const char *object_owner = cbm_js_object_owner(&state->js_object_owners, name_node);
+    if (object_owner)
+        return object_owner;
     const char *qn_name = name;
     if (ctx->language == CBM_LANG_SWIFT) {
         const char *sig = cbm_callable_sig(ctx->arena, node, ctx->source, ctx->language);
@@ -3047,6 +3050,10 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.occurrence_cursor = &occurrence_cursor;
     state.arena = ctx->arena;
     state.language = ctx->language;
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX)
+        state.js_object_owners =
+            cbm_js_object_owners(ctx->scratch ? ctx->scratch : ctx->arena, &ctx->result->defs);
     state.scopes = state.inline_scopes;
     state.scope_capacity = MAX_SCOPES;
     state.lexical_scopes = state.inline_lexical_scopes;

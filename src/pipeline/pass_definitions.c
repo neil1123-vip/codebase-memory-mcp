@@ -21,6 +21,8 @@ enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include <stdint.h>
 #include <ctype.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/compiler_facts.h"
+#include "pipeline/doc_links.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h" /* cbm_alloc/cbm_free: the grown properties buffer */
@@ -29,12 +31,16 @@ enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include "foundation/limits.h"
 #include "foundation/mem_core.h"
 #include "foundation/str_util.h"
+#include "foundation/sha256.h"
 #include "cbm.h"
 #include "helpers.h" /* cbm_is_test_file */
+#include "lang_specs.h"
 #include "arena.h"
+#include "result_spill.h"
 #include "iris_export_xml.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
+#include "yyjson/yyjson.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,17 +67,18 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         return NULL;
     }
 
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
+    long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        size = -1;
+    }
     if (out_size) {
         *out_size = size;
     }
 
-    if (size <= 0) {
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -98,10 +105,14 @@ static char *read_file(const char *path, int *out_len, long *out_size,
     }
 
     size_t nread = fread(buf, SKIP_ONE, size, f);
+    bool complete = nread == (size_t)size && !ferror(f);
     (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
+    if (!complete) {
+        free(buf);
+        if (out_status) {
+            *out_status = CBM_READ_OPEN_FAIL;
+        }
+        return NULL;
     }
     memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
     *out_len = (int)nread;
@@ -270,7 +281,8 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
 }
 
 /* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            const char *source_sha256) {
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -317,6 +329,19 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
                                 (unsigned)def->selector_param_count);
     }
     append_json_string(buf, bufsize, &pos, "call_selector", def->call_selector);
+    if (source_sha256 && strlen(source_sha256) == 64 &&
+        def->name_end_byte > def->name_start_byte) {
+        int w = snprintf(buf + pos, bufsize - pos,
+                         ",\"name_start_byte\":%u,\"name_end_byte\":%u,"
+                         "\"name_source_origin\":%u,\"source_sha256\":\"%s\"",
+                         def->name_start_byte, def->name_end_byte,
+                         (unsigned)def->name_source_origin, source_sha256);
+        if (w <= 0 || (size_t)w >= bufsize - pos) {
+            buf[0] = '\0';
+            return;
+        }
+        pos += (size_t)w;
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     /* The buffer is sized for every field below (pd_props_buf), so none can be
      * squeezed out. */
@@ -365,7 +390,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 
 /* Upper bound of build_def_props' fixed prefix: the Function/Method metrics
  * literal (about 330 B) with nine ints and seven true/false/test_role strings at
- * their widest stays under 600 B. */
+ * their widest plus declaration identity stays under 1 KB. */
 enum { PD_PROPS_PREFIX_MAX = CBM_SZ_1K };
 
 /* Serialized size of one optional field as append_json_string emits it
@@ -394,10 +419,9 @@ static size_t pd_arr_field_len(const char *key, const char **arr) {
  * body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
  * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
  * ImageController actions, 2026-10-18). fp/sp/bt are appended behind their own
- * room checks, so both the check's reserve and the field are counted. Returns
- * `stack` when everything fits it, or when the larger buffer cannot be
- * allocated. Twin of pass_parallel.c -- keep both in sync. */
-static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+ * room checks, so both the check's reserve and the field are counted.
+ * Twin of pass_parallel.c -- keep both in sync. */
+static size_t pd_props_size(const CBMDefinition *def) {
     size_t need = PD_PROPS_PREFIX_MAX + pd_str_field_len("docstring", def->docstring);
     need += pd_str_field_len("call_selector", def->call_selector);
     if (def->variants && def->variants[0]) {
@@ -428,7 +452,11 @@ static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     if (def->body_tokens) {
         need += CBM_SZ_512 + pd_str_field_len("bt", def->body_tokens) + SKIP_ONE;
     }
-    need += PD_ESC_SPACE; /* the closing '}' + NUL */
+    return need + PD_ESC_SPACE; /* the closing '}' + NUL */
+}
+
+static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+    size_t need = pd_props_size(def);
     if (need <= *size) {
         return stack;
     }
@@ -492,15 +520,16 @@ static void link_def_parents(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, 
  * the result cache the pass links them once every file is registered. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
                         const char *file_doc, CBMLanguage lang, size_t module_prefix_len,
-                        bool link_parents) {
+                        bool link_parents, const char *source_sha256) {
     if (!def->qualified_name || !def->name) {
         return;
     }
     char stack[CBM_SZ_2K];
     size_t props_size = sizeof(stack);
     char *props = pd_props_buf(def, stack, &props_size);
-    build_def_props(props, props_size, def);
     const char *def_rel = def->file_path ? def->file_path : rel;
+    build_def_props(props, props_size, def,
+                    strcmp(def_rel, rel) == 0 ? source_sha256 : NULL);
     char marked[CBM_SZ_4K];
     const char *qn = def->label && strcmp(def->label, "Module") == 0
                          ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name, def_rel,
@@ -532,7 +561,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * code it beat production candidates on proximity. Ranking only: the
      * stored is_test property is untouched. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        if (cbm_def_props_generated(def->extra_props)) {
+        if (cbm_def_props_generated(def->extra_props) || cbm_cgo_preamble_qn(def->qualified_name)) {
             cbm_registry_add_qn_only(ctx->registry, def->qualified_name, def->label);
         } else {
             bool is_test = def->is_test || cbm_is_test_file(def_rel, lang) ||
@@ -586,6 +615,760 @@ static void link_cached_def_parents(cbm_pipeline_ctx_t *ctx, CBMFileResult **cac
             }
         }
     }
+}
+
+static bool pd_callable(const CBMDefinition *def) {
+    return def->label && (strcmp(def->label, "Function") == 0 ||
+                          strcmp(def->label, "Method") == 0);
+}
+
+static bool pd_decl_ambiguous(const cbm_gbuf_node_t *node, bool *ambiguous) {
+    *ambiguous = false;
+    if (!node || !node->properties_json ||
+        !strstr(node->properties_json, "\"decl_ambiguous\"")) {
+        return true;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *value = yyjson_obj_get(yyjson_doc_get_root(doc), "decl_ambiguous");
+    bool valid = !value || yyjson_is_bool(value);
+    *ambiguous = yyjson_is_true(value);
+    yyjson_doc_free(doc);
+    return valid;
+}
+
+static bool pd_js_language(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+}
+
+typedef struct {
+    bool go;
+    bool js;
+} pd_decl_languages_t;
+
+static void pd_decl_language(const char *path, int start, int end, void *userdata) {
+    (void)start;
+    (void)end;
+    pd_decl_languages_t *languages = userdata;
+    CBMLanguage lang = cbm_language_for_filename(path);
+    languages->go |= lang == CBM_LANG_GO;
+    languages->js |= pd_js_language(lang);
+}
+
+bool cbm_pipeline_mixed_declaration(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *node) {
+    if (!node || !node->file_path || !node->properties_json ||
+        !strstr(node->properties_json, "\"decl_ambiguous\"")) {
+        return false;
+    }
+    pd_decl_languages_t languages = {0};
+    pd_decl_language(node->file_path, node->start_line, node->end_line, &languages);
+    cbm_gbuf_foreach_span(gbuf, node, pd_decl_language, &languages);
+    return languages.go && languages.js;
+}
+
+bool cbm_pipeline_go_reference_target_allowed(const cbm_gbuf_node_t *node) {
+    bool ambiguous = false;
+    return pd_decl_ambiguous(node, &ambiguous) && !ambiguous;
+}
+
+bool cbm_pipeline_call_is_self(const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                                const CBMCall *call, CBMLanguage lang) {
+    if (source->id == target->id)
+        return true;
+    if (lang != CBM_LANG_GO || !call->enclosing_func_qn)
+        return false;
+    if (strcmp(call->enclosing_func_qn, target->qualified_name) == 0)
+        return true;
+    if (!source->qualified_name ||
+        strcmp(source->qualified_name, call->enclosing_func_qn) != 0 ||
+        !source->properties_json || !strstr(source->properties_json, "\"go_physical_decl\""))
+        return false;
+    /* Uncovered compiler sites retain native logical targets after caller binding. */
+    yyjson_doc *doc = yyjson_read(source->properties_json, strlen(source->properties_json), 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *marker = yyjson_obj_get(root, "go_physical_decl");
+    yyjson_val *ambiguous = yyjson_obj_get(root, "decl_ambiguous");
+    bool self = yyjson_is_uint(marker) && yyjson_get_uint(marker) == 1 &&
+                (!ambiguous || yyjson_is_false(ambiguous)) &&
+                yyjson_equals_str(yyjson_obj_get(root, "go_logical_qn"), target->qualified_name);
+    yyjson_doc_free(doc);
+    return self;
+}
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    bool go;
+    bool js;
+    bool mixed;
+    bool valid;
+} pd_decl_inventory_t;
+
+static void pd_decl_inventory_node(const cbm_gbuf_node_t *node, void *userdata) {
+    pd_decl_inventory_t *state = userdata;
+    if (!state->mixed && cbm_pipeline_mixed_declaration(state->gbuf, node))
+        state->mixed = true;
+    if (!state->go && state->valid && node->file_path && node->label &&
+        (strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0) &&
+        cbm_language_for_filename(node->file_path) == CBM_LANG_GO) {
+        state->valid = pd_decl_ambiguous(node, &state->go);
+    }
+    if (!state->js && state->valid && node->file_path && node->label &&
+        strcmp(node->label, "Function") == 0 &&
+        pd_js_language(cbm_language_for_filename(node->file_path))) {
+        state->valid = pd_decl_ambiguous(node, &state->js);
+    }
+}
+
+static bool pd_alias_matches(const cbm_gbuf_node_t *node, const CBMDefinition *def,
+                             const char *rel, const char *sha, bool js) {
+    if (!node || !node->label || !node->name || !node->file_path || !node->properties_json ||
+        strcmp(node->label, def->label) != 0 || strcmp(node->name, def->name) != 0 ||
+        strcmp(node->file_path, rel) != 0) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *start = yyjson_obj_get(root, "name_start_byte");
+    yyjson_val *end = yyjson_obj_get(root, "name_end_byte");
+    yyjson_val *origin = yyjson_obj_get(root, "name_source_origin");
+    yyjson_val *marker = yyjson_obj_get(root, js ? "js_physical_decl" : "go_physical_decl");
+    bool matches = doc && yyjson_is_uint(start) && yyjson_is_uint(end) &&
+                   yyjson_is_uint(origin) && yyjson_is_uint(marker) &&
+                   yyjson_get_uint(start) == def->name_start_byte &&
+                   yyjson_get_uint(end) == def->name_end_byte &&
+                   yyjson_get_uint(origin) == CBM_SOURCE_ORIGIN_RAW &&
+                   yyjson_get_uint(marker) == 1 &&
+                   yyjson_equals_str(yyjson_obj_get(root, "source_sha256"), sha) &&
+                   yyjson_equals_str(yyjson_obj_get(root, js ? "js_logical_qn" : "go_logical_qn"),
+                                     def->qualified_name) &&
+                   !yyjson_is_true(yyjson_obj_get(root, "decl_ambiguous"));
+    yyjson_doc_free(doc);
+    return matches;
+}
+
+static bool pd_materialize_one(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                               const char *rel, const CBMFileResult *result, const char *alias,
+                               bool js) {
+    const char *sha = result->raw_source_sha256;
+    const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(ctx->gbuf, alias);
+    int64_t id = existing ? existing->id : 0;
+    if (existing && !pd_alias_matches(existing, def, rel, sha, js)) {
+        return false;
+    }
+    if (!existing) {
+        char stack[CBM_SZ_2K];
+        size_t size = sizeof(stack);
+        char *props = pd_props_buf(def, stack, &size);
+        if (size < pd_props_size(def)) {
+            return false; /* The legacy buffer fallback must not hide OOM here. */
+        }
+        build_def_props(props, size, def, sha);
+        size_t length = strlen(props);
+        const char *build_header = result->go_build_header_sha256;
+        bool have_header = !js && strcmp(def->label, "Function") == 0 &&
+                           build_header[0];
+        size_t capacity = length + pd_str_field_len("go_logical_qn", def->qualified_name) + 32;
+        if (have_header)
+            capacity += pd_str_field_len("go_build_header_sha256", build_header);
+        char *physical_props = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, capacity);
+        bool valid = physical_props && length > 1 && props[length - 1] == '}';
+        if (valid) {
+            size_t pos = length - 1;
+            memcpy(physical_props, props, pos);
+            append_json_string(physical_props, capacity, &pos, js ? "js_logical_qn" : "go_logical_qn",
+                               def->qualified_name);
+            if (have_header)
+                append_json_string(physical_props, capacity, &pos, "go_build_header_sha256",
+                                   build_header);
+            int n = snprintf(physical_props + pos, capacity - pos, ",\"%s_physical_decl\":1}",
+                             js ? "js" : "go");
+            valid = n > 0 && (size_t)n < capacity - pos;
+        }
+        if (valid) {
+            id = cbm_gbuf_upsert_node(ctx->gbuf, def->label, def->name, alias, rel,
+                                      (int)def->start_line, (int)def->end_line, physical_props);
+        }
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, physical_props);
+        if (props != stack) {
+            cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
+        }
+        if (!valid || id <= 0 ||
+            !pd_alias_matches(cbm_gbuf_find_by_qn(ctx->gbuf, alias), def, rel, sha, js)) {
+            return false;
+        }
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    const cbm_gbuf_node_t *file = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
+    free(file_qn);
+    if (!file || cbm_gbuf_insert_edge(ctx->gbuf, file->id, id, "DEFINES", "{}") <= 0) {
+        return false;
+    }
+    if (def->parent_class && strcmp(def->label, "Method") == 0) {
+        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
+        if (parent && cbm_gbuf_insert_edge(ctx->gbuf, parent->id, id, "DEFINES_METHOD", "{}") <= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool pd_js_proof_callable(const TSTree *tree, const CBMDefinition *def,
+                                bool classic_script) {
+    TSNode root = ts_tree_root_node(tree);
+    TSNode name = ts_node_named_descendant_for_byte_range(root, def->name_start_byte,
+                                                         def->name_end_byte);
+    if (ts_node_is_null(name) || ts_node_start_byte(name) != def->name_start_byte ||
+        ts_node_end_byte(name) != def->name_end_byte)
+        return false;
+    TSNode decl = ts_node_parent(name);
+    if (ts_node_is_null(decl) || !ts_node_eq(name, ts_node_child_by_field_name(decl, TS_FIELD("name"))))
+        return false;
+    TSNode statement = ts_node_parent(decl);
+    if (classic_script && strcmp(ts_node_type(decl), "function_declaration") == 0 &&
+        ts_node_eq(statement, root))
+        return true;
+    if (strcmp(ts_node_type(decl), "variable_declarator") != 0 ||
+        strcmp(ts_node_type(statement), "lexical_declaration") != 0)
+        return false;
+    TSNode kind = ts_node_child_by_field_name(statement, TS_FIELD("kind"));
+    TSNode value = ts_node_child_by_field_name(decl, TS_FIELD("value"));
+    TSNode body = ts_node_parent(statement);
+    TSNode owner = ts_node_parent(body);
+    if (ts_node_is_null(kind) || ts_node_is_null(value) || ts_node_is_null(owner))
+        return false;
+    return strcmp(ts_node_type(kind), "const") == 0 &&
+           (strcmp(ts_node_type(value), "arrow_function") == 0 ||
+            strcmp(ts_node_type(value), "function_expression") == 0) &&
+           strcmp(ts_node_type(body), "statement_block") == 0 &&
+           /* Only function bodies can supply lexical target evidence. */
+           ts_node_eq(ts_node_child_by_field_name(owner, TS_FIELD("body")), body) &&
+           (strstr(ts_node_type(owner), "function") || strcmp(ts_node_type(owner), "method_definition") == 0);
+}
+
+static int pd_prepare_declarations(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                   int file_count, CBMFileResult **cache) {
+    if (!ctx || !ctx->gbuf || file_count < 0 || (file_count && !files)) {
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+    pd_decl_inventory_t state = {.gbuf = ctx->gbuf, .valid = true};
+    cbm_gbuf_foreach_node(ctx->gbuf, pd_decl_inventory_node, &state);
+    if (!state.valid)
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    if (!state.go && !state.js && !state.mixed)
+        return 0;
+    if (ctx->incremental_declarations) {
+        /* The other owner may be in a file outside the incremental input. */
+        cbm_log_info("incremental.fallback", "reason", "declarations_became_ambiguous");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
+    ctx->mixed_declarations = state.mixed;
+    for (int i = 0; i < file_count; i++) {
+        bool js = pd_js_language(files[i].language);
+        const char *extension = files[i].rel_path ? strrchr(files[i].rel_path, '.') : NULL;
+        bool classic_js = files[i].language == CBM_LANG_JAVASCRIPT &&
+                          extension && strcmp(extension, ".js") == 0;
+        if (files[i].language != CBM_LANG_GO && !(js && (state.mixed || state.js))) {
+            continue;
+        }
+        if (!files[i].path || !files[i].rel_path || cbm_pipeline_check_cancel(ctx)) {
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        if ((!cache || !cache[i]) &&
+            (!ctx->spill || !cbm_result_spill_has(ctx->spill, i))) {
+            if (!cache)
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            continue; /* Empty or skipped inputs contributed no declarations. */
+        }
+        bool loaded = false, valid = true;
+        CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+        char *source = NULL;
+        int source_len = 0;
+        TSParser *parser = NULL;
+        TSTree *parsed = NULL;
+        CBMArena aliases;
+        cbm_arena_init_lazy(&aliases, CBM_ARENA_APPEND_BLOCK);
+        if (!result || result->defs.count < 0 || (result->defs.count && !result->defs.items)) {
+            valid = false;
+        }
+        for (int d = 0; valid && d < result->defs.count; d++) {
+            const CBMDefinition *def = &result->defs.items[d];
+            bool callable = pd_callable(def);
+            bool go_field = !js && state.mixed && def->label && strcmp(def->label, "Field") == 0;
+            if ((!callable && !go_field) || !def->qualified_name) {
+                continue;
+            }
+            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+            bool ambiguous = false;
+            bool proof_target = false;
+            if (js || go_field) {
+                ambiguous = cbm_pipeline_mixed_declaration(ctx->gbuf, node) &&
+                            (js || strcmp(node->file_path, files[i].rel_path) != 0);
+                if (!ambiguous && js && state.js && strcmp(def->label, "Function") == 0) {
+                    valid = pd_decl_ambiguous(node, &proof_target);
+                    ambiguous = proof_target;
+                }
+            } else {
+                valid = pd_decl_ambiguous(node, &ambiguous);
+            }
+            if (!valid || !ambiguous) {
+                continue;
+            }
+            if (!source) {
+                source = read_file(files[i].path, &source_len, NULL, NULL);
+                char current_sha[65];
+                if (source) {
+                    cbm_sha256_hex(source, (size_t)source_len, current_sha);
+                }
+                valid = source && strcmp(current_sha, result->raw_source_sha256) == 0;
+            }
+            if (!valid) {
+                break;
+            }
+            bool raw_name = def->name && def->name_source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                    (!def->file_path || strcmp(def->file_path, files[i].rel_path) == 0) &&
+                    def->name_end_byte > def->name_start_byte &&
+                    def->name_end_byte <= (uint32_t)source_len &&
+                    strlen(def->name) == def->name_end_byte - def->name_start_byte &&
+                    memcmp(source + def->name_start_byte, def->name,
+                           def->name_end_byte - def->name_start_byte) == 0;
+            if (proof_target) {
+                if (!raw_name)
+                    continue;
+                if (!result->cached_tree && !parser) {
+                    parser = ts_parser_new();
+                    if (parser && ts_parser_set_language(parser, cbm_ts_language(files[i].language)))
+                        parsed = cbm_parse_source(parser, source, (uint32_t)source_len,
+                                                  (TSParseOptions){0});
+                }
+                const TSTree *tree = result->cached_tree ? result->cached_tree : parsed;
+                if (!tree || !pd_js_proof_callable(tree, def, classic_js))
+                    continue;
+            }
+            valid = raw_name;
+            char *alias = valid ? (js ? cbm_compiler_js_declaration_qn
+                                      : cbm_compiler_go_declaration_qn)(
+                                      &aliases, def->qualified_name, files[i].rel_path, def->label,
+                                      result->raw_source_sha256, def->name_start_byte,
+                                      def->name_end_byte, CBM_SOURCE_ORIGIN_RAW)
+                                : NULL;
+            valid = alias && pd_materialize_one(ctx, def, files[i].rel_path, result, alias, js);
+        }
+        if (parsed)
+            ts_tree_delete(parsed);
+        if (parser)
+            ts_parser_delete(parser);
+        free(source);
+        cbm_arena_destroy(&aliases);
+        cbm_pipeline_result_release(result, loaded);
+        if (!valid) {
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+    }
+    return 0;
+}
+
+int cbm_pipeline_prepare_declarations(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache) {
+    int rc = pd_prepare_declarations(ctx, files, file_count, cache);
+    if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB && ctx)
+        cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
+    return rc;
+}
+
+static bool pd_go_bind_caller(const cbm_gbuf_t *gbuf, CBMHashTable **mapping,
+                               const char **caller) {
+    if (!*caller)
+        return true;
+    const char *bound = *mapping ? cbm_ht_get(*mapping, *caller) : NULL;
+    if (!bound) {
+        bool ambiguous = false;
+        if (!pd_decl_ambiguous(cbm_gbuf_find_by_qn(gbuf, *caller), &ambiguous) || ambiguous)
+            return false;
+        if (!*mapping)
+            *mapping = cbm_ht_create(16);
+        if (!*mapping)
+            return false;
+        cbm_ht_set(*mapping, *caller, (void *)*caller);
+        return cbm_ht_get(*mapping, *caller) == *caller;
+    }
+    *caller = bound;
+    return true;
+}
+
+static bool pd_go_owner_mapping(const cbm_gbuf_t *gbuf, CBMFileResult *result, const char *rel,
+                                CBMHashTable **out) {
+    CBMHashTable *mapping = NULL;
+    bool valid = true;
+    for (int d = 0; valid && d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!pd_callable(def) || !def->qualified_name) {
+            continue;
+        }
+        bool ambiguous = false;
+        valid = pd_decl_ambiguous(cbm_gbuf_find_by_qn(gbuf, def->qualified_name), &ambiguous);
+        if (!valid || !ambiguous) {
+            continue;
+        }
+        char *alias = def->name && def->name_source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                              (!def->file_path || strcmp(def->file_path, rel) == 0)
+                          ? cbm_compiler_go_declaration_qn(
+                                &result->arena, def->qualified_name, rel, def->label,
+                                result->raw_source_sha256, def->name_start_byte,
+                                def->name_end_byte, CBM_SOURCE_ORIGIN_RAW)
+                          : NULL;
+        if (!alias) {
+            valid = false;
+            break;
+        }
+        const cbm_gbuf_node_t *physical = cbm_gbuf_find_by_qn(gbuf, alias);
+        if (!physical) {
+            valid = false;
+            break;
+        }
+        if (!pd_alias_matches(physical, def, rel, result->raw_source_sha256, false)) {
+            valid = false;
+            break;
+        }
+        if (!mapping) {
+            mapping = cbm_ht_create((uint32_t)result->defs.count);
+        }
+        const char *prior = mapping ? cbm_ht_get(mapping, def->qualified_name) : NULL;
+        if (!mapping || (prior && strcmp(prior, alias) != 0)) {
+            valid = false; /* One file cannot choose between two physical owners of one QN. */
+            break;
+        }
+        cbm_ht_set(mapping, def->qualified_name, alias);
+        valid = cbm_ht_get(mapping, def->qualified_name) == alias;
+    }
+    *out = mapping;
+    return valid;
+}
+
+static bool pd_go_unconstrained_name(const char *rel) {
+    const char *base = strrchr(rel, '/');
+    base = base ? base + 1 : rel;
+    const char *dot = strchr(base, '.');
+    /* Go checks implicit tags before the first dot. */
+    return base[0] != '_' && dot && dot != base && strcmp(dot, ".go") == 0 &&
+           !cbm_doclinks_go_name_constrained(rel);
+}
+
+static const char *pd_go_build_target(const cbm_gbuf_t *gbuf, const char *rel, size_t stem,
+                                     const char *header, const char *name, const char *logical,
+                                     const char **strategy) {
+    bool ambiguous = false;
+    if (!pd_decl_ambiguous(cbm_gbuf_find_by_qn(gbuf, logical), &ambiguous) || !ambiguous)
+        return NULL;
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    cbm_gbuf_find_by_name(gbuf, name, &nodes, &count);
+    const char *target = NULL;
+    const char *slash = strrchr(rel, '/');
+    size_t dir_len = slash ? (size_t)(slash + 1 - rel) : 0;
+    bool ordinary_name = pd_go_unconstrained_name(rel);
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *node = nodes[i];
+        const char *path = node->file_path;
+        if (!path || !node->properties_json || strcmp(node->label, "Function") != 0 ||
+            strncmp(path, rel, dir_len) != 0 || strchr(path + dir_len, '/'))
+            continue;
+        size_t len = strlen(path);
+        if (len < 3 || strcmp(path + len - 3, ".go") != 0 ||
+            (len >= 8 && strcmp(path + len - 8, "_test.go") == 0))
+            continue;
+        /* A test/production stem shares implicit tags. Other filenames must
+         * add no constraints beyond the byte-identical explicit header. */
+        bool same_stem = stem && len == stem + 3 && strncmp(path, rel, stem) == 0;
+        if (!same_stem && !(ordinary_name && pd_go_unconstrained_name(path)))
+            continue;
+        yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+        yyjson_val *props = yyjson_doc_get_root(doc);
+        bool matches = yyjson_get_uint(yyjson_obj_get(props, "go_physical_decl")) == 1 &&
+                       yyjson_equals_str(yyjson_obj_get(props, "go_logical_qn"), logical) &&
+                       yyjson_equals_str(yyjson_obj_get(props, "go_build_header_sha256"), header);
+        yyjson_doc_free(doc);
+        if (matches) {
+            if (target)
+                return NULL;
+            target = node->qualified_name;
+            *strategy = same_stem ? "lsp_go_test_variant" : "lsp_go_build_variant";
+        }
+    }
+    return target;
+}
+
+static void pd_go_bind_direct_target(const cbm_gbuf_t *gbuf, const CBMHashTable *mapping,
+                                     const char *module_qn, const char *rel, size_t test_stem,
+                                     const char *build_header, CBMResolvedCall *call) {
+    if ((!mapping && !build_header) || !module_qn || !call->callee_qn || call->reason ||
+        call->confidence <= 0.0f ||
+        call->kind != CBM_RESOLVED_INVOCATION || call->site_end_byte <= call->site_start_byte ||
+        !call->strategy || strcmp(call->strategy, "lsp_direct") != 0)
+        return;
+
+    const char *name = strrchr(call->callee_qn, '.');
+    if (!name || (size_t)(name - call->callee_qn) != strlen(module_qn) ||
+        strncmp(call->callee_qn, module_qn, (size_t)(name - call->callee_qn)) != 0)
+        return;
+
+    const char *bound = mapping ? cbm_ht_get(mapping, call->callee_qn) : NULL;
+    const cbm_gbuf_node_t *target =
+        bound && strcmp(bound, call->callee_qn) != 0 ? cbm_gbuf_find_by_qn(gbuf, bound) : NULL;
+    /* A build that includes this call also includes this file's package function. */
+    const char *strategy = "lsp_go_same_file";
+    if (!target || strcmp(target->label, "Function") != 0) {
+        if (!build_header)
+            return;
+        bound = pd_go_build_target(gbuf, rel, test_stem, build_header, name + 1, call->callee_qn,
+                                    &strategy);
+        if (!bound)
+            return;
+    }
+    call->reason = name + 1;
+    call->callee_qn = bound;
+    call->strategy = strategy;
+}
+
+bool cbm_pipeline_bind_go_callers(const cbm_gbuf_t *gbuf, CBMFileResult *result, const char *rel) {
+    if (!gbuf || !result || !rel || result->defs.count < 0 ||
+        (result->defs.count && !result->defs.items) || result->calls.count < 0 ||
+        (result->calls.count && !result->calls.items) || result->resolved_calls.count < 0 ||
+        (result->resolved_calls.count && !result->resolved_calls.items) ||
+        result->usages.count < 0 || (result->usages.count && !result->usages.items) ||
+        result->rw.count < 0 || (result->rw.count && !result->rw.items)) {
+        return false;
+    }
+    CBMHashTable *mapping = NULL;
+    bool valid = pd_go_owner_mapping(gbuf, result, rel, &mapping);
+    static const char suffix[] = "_test.go";
+    size_t rel_len = strlen(rel);
+    size_t stem = rel_len >= sizeof(suffix) ? rel_len - (sizeof(suffix) - 1) : 0;
+    bool production_pair = stem < sizeof("_test") - 1 ||
+                           memcmp(rel + stem - (sizeof("_test") - 1), "_test",
+                                  sizeof("_test") - 1) != 0;
+    size_t test_stem = stem && strcmp(rel + stem, suffix) == 0 && production_pair ? stem : 0;
+    const char *build_header = result->go_build_header_sha256[0]
+                                   ? result->go_build_header_sha256 : NULL;
+    if (valid && mapping) {
+        /* Keep semantic edges on the same physical owner as calls. */
+        for (int i = 0; i < result->usages.count; i++) {
+            CBMUsage *usage = &result->usages.items[i];
+            if (usage->source_origin == CBM_SOURCE_ORIGIN_RAW && usage->enclosing_func_qn) {
+                const char *owner = cbm_ht_get(mapping, usage->enclosing_func_qn);
+                if (owner)
+                    usage->enclosing_func_qn = owner;
+            }
+        }
+        for (int i = 0; i < result->rw.count; i++) {
+            CBMReadWrite *rw = &result->rw.items[i];
+            const char *owner = rw->enclosing_func_qn
+                                    ? cbm_ht_get(mapping, rw->enclosing_func_qn)
+                                    : NULL;
+            if (owner)
+                rw->enclosing_func_qn = owner;
+        }
+    }
+    if (valid) {
+        for (int i = 0; valid && i < result->calls.count; i++) {
+            CBMCall *call = &result->calls.items[i];
+            if (call->source_origin == CBM_SOURCE_ORIGIN_RAW)
+                valid = pd_go_bind_caller(gbuf, &mapping, &call->enclosing_func_qn);
+        }
+        for (int i = 0; valid && i < result->resolved_calls.count; i++) {
+            CBMResolvedCall *call = &result->resolved_calls.items[i];
+            if (call->source_origin == CBM_SOURCE_ORIGIN_RAW) {
+                if (!result->has_error && !result->parse_incomplete)
+                    pd_go_bind_direct_target(gbuf, mapping, result->module_qn, rel, test_stem,
+                                              build_header, call);
+                valid = pd_go_bind_caller(gbuf, &mapping, &call->caller_qn);
+            }
+        }
+    }
+    cbm_ht_free(mapping);
+    return valid;
+}
+
+typedef struct {
+    const char *logical;
+    const char *physical;
+    uint32_t start;
+    uint32_t end;
+    bool module_function;
+} pd_js_owner_t;
+
+static TSNode pd_js_callable(TSNode root, const CBMDefinition *def) {
+    TSNode name = ts_node_named_descendant_for_byte_range(root, def->name_start_byte,
+                                                         def->name_end_byte);
+    if (ts_node_is_null(name) || ts_node_start_byte(name) != def->name_start_byte ||
+        ts_node_end_byte(name) != def->name_end_byte)
+        return (TSNode){0};
+    TSNode parent = ts_node_parent(name);
+    if (ts_node_is_null(parent))
+        return (TSNode){0};
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "variable_declarator") == 0 ||
+        strcmp(kind, "public_field_definition") == 0 || strcmp(kind, "pair") == 0)
+        return ts_node_child_by_field_name(parent, TS_FIELD("value"));
+    return parent;
+}
+
+static const char *pd_js_site_owner(const cbm_gbuf_t *gbuf, const pd_js_owner_t *owners, int count,
+                                    const char *logical, const char *module_qn, uint32_t start,
+                                    uint32_t end) {
+    if (!logical || (module_qn && strcmp(logical, module_qn) == 0) ||
+        !cbm_pipeline_mixed_declaration(gbuf, cbm_gbuf_find_by_qn(gbuf, logical)))
+        return logical;
+    const pd_js_owner_t *best = NULL;
+    for (int i = 0; i < count; i++) {
+        const pd_js_owner_t *owner = &owners[i];
+        if (end <= start || owner->start > start || owner->end < end ||
+            strcmp(owner->logical, logical) != 0)
+            continue;
+        if (!best || owner->end - owner->start < best->end - best->start)
+            best = owner;
+    }
+    return best ? best->physical : NULL;
+}
+
+bool cbm_pipeline_bind_js_calls(const cbm_pipeline_ctx_t *ctx, CBMFileResult *result,
+                                const cbm_file_info_t *file) {
+    if (!ctx->mixed_declarations || !pd_js_language(file->language))
+        return true;
+    const char *module_qn = result->module_qn;
+    const cbm_gbuf_node_t *module = module_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, module_qn) : NULL;
+    if (module && module->file_path &&
+        cbm_language_for_filename(module->file_path) == CBM_LANG_GO) {
+        /* A Go declaration can occupy the logical JS module QN. */
+        char *qn = cbm_pipeline_fqn_compute(ctx->project_name, file->rel_path, "__file__");
+        const cbm_gbuf_node_t *owner = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+        const char *file_qn = owner && owner->label && strcmp(owner->label, "File") == 0 &&
+                                      owner->file_path && strcmp(owner->file_path, file->rel_path) == 0
+                                  ? cbm_arena_strdup(&result->arena, qn) : NULL;
+        free(qn);
+        if (!file_qn)
+            return false;
+        for (int i = 0; i < result->calls.count; i++) {
+            CBMCall *call = &result->calls.items[i];
+            if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, module_qn) == 0)
+                call->enclosing_func_qn = file_qn;
+        }
+        for (int i = 0; i < result->resolved_calls.count; i++) {
+            CBMResolvedCall *call = &result->resolved_calls.items[i];
+            if (call->caller_qn && strcmp(call->caller_qn, module_qn) == 0)
+                call->caller_qn = file_qn;
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (pd_callable(def) && def->qualified_name &&
+            cbm_pipeline_mixed_declaration(ctx->gbuf,
+                                           cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name)))
+            count++;
+    }
+    if (!count)
+        return true;
+
+    pd_js_owner_t *owners =
+        cbm_arena_alloc(&result->arena, (size_t)count * sizeof(*owners));
+    int length = 0;
+    char *source = owners ? read_file(file->path, &length, NULL, NULL) : NULL;
+    char hash[65];
+    if (source)
+        cbm_sha256_hex(source, (size_t)length, hash);
+    bool valid = source && strcmp(hash, result->raw_source_sha256) == 0;
+    TSParser *parser = valid && !result->cached_tree ? ts_parser_new() : NULL;
+    TSTree *parsed = parser && ts_parser_set_language(parser, cbm_ts_language(file->language))
+                         ? cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0})
+                         : NULL;
+    const TSTree *tree = result->cached_tree ? result->cached_tree : parsed;
+    valid = valid && tree;
+    int used = 0;
+    for (int i = 0; valid && i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (!pd_callable(def) || !def->qualified_name ||
+            !cbm_pipeline_mixed_declaration(ctx->gbuf,
+                                            cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name)))
+            continue;
+        const char *physical = cbm_compiler_js_declaration_qn(
+            &result->arena, def->qualified_name, file->rel_path, def->label, hash,
+            def->name_start_byte, def->name_end_byte, def->name_source_origin);
+        TSNode callable = pd_js_callable(ts_tree_root_node(tree), def);
+        if (!physical || ts_node_is_null(callable) ||
+            !pd_alias_matches(cbm_gbuf_find_by_qn(ctx->gbuf, physical), def, file->rel_path, hash,
+                              true)) {
+            valid = false;
+            break;
+        }
+        owners[used++] = (pd_js_owner_t){
+            .logical = def->qualified_name, .physical = physical,
+            .start = ts_node_start_byte(callable), .end = ts_node_end_byte(callable),
+            .module_function = strcmp(ts_node_type(callable), "function_declaration") == 0 &&
+                               ts_node_eq(ts_node_parent(callable), ts_tree_root_node(tree)),
+        };
+    }
+    if (parser)
+        ts_parser_delete(parser);
+    if (parsed)
+        ts_tree_delete(parsed);
+    free(source);
+    if (!valid)
+        return false;
+
+    for (int i = 0; i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (call->source_origin == CBM_SOURCE_ORIGIN_RAW)
+            call->enclosing_func_qn = pd_js_site_owner(ctx->gbuf, owners, used,
+                call->enclosing_func_qn, module_qn, call->site_start_byte, call->site_end_byte);
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        CBMResolvedCall *call = &result->resolved_calls.items[i];
+        if (call->source_origin != CBM_SOURCE_ORIGIN_RAW)
+            continue;
+        call->caller_qn = pd_js_site_owner(ctx->gbuf, owners, used, call->caller_qn, module_qn,
+                                          call->site_start_byte, call->site_end_byte);
+        if (call->kind != CBM_RESOLVED_INVOCATION || call->site_end_byte <= call->site_start_byte ||
+            !call->callee_qn || !call->strategy || strcmp(call->strategy, "lsp_ts_local") != 0)
+            continue;
+        /* Native module lookup is sufficient only for one same-file declaration. */
+        const pd_js_owner_t *target = NULL;
+        for (int j = 0; j < used; j++) {
+            if (strcmp(owners[j].logical, call->callee_qn) != 0)
+                continue;
+            if (target) {
+                target = NULL;
+                break;
+            }
+            target = &owners[j];
+        }
+        if (target && target->module_function) {
+            call->reason = call->callee_qn;
+            call->callee_qn = target->physical;
+        }
+    }
+    return true;
+}
+
+bool cbm_pipeline_bind_go_declaration_owners(const cbm_gbuf_t *gbuf, CBMFileResult *result,
+                                             const char *rel) {
+    if (!gbuf || !result || !rel || result->defs.count < 0 ||
+        (result->defs.count && !result->defs.items) || result->env_accesses.count < 0 ||
+        (result->env_accesses.count && !result->env_accesses.items) ||
+        result->channels.count < 0 || (result->channels.count && !result->channels.items)) {
+        return false;
+    }
+    if (!result->env_accesses.count && !result->channels.count)
+        return true;
+    CBMHashTable *mapping = NULL;
+    bool valid = pd_go_owner_mapping(gbuf, result, rel, &mapping);
+    for (int i = 0; valid && i < result->env_accesses.count; i++)
+        valid = pd_go_bind_caller(gbuf, &mapping, &result->env_accesses.items[i].enclosing_func_qn);
+    for (int i = 0; valid && i < result->channels.count; i++)
+        valid = pd_go_bind_caller(gbuf, &mapping, &result->channels.items[i].enclosing_func_qn);
+    cbm_ht_free(mapping);
+    return valid;
 }
 
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
@@ -697,7 +1480,7 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         free(file_qn);
         return 0;
     }
-    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
+    if (language == CBM_LANG_PHP) {
         count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
                                                      namespace_map);
     } else {
@@ -709,10 +1492,8 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
             const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
                 ctx, rel, file_qn, language, imp, namespace_map, scala_index);
             if (target && target->id != source_node->id) {
-                char esc_ln[CBM_SZ_128];
-                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
                 char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                cbm_pipeline_format_import_edge(imp_props, sizeof(imp_props), language, imp);
                 cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
                 count++;
             }
@@ -892,6 +1673,10 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     const char *source, int source_len, const char *project_name, const char *rel_path,
     const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
     int64_t timeout_micros) {
+    if (source && source_len == 0) {
+        return cbm_extract_file_ex(source, 0, CBM_LANG_OBJECTSCRIPT_UDL, project_name, rel_path,
+                                   timeout_micros, NULL, NULL, macro_table, return_type_table);
+    }
     CBMArena export_arena;
     cbm_arena_init(&export_arena);
     int class_count = 0;
@@ -920,6 +1705,7 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
         return NULL;
     }
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
+    cbm_sha256_hex(source, (size_t)source_len, aggregate->raw_source_sha256);
 
     cbm_objectscript_export_extractor_t extract = objectscript_export_test_extractor
                                                       ? objectscript_export_test_extractor
@@ -929,7 +1715,27 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
                                       CBM_LANG_OBJECTSCRIPT_UDL, project_name, rel_path,
                                       timeout_micros, NULL, NULL, macro_table, return_type_table);
         if (!part) {
+            aggregate->parse_incomplete = true;
             continue;
+        }
+
+        /* Generated UDL offsets do not identify occurrences in the physical XML. */
+        for (int i = 0; i < part->defs.count; i++) {
+            part->defs.items[i].name_start_byte = part->defs.items[i].name_end_byte = 0;
+            part->defs.items[i].name_source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        }
+        for (int i = 0; i < part->calls.count; i++) {
+            part->calls.items[i].site_start_byte = part->calls.items[i].site_end_byte = 0;
+            part->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        }
+        for (int i = 0; i < part->usages.count; i++) {
+            part->usages.items[i].site_start_byte = part->usages.items[i].site_end_byte = 0;
+            part->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        }
+        for (int i = 0; i < part->resolved_calls.count; i++) {
+            part->resolved_calls.items[i].site_start_byte =
+                part->resolved_calls.items[i].site_end_byte = 0;
+            part->resolved_calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
         }
 
         /* The aggregate has no single parse tree. Later ObjectScript Export
@@ -1051,6 +1857,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
          * re-crashing and without duplicating the skip. No-op unless
          * CBM_INDEX_QUARANTINE_FILE is set. */
         if (cbm_index_is_quarantined(rel)) {
+            cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
             const char *phase = cbm_index_quarantine_phase(rel);
             if (!phase) {
                 phase = "crash";
@@ -1072,6 +1879,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_read_status_t rst = CBM_READ_OK;
         char *source = read_file(path, &source_len, &file_size, &rst);
         if (!source) {
+            cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
             errors++;
             if (rst == CBM_READ_OVERSIZED) {
                 /* Never a silent drop: record the oversized skip + WARN so the
@@ -1115,6 +1923,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             goto configured_failure;
         }
         if (!result) {
+            cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
             errors++;
             cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
@@ -1159,7 +1968,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                    : 0;
         for (int d = 0; d < result->defs.count; d++) {
             process_def(ctx, &result->defs.items[d], rel, file_doc, lang, py_prefix_len,
-                        !local_cache);
+                        !local_cache, result->raw_source_sha256);
             file_doc = NULL;
             total_defs++;
         }
@@ -1200,6 +2009,15 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     if (local_cache) {
         link_cached_def_parents(ctx, local_cache, file_count);
     }
+    int decl_rc = cbm_pipeline_prepare_declarations(ctx, files, file_count, local_cache);
+    if (decl_rc != 0) {
+        if (owns_local_cache) {
+            for (int i = 0; i < file_count; i++)
+                cbm_free_result(local_cache[i]);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
+        }
+        return decl_rc;
+    }
 
     /* Phase 2: now that all extraction results are cached and Module
      * nodes for every file are in the graph, walk the cache again to
@@ -1228,6 +2046,12 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             CBMFileResult *result = local_cache[i];
             if (!result) {
                 continue;
+            }
+            if (files[i].language == CBM_LANG_GO &&
+                !cbm_pipeline_bind_go_declaration_owners(ctx->gbuf, result, files[i].rel_path)) {
+                cbm_pipeline_import_maps_free(namespace_map, scala_index);
+                cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
+                goto configured_failure;
             }
             total_imports += create_import_edges_for_file(
                 ctx, result, files[i].rel_path, files[i].language, namespace_map, scala_index);

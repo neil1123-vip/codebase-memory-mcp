@@ -292,6 +292,8 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
         cr_str(c, &facts->class_bindings);
         cr_str(c, &facts->global_names);
     }
+    cr_str(c, &d->go_underlying_type);
+    cr_str(c, &d->go_generic_declaration);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {

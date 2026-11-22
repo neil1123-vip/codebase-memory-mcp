@@ -77,6 +77,13 @@ cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLang
                                           const char **imp_keys, const char **imp_vals,
                                           int imp_count);
 
+/* Replace only exact raw occurrences from a verified compiler snapshot.
+ * Unknown, dynamic and external sites also suppress name-only fallback. */
+bool cbm_pxc_apply_compiler_facts(const CBMCompilerFacts *facts, CBMFileResult *result,
+                                  const char *rel_path);
+bool cbm_pxc_apply_compiler_run(CBMCompilerRun *run, CBMLanguage language,
+                                 CBMFileResult *result, const char *rel_path);
+
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
  * caller frees each entry then the array). String fields in the
@@ -185,8 +192,8 @@ uint64_t cbm_pxc_test_reach_work(void);
 typedef struct {
     CBMTypeRegistry *by_engine[CBM_PXC_MAX_ENGINES]; /* indexed by engine row */
     /* The pipeline context the walks may read (the project registry, for the
-     * calling file's own identities: cbm_pxc_file_scope). Every driver sets
-     * it, also when it builds no registry; NULL in a harness without one. */
+     * calling file's own identities, and verified compiler facts). Every
+     * driver sets it, also when it builds no registry; NULL in a harness. */
     const cbm_pipeline_ctx_t *ctx;
 } CBMCrossLspRegistries;
 
@@ -200,6 +207,10 @@ void cbm_pxc_build_cross_registries(CBMArena *arena, CBMLSPDef *defs, int def_co
 /* The pre-built registry of the engine serving `lang`, or NULL if none was
  * built (or the language has no engine; r may be NULL). */
 CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r, CBMLanguage lang);
+
+/* Seal compiler overlays above the native bases before workers begin. */
+void cbm_pxc_merge_compiler_registries(CBMCrossLspRegistries *registries, CBMArena *arena,
+                                       CBMCompilerRun *run);
 
 /* Per-file registry-build cost (#1669): how many defs the per-file cross-LSP
  * path actually registered, and how often the module filter failed. */

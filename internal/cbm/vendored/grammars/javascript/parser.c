@@ -6836,6 +6836,8 @@ static bool ts_lex_keywords(TSLexer *lexer, TSStateId state) {
       if (lookahead == 'i') ADVANCE(183);
       END_STATE();
     case 165:
+      // A contiguous property access starts with an identifier, not a declaration.
+      if (lookahead == '.') END_STATE();
       ACCEPT_TOKEN(anon_sym_using);
       END_STATE();
     case 166:

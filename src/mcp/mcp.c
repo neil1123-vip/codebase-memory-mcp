@@ -6968,6 +6968,98 @@ cleanup:
  * the graph, stored outside it). Full per-project list, capped generously. */
 enum { COVERAGE_FILE_CAP = 500 };
 
+static yyjson_mut_val *coverage_call_totals(yyjson_mut_doc *doc,
+                                           const cbm_coverage_row_t *rows, int count,
+                                           bool authoritative) {
+    static const char *const fields[] = {
+        "observed_invocations", "call_references", "internal_resolved", "external_dependency",
+        "unresolved", "dynamic_callable", "unclassified", "unlocated_invocations",
+        "ambiguous_carriers", "sampled_diagnostics"};
+    uint64_t totals[sizeof(fields) / sizeof(fields[0])] = {0};
+    int files = 0, limited = 0, truncated = 0, unavailable = 0;
+    bool complete = authoritative, grouped = false;
+    yyjson_mut_val *out = yyjson_mut_obj(doc), *reasons = yyjson_mut_obj(doc);
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].kind || strcmp(rows[i].kind, "call_summary") != 0)
+            continue;
+        yyjson_doc *input = rows[i].detail
+            ? yyjson_read(rows[i].detail, strlen(rows[i].detail), 0) : NULL;
+        yyjson_val *summary = input ? yyjson_doc_get_root(input) : NULL;
+        bool valid = yyjson_is_obj(summary) &&
+                     yyjson_get_uint(yyjson_obj_get(summary, "version")) == 1 &&
+                     yyjson_is_bool(yyjson_obj_get(summary, "counts_complete")) &&
+                     yyjson_is_obj(yyjson_obj_get(summary, "reasons"));
+        for (size_t f = 0; valid && f < sizeof(fields) / sizeof(fields[0]); f++)
+            valid = yyjson_is_uint(yyjson_obj_get(summary, fields[f]));
+        if (!valid) {
+            unavailable++;
+            complete = false;
+            yyjson_doc_free(input);
+            continue;
+        }
+        files++;
+        complete &= yyjson_is_true(yyjson_obj_get(summary, "counts_complete"));
+        limited += yyjson_is_true(yyjson_obj_get(summary, "analysis_limited"));
+        truncated += yyjson_is_true(yyjson_obj_get(summary, "samples_truncated"));
+        grouped |= yyjson_is_true(yyjson_obj_get(summary, "reasons_grouped"));
+        for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++)
+            totals[f] += yyjson_get_uint(yyjson_obj_get(summary, fields[f]));
+        size_t index, maximum;
+        yyjson_val *key, *value;
+        yyjson_obj_foreach(yyjson_obj_get(summary, "reasons"), index, maximum, key, value) {
+            const char *name = yyjson_get_str(key);
+            yyjson_mut_val *old = yyjson_mut_obj_get(reasons, name);
+            if (!old && yyjson_mut_obj_size(reasons) >= 64) {
+                name = "other";
+                grouped = true;
+                old = yyjson_mut_obj_get(reasons, name);
+            }
+            if (!yyjson_is_uint(value)) {
+                complete = false;
+                continue;
+            }
+            if (old)
+                yyjson_mut_set_uint(old, yyjson_mut_get_uint(old) + yyjson_get_uint(value));
+            else
+                yyjson_mut_obj_add(reasons, yyjson_mut_strcpy(doc, name),
+                                   yyjson_mut_uint(doc, yyjson_get_uint(value)));
+        }
+        yyjson_doc_free(input);
+    }
+    yyjson_mut_obj_add_bool(doc, out, "available", files > 0);
+    yyjson_mut_obj_add_bool(doc, out, "counts_complete", complete && files > 0);
+    yyjson_mut_obj_add_str(doc, out, "scope", "extracted_calls");
+    yyjson_mut_obj_add_int(doc, out, "files", files);
+    yyjson_mut_obj_add_int(doc, out, "unavailable_files", unavailable);
+    yyjson_mut_obj_add_int(doc, out, "analysis_limited_files", limited);
+    yyjson_mut_obj_add_int(doc, out, "sample_truncated_files", truncated);
+    for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++)
+        yyjson_mut_obj_add_uint(doc, out, fields[f], totals[f]);
+    yyjson_mut_obj_add_bool(doc, out, "reasons_grouped", grouped);
+    yyjson_mut_obj_add_val(doc, out, "reasons", reasons);
+    return out;
+}
+
+static void add_callback_context_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                         yyjson_mut_val *files, int count, int sample_limit) {
+    yyjson_mut_val *limited = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, limited, "files", files);
+    yyjson_mut_obj_add_int(doc, limited, "count", count);
+    yyjson_mut_obj_add_bool(doc, limited, "truncated", count > sample_limit);
+    if (count > sample_limit)
+        yyjson_mut_obj_add_int(doc, limited, "omitted", count - sample_limit);
+    if (count > 0)
+        yyjson_mut_obj_add_str(
+            doc, limited, "note",
+            "Files were indexed; callback context propagation stopped at its budget. "
+            "Definitions and observed calls remain available; verify callback targets in source.");
+    yyjson_mut_obj_add_val(doc, root, "analysis_limited", limited);
+}
+
+static bool coverage_is_metadata(const char *kind) {
+    return kind && (strcmp(kind, "call_summary") == 0 || strcmp(kind, "compiler_facts") == 0);
+}
+
 static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
                                 const char *project, const char *indexed_at, int sample_limit) {
     cbm_coverage_row_t *rows = NULL;
@@ -6979,18 +7071,36 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *pu_files = yyjson_mut_arr(doc);
     yyjson_mut_val *unresolved_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *limited_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
     int pp_n = 0;
     int pu_n = 0;
     int unresolved_n = 0;
+    int limited_n = 0;
     int sk_n = 0;
     int ni_dir_n = 0;
     int ni_file_n = 0;
     for (int i = 0; i < count; i++) {
         const char *kind = rows[i].kind ? rows[i].kind : "";
-        if (strcmp(kind, "parse_partial") == 0) {
+        if (strcmp(kind, "compiler_facts") == 0) {
+            yyjson_doc *input = rows[i].detail
+                ? yyjson_read(rows[i].detail, strlen(rows[i].detail), 0) : NULL;
+            yyjson_val *status = input ? yyjson_doc_get_root(input) : NULL;
+            yyjson_mut_val *compiler = yyjson_is_obj(status)
+                ? yyjson_val_mut_copy(doc, status) : yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_str(doc, compiler, "scope", "project");
+            if (!yyjson_is_obj(status)) {
+                yyjson_mut_obj_add_str(doc, compiler, "status", "unavailable");
+                yyjson_mut_obj_add_str(doc, compiler, "reason", "invalid_status");
+            }
+            yyjson_mut_obj_add_val(doc, root, "compiler_facts", compiler);
+            yyjson_doc_free(input);
+            continue;
+        } else if (coverage_is_metadata(kind)) {
+            continue;
+        } else if (strcmp(kind, "parse_partial") == 0) {
             if (pp_n < sample_limit) {
                 yyjson_mut_val *fe = yyjson_mut_obj(doc);
                 yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
@@ -7019,6 +7129,17 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
                 yyjson_mut_arr_add_strcpy(doc, unresolved_files, rows[i].rel_path);
             }
             unresolved_n++;
+        } else if (strcmp(kind, "callback_context") == 0) {
+            if (limited_n < sample_limit) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                yyjson_mut_obj_add_str(doc, fe, "phase", "callback_context");
+                yyjson_mut_obj_add_strcpy(doc, fe, "reason",
+                                          rows[i].detail ? rows[i].detail : "");
+                yyjson_mut_obj_add_bool(doc, fe, "indexed", true);
+                yyjson_mut_arr_add_val(limited_files, fe);
+            }
+            limited_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
             if (ni_dir_n < sample_limit) {
                 yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
@@ -7043,14 +7164,16 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             sk_n++;
         }
     }
-    cbm_store_free_coverage(rows, count);
-
     /* Discovery retains a bounded sample of ignored files but records the
      * exact uncapped total atomically beside it. Counts-only status must use
      * that authoritative total: reporting only the stored rows makes a lean
      * response look complete precisely when the discovery cap was hit. */
     bool generation_matches =
         have_meta && indexed_at && meta.generation && strcmp(indexed_at, meta.generation) == 0;
+    yyjson_mut_obj_add_val(doc, root, "call_diagnostics",
+        coverage_call_totals(doc, rows, count, generation_matches &&
+            meta.coverage_version >= 28 && meta.unresolved_calls_complete));
+    cbm_store_free_coverage(rows, count);
     bool ignored_total_authoritative = generation_matches && meta.ignored_files_total >= ni_file_n;
     int ni_file_total = ni_file_n;
     if (ignored_total_authoritative) {
@@ -7081,6 +7204,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_obj_add_int(doc, unresolved, "count", unresolved_n);
     yyjson_mut_obj_add_bool(doc, unresolved, "truncated", unresolved_n > sample_limit);
     yyjson_mut_obj_add_val(doc, root, "unresolved_calls", unresolved);
+    add_callback_context_report(doc, root, limited_files, limited_n, sample_limit);
 
     yyjson_mut_val *sk = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
@@ -7497,6 +7621,8 @@ static bool coverage_add_ranges(yyjson_mut_doc *doc, yyjson_mut_val *row, const 
 static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
                                   const cbm_coverage_row_t *row, const char *requested_path,
                                   bool diagnostics_full) {
+    if (row->kind && strcmp(row->kind, "compiler_facts") == 0)
+        return;
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, item, "path", row->rel_path ? row->rel_path : "");
     yyjson_mut_obj_add_strcpy(doc, item, "kind", row->kind ? row->kind : "");
@@ -7506,6 +7632,17 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
             row->rel_path && strcmp(row->rel_path, requested_path) == 0 ? "exact" : "ancestor");
     }
     bool ranges_added = false;
+    if (row->kind && strcmp(row->kind, "call_summary") == 0) {
+        yyjson_doc *summary = row->detail ? yyjson_read(row->detail, strlen(row->detail), 0) : NULL;
+        if (summary)
+            yyjson_mut_obj_add_val(doc, item, "summary",
+                yyjson_val_mut_copy(doc, yyjson_doc_get_root(summary)));
+        else
+            yyjson_mut_obj_add_bool(doc, item, "summary_unavailable", true);
+        yyjson_doc_free(summary);
+        yyjson_mut_arr_add_val(array, item);
+        return;
+    }
     if (row->kind &&
         (strcmp(row->kind, "parse_partial") == 0 || strcmp(row->kind, "parse_unusable") == 0)) {
         ranges_added = coverage_add_ranges(doc, item, row->detail);
@@ -7559,12 +7696,17 @@ enum {
     COVERAGE_STATUS_PARSE,
     COVERAGE_STATUS_EXCLUDED,
     COVERAGE_STATUS_SKIPPED,
+    COVERAGE_STATUS_LIMITED,
     COVERAGE_STATUS_UNRESOLVED,
     COVERAGE_STATUS_PASSES
 };
 
 static const char *coverage_row_status(const char *kind, int pass) {
     kind = kind ? kind : "";
+    if (coverage_is_metadata(kind))
+        return NULL;
+    if (strcmp(kind, "callback_context") == 0)
+        return pass == COVERAGE_STATUS_LIMITED ? "limited" : NULL;
     if (pass == COVERAGE_STATUS_PARSE) {
         if (strcmp(kind, "parse_unusable") == 0) {
             return "unusable";
@@ -7632,7 +7774,7 @@ static const char *coverage_recommended_action(const char *status, const char *f
     if (strcmp(status, "partial") == 0) {
         return "read_ranges_and_verify_scope";
     }
-    if (strcmp(status, "unresolved_calls") == 0) {
+    if (strcmp(status, "unresolved_calls") == 0 || strcmp(status, "limited") == 0) {
         return "read_source_and_verify_calls";
     }
     if (strcmp(status, "unusable") == 0) {
@@ -7835,40 +7977,51 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 row_count = 0;
                 yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
             }
-            yyjson_mut_obj_add_int(doc, item, "total", row_count);
+            yyjson_mut_obj_add_val(doc, item, "call_diagnostics",
+                coverage_call_totals(doc, rows, row_count, generation_matches &&
+                    meta.coverage_version >= 28 && meta.unresolved_calls_complete));
+            int coverage_count = 0;
+            for (int i = 0; i < row_count; i++)
+                coverage_count += !coverage_is_metadata(rows[i].kind);
+            yyjson_mut_obj_add_int(doc, item, "total", coverage_count);
             int flat_start = scope_total;
-            int flat_end = flat_start + row_count;
+            int flat_end = flat_start + coverage_count;
             int page_start = scope_offset;
             int page_end = scope_offset + scope_limit;
             int start = page_start > flat_start ? page_start - flat_start : 0;
-            int end = page_end < flat_end ? page_end - flat_start : row_count;
+            int end = page_end < flat_end ? page_end - flat_start : coverage_count;
             if (start < 0) {
                 start = 0;
-            } else if (start > row_count) {
-                start = row_count;
+            } else if (start > coverage_count) {
+                start = coverage_count;
             }
             if (end < start) {
                 end = start;
-            } else if (end > row_count) {
-                end = row_count;
+            } else if (end > coverage_count) {
+                end = coverage_count;
             }
             int returned = end - start;
             yyjson_mut_obj_add_int(doc, item, "returned", returned);
-            yyjson_mut_obj_add_bool(doc, item, "truncated", returned < row_count);
+            yyjson_mut_obj_add_bool(doc, item, "truncated", returned < coverage_count);
             yyjson_mut_val *entries = yyjson_mut_arr(doc);
-            for (int i = start; i < end; i++) {
-                coverage_add_row_json(doc, entries, &rows[i], NULL, diagnostics_full);
+            int coverage_index = 0;
+            for (int i = 0; i < row_count; i++) {
+                if (coverage_is_metadata(rows[i].kind))
+                    continue;
+                if (coverage_index >= start && coverage_index < end)
+                    coverage_add_row_json(doc, entries, &rows[i], NULL, diagnostics_full);
+                coverage_index++;
             }
             yyjson_mut_obj_add_val(doc, item, "entries", entries);
             const char *scope_status = !lookup_ok || !generation_matches ? "coverage_unavailable"
-                                       : row_count > 0                   ? "known_gaps"
+                                       : coverage_count > 0              ? "known_gaps"
                                        : strcmp(recording_status, "complete") == 0
                                            ? "no_recorded_issue"
                                            : "coverage_unavailable";
             yyjson_mut_obj_add_str(doc, item, "status", scope_status);
             cbm_store_free_coverage(rows, row_count);
             yyjson_mut_arr_add_val(scope_results, item);
-            scope_total += row_count;
+            scope_total += coverage_count;
             scope_returned += returned;
         }
     }
@@ -12226,7 +12379,9 @@ static bool is_parse_unusable(const cbm_file_error_t *e) {
  * graph entirely. */
 static bool is_indexed_coverage(const cbm_file_error_t *e) {
     return is_parse_partial(e) || is_parse_unusable(e) ||
-           (e->phase && strcmp(e->phase, "unresolved_calls") == 0);
+           (e->phase && (strcmp(e->phase, "unresolved_calls") == 0 ||
+                         strcmp(e->phase, "callback_context") == 0 ||
+                         strcmp(e->phase, "call_summary") == 0));
 }
 
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
@@ -12236,18 +12391,33 @@ static bool is_indexed_coverage(const cbm_file_error_t *e) {
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
  * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
- * parse_partial, parse_unusable, and unresolved_calls entries. These describe
- * indexed files and are counted separately from skips. */
+ * parse_partial, parse_unusable, unresolved_calls and callback_context entries.
+ * These describe indexed files and are counted separately from skips.
+ * call_summary rows are metadata, not failures. */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
     int skips = 0;
     int unresolved = 0;
+    int limited = 0;
+    yyjson_mut_val *limited_files = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
         unresolved += errs[i].phase && strcmp(errs[i].phase, "unresolved_calls") == 0;
+        if (errs[i].phase && strcmp(errs[i].phase, "callback_context") == 0) {
+            if (limited < INDEX_SKIPPED_FILE_CAP) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
+                yyjson_mut_obj_add_str(doc, fe, "phase", "callback_context");
+                yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
+                yyjson_mut_obj_add_bool(doc, fe, "indexed", true);
+                yyjson_mut_arr_add_val(limited_files, fe);
+            }
+            limited++;
+        }
         if (!is_indexed_coverage(&errs[i])) {
             skips++;
         }
     }
+    add_callback_context_report(doc, root, limited_files, limited, INDEX_SKIPPED_FILE_CAP);
     yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
     yyjson_mut_obj_add_int(doc, root, "unresolved_calls_count", unresolved);
     if (logfile && logfile[0]) {

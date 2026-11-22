@@ -6,7 +6,10 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "../helpers.h"
 #include "go_lsp.h" // for CBMLSPDef, CBMResolvedCallArray (shared cross-language)
+
+struct CBMCompilerFacts;
 
 // TSLSPContext holds state for TypeScript / JavaScript / JSX / TSX expression type
 // evaluation within a single file. One context per cbm_run_ts_lsp invocation.
@@ -27,6 +30,7 @@ typedef struct {
     int source_len;
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+    CBMScope *written_functions; // file-level writes block only new function-value aliases
 
     // Import map: local_name -> module QN (resolved or opaque).
     // Parallel arrays of length import_count.
@@ -36,9 +40,9 @@ typedef struct {
     int import_capacity;     // rows the two arrays hold (ts_lsp_add_import)
     CBMNameRows import_rows; // import_local_names by name, rows in table order
 
-    // Renamed named imports (`import { foo as bar }`): local binding -> the name
-    // the module exports. Parallel arrays of length import_alias_count; a
-    // binding absent here is exported under its local name.
+    // Named import evidence: renamed imports and known library identity imports.
+    // Local binding -> exported name, in parallel arrays of import_alias_count.
+    // A binding absent here keeps its local name for ordinary symbol lookup.
     const char **import_alias_locals;
     const char **import_alias_exports;
     int import_alias_count;
@@ -48,6 +52,8 @@ typedef struct {
     const char *module_qn;          // QN of this file's module
     const char *enclosing_func_qn;  // current function being walked, NULL at module scope
     const char *enclosing_class_qn; // current class for `this` resolution
+    CBMJsObjectOwners js_object_owners;
+    const CBMDefArray *file_defs;
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;
@@ -76,6 +82,19 @@ typedef struct {
     // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
     // re-evaluation of shared subexpressions under overload resolution.
     struct TsEvalMemo *eval_memo;
+    // Declaration facts stay separate from exact callable identities.
+    unsigned library_environment; // 0 unknown, 1 Node, 2 browser
+    struct TSLibCallbackFacts *callback_facts;
+    TSNode file_root;
+    bool collecting_callback_facts;
+    bool has_library_facts;
+    bool isolated_page_context;
+    bool page_fetch_blocked;
+    bool require_shadowed; // module declarations shadow the loader even without registry defs
+    uint32_t commonjs_load_end; // end of the leading verified Node load declarations
+    const struct CBMCompilerFacts *compiler_facts;
+    const char *compiler_path;
+    const char *compiler_sha256;
 } TSLSPContext;
 
 /* The imports with this local name, in table order (lsp_name_rows.h). */
@@ -118,6 +137,9 @@ void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *mo
 // method body. Safe on any tree-sitter root; emits zero calls in dts_mode.
 void ts_lsp_process_file(TSLSPContext *ctx, TSNode root);
 
+/* Start anchor for a TS/JS invocation or its callee. The end stays unchanged. */
+TSNode cbm_ts_call_start_node(TSNode node, const char *source);
+
 // --- Internals exposed for tests and stdlib data ---
 
 // Evaluate the type of a TS/JS expression node. Returns cbm_type_unknown() on miss.
@@ -138,11 +160,20 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 // Cross-file LSP. Caller passes in cross-file definitions (CBMLSPDef list) and the
 // resolved import → module-QN map. Re-parses source if cached_tree is NULL.
-void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                          const char *module_qn, bool js_mode, bool jsx_mode, bool dts_mode,
-                          CBMLSPDef *defs, int def_count, const char **import_names,
-                          const char **import_qns, int import_count, TSTree *cached_tree,
-                          CBMResolvedCallArray *out);
+void cbm_run_ts_lsp_cross_for_file(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMLSPDef *defs, int def_count, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    const CBMDefArray *file_defs);
+
+static inline void cbm_run_ts_lsp_cross(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMLSPDef *defs, int def_count, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_for_file(arena, source, source_len, module_qn, js_mode, jsx_mode, dts_mode,
+                                  defs, def_count, import_names, import_qns, import_count,
+                                  cached_tree, out, NULL);
+}
 
 // Tier 2: build a project-wide TS/JS/TSX registry ONCE from all defs
 // (filters by lang). Shared READ-ONLY base; per-file overlays chain to
@@ -159,6 +190,14 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         int def_count, const char **import_names,
                                         const char **import_qns, int import_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out);
+
+/* Verified snapshot types are merged after native AST refinement. */
+void cbm_run_ts_lsp_cross_with_compiler(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, const struct CBMCompilerFacts *facts, const char *rel_path,
+    const char *sha256, const CBMDefArray *file_defs);
 
 // Register the TypeScript / JavaScript stdlib subset (Promise, Array<T>, Map<K,V>, Set<T>,
 // Object, Function, console, JSON) into a registry. v1 is hand-curated; a generator script

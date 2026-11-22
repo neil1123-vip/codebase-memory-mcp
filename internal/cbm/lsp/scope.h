@@ -16,6 +16,8 @@ typedef struct {
      * identity metadata rather than another CBMType kind: aliases need both
      * their ordinary type and the graph QN of the value they reference. */
     const char *callable_qn;
+    /* A lexical type declaration shadows values without becoming a value. */
+    bool is_type;
 } CBMVarBinding;
 
 #define CBM_SCOPE_CHUNK_BINDINGS 16
@@ -116,6 +118,7 @@ void cbm_scope_bind(CBMScope* scope, const char* name, const CBMType* type);
  * proof from a shadow that never took effect. Use these, and read the local
  * result, wherever a failed bind must not be mistaken for success. */
 bool cbm_scope_bind_checked(CBMScope *scope, const char *name, const CBMType *type);
+bool cbm_scope_bind_type(CBMScope *scope, const char *name);
 bool cbm_scope_bind_callable_checked(CBMScope *scope, const char *name, const CBMType *type,
                                      const char *callable_qn);
 /* Bind a value whose identity is one exact callable.  A later ordinary

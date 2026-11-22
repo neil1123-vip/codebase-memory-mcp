@@ -236,10 +236,31 @@ static const char *extract_channel_name(CBMExtractCtx *ctx, TSNode args,
 
 static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const char *transport,
                          CBMChannelDirection direction, TSNode call) {
+    const char *owner = enclosing_function_qn(ctx, call);
+    if (ctx->language == CBM_LANG_GO) {
+        owner = NULL;
+        TSNode function = cbm_find_enclosing_func(call, CBM_LANG_GO);
+        if (!ts_node_is_null(function)) {
+            TSNode name = ts_node_child_by_field_name(function, TS_FIELD("name"));
+            if (!ts_node_is_null(name)) {
+                /* Reuse declaration identity, including receivers and init ordinals. */
+                for (int i = 0; i < ctx->result->defs.count; i++) {
+                    const CBMDefinition *def = &ctx->result->defs.items[i];
+                    if (def->name_source_origin == CBM_SOURCE_ORIGIN_RAW && def->label &&
+                        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0) &&
+                        def->name_start_byte == ts_node_start_byte(name) &&
+                        def->name_end_byte == ts_node_end_byte(name)) {
+                        owner = def->qualified_name;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     CBMChannel ch = {
         .channel_name = channel_name,
         .transport = transport,
-        .enclosing_func_qn = enclosing_function_qn(ctx, call),
+        .enclosing_func_qn = owner,
         .direction = direction,
     };
     cbm_channels_push(&ctx->result->channels, ctx->arena, ch);

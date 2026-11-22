@@ -226,6 +226,8 @@ typedef enum {
 
 /* Walk a repository directory tree and discover all source files.
  * Applies hardcoded filters, gitignore patterns, and language detection.
+ * Inside Git repositories, only tracked files (including staged additions)
+ * are eligible. An empty Git index yields no files; Git failures return -1.
  * Returns 0 on success, -1 on error.
  * Caller must call cbm_discover_free() on the results. */
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
@@ -271,7 +273,7 @@ typedef struct {
     char *rel_path; /* heap-allocated, relative to repo root */
     char *reason;   /* heap-allocated: "gitignore" | "cbmignore" |
                      * "skip-list" | "ignored-suffix" | "fast-pattern" |
-                     * "size-cap" */
+                     * "size-cap" | "git-untracked" */
 } cbm_ignored_file_t;
 
 /* Stored per-file ignore entries are capped (the walk still counts ALL of

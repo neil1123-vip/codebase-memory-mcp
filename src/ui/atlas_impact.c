@@ -590,7 +590,9 @@ char *cbm_atlas_impact_analysis_json(cbm_store_t *store, const char *project, co
     sqlite3_progress_handler(db, 10000, ia_deadline, &deadline);
     if (sqlite3_prepare_v2(
             db,
-            "SELECT kind,count(*) FROM index_coverage WHERE project=?1 GROUP BY kind ORDER BY kind",
+            "SELECT kind,count(*) FROM index_coverage WHERE project=?1 "
+            "AND kind NOT IN ('call_summary','compiler_facts') "
+            "GROUP BY kind ORDER BY kind",
             -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
         int coverage_rc;

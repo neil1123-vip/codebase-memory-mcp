@@ -550,14 +550,11 @@ bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
 
 /* ── Dynamic file list ────────────────────────── */
 
-/* Paths git tracks under the discovery root, and every directory above one.
- * git applies ignore rules to untracked paths only, so .gitignore,
- * info/exclude and the global excludes file never hide a tracked path. Both
- * tables stay NULL when the root is not in a git repository or git cannot
- * run, and the ignore rules then apply exactly as before. */
+/* Git discovery is limited to tracked paths and their parent directories.
+ * Git applies ignore rules to untracked paths only, so .gitignore,
+ * info/exclude and the global excludes file never hide a tracked path. */
 typedef struct {
-    char *paths;         /* `git ls-files -z` output; holds the keys of `files` */
-    CBMHashTable *files; /* tracked path */
+    CBMHashTable *files; /* tracked path (owned key) */
     CBMHashTable *dirs;  /* directory above a tracked path (owned key) */
 } discover_tracked_t;
 
@@ -1365,6 +1362,9 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
     const char *skip_reason =
         file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size,
                          tracked_has_file(out->tracked, rel_path), in_ignored_dir);
+    if (!skip_reason && out->tracked && !tracked_has_file(out->tracked, rel_path)) {
+        skip_reason = "git-untracked";
+    }
     if (skip_reason) {
         /* Deliberately not indexed (#963) — record so callers can surface it.
          * Unsupported-language files below are NOT recorded: "no grammar for
@@ -1516,6 +1516,9 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
                                     global_gi, cbmignore, &config_only);
         if (verdict == DIR_KEEP && frame->git_ignored) {
             verdict = DIR_GIT_IGNORED; /* below a git-ignored directory, as in git */
+        }
+        if (out->tracked && !tracked_has_dir(out->tracked, rel_path)) {
+            verdict = DIR_SKIP;
         }
         if (verdict == DIR_KEEP ||
             (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
@@ -1690,12 +1693,14 @@ static void tracked_free_key(const char *key, void *value, void *userdata) {
 }
 
 static void tracked_free(discover_tracked_t *tracked) {
+    if (tracked->files) {
+        cbm_ht_foreach(tracked->files, tracked_free_key, NULL);
+    }
     if (tracked->dirs) {
         cbm_ht_foreach(tracked->dirs, tracked_free_key, NULL);
     }
     cbm_ht_free(tracked->dirs);
     cbm_ht_free(tracked->files);
-    cbm_free(CBM_MEM_CLASS_OTHER, tracked->paths);
     memset(tracked, 0, sizeof(*tracked));
 }
 
@@ -1774,38 +1779,113 @@ static bool tracked_add_dirs(CBMHashTable *dirs, const char *path) {
             return false;
         }
         cbm_ht_set(dirs, key, key);
+        if (!cbm_ht_has(dirs, key)) {
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
+            return false;
+        }
     }
     return true;
 }
 
-/* Load what git tracks under repo_path; leaves `tracked` empty on any failure,
- * so the ignore rules then apply exactly as they did without it. */
-static void tracked_load(discover_tracked_t *tracked, const char *repo_path) {
+static char *tracked_worktree_key(const char *repo_path, const char *path) {
+#ifdef _WIN32
+    /* Resolve each component's case without mapping a tracked link to its target. */
+    char resolved[CBM_SZ_4K] = {0};
+    size_t used = 0;
+    for (const char *component = path; *component;) {
+        const char *slash = strchr(component, '/');
+        size_t prefix_length = slash ? (size_t)(slash - path) : strlen(path);
+        char absolute[CBM_SZ_4K];
+        int n = snprintf(absolute, sizeof(absolute), "%s/%.*s", repo_path,
+                         (int)prefix_length, path);
+        if (n < 0 || (size_t)n >= sizeof(absolute)) {
+            return NULL;
+        }
+        struct stat st;
+        bool is_symlink = false;
+        if (safe_stat(absolute, &st, &is_symlink) != 0) {
+            /* Missing files and reparse points are skipped by the walk. */
+            return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path);
+        }
+        char canonical[CBM_SZ_4K];
+        if (!cbm_canonical_path(absolute, canonical, sizeof(canonical))) {
+            return NULL;
+        }
+        cbm_normalize_path_sep(canonical);
+        const char *name = strrchr(canonical, '/');
+        if (!name) {
+            return NULL;
+        }
+        n = snprintf(resolved + used, sizeof(resolved) - used, "%s%s",
+                     used ? "/" : "", name + SKIP_ONE);
+        if (n < 0 || (size_t)n >= sizeof(resolved) - used) {
+            return NULL;
+        }
+        used += (size_t)n;
+        if (!slash) {
+            break;
+        }
+        component = slash + SKIP_ONE;
+    }
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, resolved);
+#else
+    (void)repo_path;
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path);
+#endif
+}
+
+/* A successful empty index is authoritative; Git failures must not broaden it. */
+static bool tracked_load(discover_tracked_t *tracked, const char *repo_path, const char *prefix) {
     memset(tracked, 0, sizeof(*tracked));
     size_t length = 0;
-    tracked->paths = tracked_read(repo_path, &length);
-    if (!tracked->paths || length == 0) {
-        tracked_free(tracked);
-        return;
+    size_t prefix_length = strlen(prefix);
+    char *paths = tracked_read(repo_path, &length);
+    if (!paths) {
+        goto fail;
     }
     tracked->files = cbm_ht_create(CBM_SZ_1K);
     tracked->dirs = cbm_ht_create(CBM_SZ_256);
     if (!tracked->files || !tracked->dirs) {
-        tracked_free(tracked);
-        return;
+        goto fail;
     }
     for (size_t at = 0; at < length;) {
-        const char *path = tracked->paths + at;
+        const char *path = paths + at;
         size_t n = strlen(path);
         if (n > 0) {
-            cbm_ht_set(tracked->files, path, (void *)path);
-            if (!tracked_add_dirs(tracked->dirs, path)) {
-                tracked_free(tracked);
-                return;
+            char *key = tracked_worktree_key(repo_path, path);
+            if (!key) {
+                goto fail;
+            }
+            if (prefix_length > 0) {
+                if (strncmp(key, prefix, prefix_length) != 0 || key[prefix_length] != '/') {
+                    cbm_free(CBM_MEM_CLASS_OTHER, key);
+                    at += n + SKIP_ONE;
+                    continue;
+                }
+                memmove(key, key + prefix_length + SKIP_ONE,
+                        strlen(key + prefix_length + SKIP_ONE) + SKIP_ONE);
+            }
+            if (cbm_ht_has(tracked->files, key)) {
+                cbm_free(CBM_MEM_CLASS_OTHER, key);
+            } else {
+                cbm_ht_set(tracked->files, key, key);
+                if (!cbm_ht_has(tracked->files, key)) {
+                    cbm_free(CBM_MEM_CLASS_OTHER, key);
+                    goto fail;
+                }
+                if (!tracked_add_dirs(tracked->dirs, key)) {
+                    goto fail;
+                }
             }
         }
         at += n + SKIP_ONE;
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, paths);
+    return true;
+fail:
+    cbm_free(CBM_MEM_CLASS_OTHER, paths);
+    tracked_free(tracked);
+    return false;
 }
 
 /* Resolve the shared "common" git directory for repo_path.
@@ -2174,11 +2254,18 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     };
     discover_tracked_t tracked = {0};
     if (is_git_repo) {
-        tracked_load(&tracked, repo_path);
+        /* Git's subdirectory prefix is case-sensitive even on Windows. */
+        const char *git_root = has_enclosing_repo ? enclosing_root : repo_path;
+        const char *prefix = has_enclosing_repo ? canonical_repo + strlen(enclosing_root) : "";
+        while (*prefix == '/')
+            prefix++;
+        fl.failed = !tracked_load(&tracked, git_root, prefix);
         fl.tracked = &tracked;
     }
-    walk_cache_dir_snapshot();
-    walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
+    if (!fl.failed) {
+        walk_cache_dir_snapshot();
+        walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
+    }
 
     /* Cleanup */
     tracked_free(&tracked);

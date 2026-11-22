@@ -253,6 +253,10 @@ static TSNode resolve_write_lhs_node(TSNode node) {
 
 // Try to emit a write for an assignment node.
 static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
+    /* Go := only writes block-local variables, even when redeclaring one. */
+    if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(node), "short_var_declaration") == 0) {
+        return;
+    }
     TSNode left = resolve_write_lhs_node(node);
     if (ts_node_is_null(left)) {
         return;
@@ -334,19 +338,6 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
     }
 
     if (cbm_kind_in_set(node, spec->assignment_node_types)) {
-        TSNode left = resolve_write_lhs_node(node);
-
-        if (!ts_node_is_null(left)) {
-            bool is_member = false;
-            char *name = resolve_lhs_write_name(ctx, left, &is_member);
-            if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-                CBMReadWrite rw;
-                rw.var_name = name;
-                rw.is_write = true;
-                rw.enclosing_func_qn = state->enclosing_func_qn;
-                rw.is_member_access = is_member;
-                cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
-            }
-        }
+        try_emit_assignment_write(ctx, node, state->enclosing_func_qn);
     }
 }

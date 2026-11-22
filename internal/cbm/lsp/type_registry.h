@@ -50,6 +50,13 @@ typedef struct {
     const char *sig;
 } CBMRegisteredFunc;
 
+typedef enum {
+    CBM_GO_IDENTITY_UNKNOWN,
+    CBM_GO_IDENTITY_ALIAS,
+    CBM_GO_IDENTITY_CONCRETE,
+    CBM_GO_IDENTITY_INTERFACE,
+} CBMGoTypeIdentity;
+
 // Registered type with fields and method names.
 typedef struct {
     const char *qualified_name;    // e.g., "proj.pkg.TypeName"
@@ -60,6 +67,7 @@ typedef struct {
     const char **method_qns;       // NULL-terminated (qualified names, parallel)
     const char **embedded_types;   // NULL-terminated (embedded/anonymous field type QNs)
     const char *alias_of;          // QN of aliased type (type Foo = Bar), NULL if not alias
+    const CBMType *underlying_type; // Go shape only; defined types keep their own method sets
     const char **type_param_names; // NULL-terminated, e.g., ["T", "K", NULL] for template classes
     bool is_interface;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
@@ -78,6 +86,7 @@ typedef struct {
     // so this is the only way to bind a short name through `using` directives and
     // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
     const char *namespace_qn;
+    CBMGoTypeIdentity go_identity; // Declaration evidence; zero is not proof of a defined type.
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.
@@ -213,6 +222,10 @@ typedef struct CBMTypeRegistry {
     const char **export_keys;
     const char **export_targets;
     int export_count;
+
+    /* Source declarations sorted by QN for exact Go package-variable dispatch. */
+    const struct CBMLSPDef **go_source_defs;
+    int go_source_def_count;
 } CBMTypeRegistry;
 
 // Initialize a registry.

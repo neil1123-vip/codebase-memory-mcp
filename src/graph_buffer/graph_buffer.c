@@ -972,9 +972,89 @@ static bool gb_props_have_variants(const char *props) {
     return props && strstr(props, "\"variants\"") != NULL;
 }
 
+static bool gb_props_have_decl_identity(const char *props) {
+    return props &&
+           (strstr(props, "\"name_start_byte\"") || strstr(props, "\"decl_ambiguous\""));
+}
+
+/* Line-span variants cannot distinguish two declarations on the same line. */
+static bool gb_decl_collision_ambiguous(const cbm_gbuf_node_t *node, const gb_def_t *arrival) {
+    if (!gb_props_have_decl_identity(node->properties_json) &&
+        !gb_props_have_decl_identity(arrival->props)) {
+        return false;
+    }
+    yyjson_doc *left =
+        node->properties_json
+            ? yyjson_read_opts(node->properties_json, strlen(node->properties_json), 0,
+                               &gb_yy_alc, NULL)
+            : NULL;
+    yyjson_doc *right = arrival->props
+                           ? yyjson_read_opts((char *)arrival->props, strlen(arrival->props), 0,
+                                              &gb_yy_alc, NULL)
+                           : NULL;
+    yyjson_val *a = left ? yyjson_doc_get_root(left) : NULL;
+    yyjson_val *b = right ? yyjson_doc_get_root(right) : NULL;
+    yyjson_val *aa = yyjson_obj_get(a, "decl_ambiguous");
+    yyjson_val *ba = yyjson_obj_get(b, "decl_ambiguous");
+    bool same = yyjson_is_obj(a) && yyjson_is_obj(b) &&
+                (!aa || yyjson_is_false(aa)) && (!ba || yyjson_is_false(ba)) &&
+                node->file_path && arrival->file &&
+                strcmp(node->file_path, arrival->file) == 0 && node->label && arrival->label &&
+                strcmp(node->label, arrival->label) == 0;
+    static const char *const keys[] = {"name_start_byte", "name_end_byte", "name_source_origin"};
+    for (size_t i = 0; same && i < sizeof(keys) / sizeof(keys[0]); i++) {
+        yyjson_val *av = yyjson_obj_get(a, keys[i]), *bv = yyjson_obj_get(b, keys[i]);
+        same = yyjson_is_uint(av) && yyjson_is_uint(bv) &&
+               yyjson_get_uint(av) <= UINT32_MAX && yyjson_get_uint(av) == yyjson_get_uint(bv);
+    }
+    if (same) {
+        const char *ah = yyjson_get_str(yyjson_obj_get(a, "source_sha256"));
+        const char *bh = yyjson_get_str(yyjson_obj_get(b, "source_sha256"));
+        same = yyjson_get_uint(yyjson_obj_get(a, "name_end_byte")) >
+                   yyjson_get_uint(yyjson_obj_get(a, "name_start_byte")) &&
+               yyjson_get_uint(yyjson_obj_get(a, "name_source_origin")) == 0 &&
+               ah && bh && strlen(ah) == 64 && strcmp(ah, bh) == 0;
+    }
+    yyjson_doc_free(left);
+    yyjson_doc_free(right);
+    return !same;
+}
+
+static void gb_mark_decl_ambiguous(cbm_gbuf_node_t *node) {
+    const char *props = node->properties_json;
+    yyjson_doc *doc = props ? yyjson_read_opts((char *)props, strlen(props),
+                                               YYJSON_READ_NUMBER_AS_RAW, &gb_yy_alc, NULL)
+                            : NULL;
+    yyjson_mut_doc *mut = yyjson_mut_doc_new(&gb_yy_alc);
+    yyjson_mut_val *root =
+        !mut ? NULL
+             : doc && yyjson_is_obj(yyjson_doc_get_root(doc))
+                   ? yyjson_val_mut_copy(mut, yyjson_doc_get_root(doc))
+                   : yyjson_mut_obj(mut);
+    char *out = NULL;
+    if (root) {
+        yyjson_mut_obj_remove_key(root, "decl_ambiguous");
+        if (yyjson_mut_obj_add_bool(mut, root, "decl_ambiguous", true)) {
+            yyjson_mut_doc_set_root(mut, root);
+            out = yyjson_mut_write_opts(mut, 0, &gb_yy_alc, NULL, NULL);
+        }
+    }
+    yyjson_mut_doc_free(mut);
+    yyjson_doc_free(doc);
+    /* OOM must remove admission evidence rather than leave an unmarked conflict. */
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->properties_json);
+    node->properties_json = out;
+}
+
+static bool gb_def_has_own_span(const gb_def_t *d) {
+    return d->start > 0 &&
+           (gb_variant_label(d->label) ||
+            (d->label && strcmp(d->label, "Field") == 0 && gb_props_have_decl_identity(d->props)));
+}
+
 /* Does this side carry a span: a variants list, or a definition's own span? */
 static bool gb_def_has_spans(const gb_def_t *d) {
-    return gb_props_have_variants(d->props) || (gb_variant_label(d->label) && d->start > 0);
+    return gb_props_have_variants(d->props) || gb_def_has_own_span(d);
 }
 
 static void gb_span_push(gb_span_vec_t *vec, gb_span_t span) {
@@ -1014,7 +1094,7 @@ static void gb_collect_spans(cbm_gbuf_t *gb, gb_span_vec_t *vec, const gb_def_t 
         }
         yyjson_doc_free(doc);
     }
-    if (gb_variant_label(d->label) && d->start > 0) {
+    if (gb_def_has_own_span(d)) {
         gb_span_push(vec, (gb_span_t){gb_intern(gb, d->file ? d->file : ""), d->start, d->end});
     }
 }
@@ -1344,9 +1424,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
             c = strcmp(existing->label ? existing->label : "", label ? label : "");
         }
         gb_def_t arrival = {label, properties_json, file_path, start_line, end_line};
+        bool decl_ambiguous = gb_decl_collision_ambiguous(existing, &arrival);
         gb_note_collision(gb, existing, &arrival, NULL);
         properties_json = gb_swift_merge_node_props(existing, properties_json, c <= 0);
         if (c > 0) {
+            if (decl_ambiguous) {
+                gb_mark_decl_ambiguous(existing);
+            }
             return existing->id; /* existing entity is the canonical winner */
         }
         /* The arrival wins: its properties; the variant spans both carry are
@@ -1383,6 +1467,9 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
         if (new_props) {
             cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
             existing->properties_json = new_props;
+        }
+        if (decl_ambiguous) {
+            gb_mark_decl_ambiguous(existing);
         }
         if (label_changed) {
             node_ptr_array_t *by_label = get_or_create_node_array(
@@ -2133,6 +2220,7 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
         bool sn_wins = c <= 0;
         gb_def_t src_def = {sn->label, sn->properties_json, sn->file_path, sn->start_line,
                             sn->end_line};
+        bool decl_ambiguous = gb_decl_collision_ambiguous(existing, &src_def);
         gb_note_collision(dst, existing, &src_def, sn_spans);
         const char *properties = gb_swift_merge_node_props(existing, sn->properties_json, sn_wins);
         if (sn_wins) {
@@ -2175,6 +2263,9 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                     dst->nodes_by_name, existing->name ? existing->name : "");
                 node_array_push(by_name, existing);
             }
+        }
+        if (decl_ambiguous) {
+            gb_mark_decl_ambiguous(existing);
         }
     }
 

@@ -218,7 +218,7 @@ enum { RT_PAIR_SIZE = 2 };
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                           const char *kind, char *name);
+                           const char *kind, char *name, TSNode name_node);
 static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused);
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
@@ -237,6 +237,35 @@ static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
+
+static void def_set_source_name(const CBMExtractCtx *ctx, CBMDefinition *def, TSNode name) {
+    bool raw_header = false;
+#ifdef __linux__
+    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP) &&
+        ctx->test_declarations_raw_source && ctx->rel_path) {
+        const char *extension = strrchr(ctx->rel_path, '.');
+        raw_header = extension && strcmp(extension, ".h") == 0 && cbm_go_cgo_enabled();
+    }
+#endif
+    if ((ctx->language != CBM_LANG_GO && ctx->language != CBM_LANG_JAVASCRIPT &&
+         ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX && !raw_header) ||
+        ts_node_is_null(name)) {
+        return;
+    }
+    const char *kind = ts_node_type(name);
+    if (strcmp(kind, "identifier") != 0 && strcmp(kind, "type_identifier") != 0 &&
+        strcmp(kind, "field_identifier") != 0 && strcmp(kind, "property_identifier") != 0 &&
+        strcmp(kind, "private_property_identifier") != 0 &&
+        strcmp(kind, "shorthand_property_identifier_pattern") != 0) {
+        return;
+    }
+    uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+    if (end > start && ctx->source_len >= 0 && end <= (uint32_t)ctx->source_len) {
+        def->name_start_byte = start;
+        def->name_end_byte = end;
+        def->name_source_origin = CBM_SOURCE_ORIGIN_RAW;
+    }
+}
 
 // Get "name" field from a node
 static TSNode func_name_node(TSNode node) {
@@ -825,6 +854,27 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
 
         if (!ts_node_is_null(name)) {
             return name;
+        }
+
+        if ((lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+             lang == CBM_LANG_TSX) &&
+            (strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0)) {
+            TSNode assignment = ts_node_parent(node);
+            TSNode statement = ts_node_parent(assignment);
+            TSNode program = ts_node_parent(statement);
+            if (!ts_node_is_null(assignment) && !ts_node_is_null(statement) &&
+                !ts_node_is_null(program) &&
+                strcmp(ts_node_type(assignment), "assignment_expression") == 0 &&
+                strcmp(ts_node_type(statement), "expression_statement") == 0 &&
+                strcmp(ts_node_type(program), "program") == 0) {
+                TSNode right = ts_node_child_by_field_name(assignment, TS_FIELD("right"));
+                TSNode left = ts_node_child_by_field_name(assignment, TS_FIELD("left"));
+                if (ts_node_eq(right, node) && !ts_node_is_null(left) &&
+                    strcmp(ts_node_type(left), "member_expression") == 0) {
+                    // The source-aware name helper accepts only window.<identifier>.
+                    return left;
+                }
+            }
         }
 
         /* Swift and newer tree-sitter-kotlin: function_declaration has no `name`
@@ -4726,6 +4776,34 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    if (lang == CBM_LANG_GO) {
+        TSNode type = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (ts_node_is_null(type) || strcmp(ts_node_type(type), "struct_type") != 0)
+            return NULL;
+        TSNode body = cbm_find_child_by_kind(type, "field_declaration_list");
+        if (ts_node_is_null(body))
+            return NULL;
+        uint32_t nc = ts_node_named_child_count(body), count = 0;
+        const char **bases = cbm_arena_alloc(a, (nc + 1) * sizeof(*bases));
+        if (!bases)
+            return NULL;
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode field = ts_node_named_child(body, i);
+            if (strcmp(ts_node_type(field), "field_declaration") != 0 ||
+                !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("name"))))
+                continue;
+            TSNode embedded = ts_node_child_by_field_name(field, TS_FIELD("type"));
+            if (ts_node_is_null(embedded))
+                continue;
+            const char *text = cbm_node_text(a, embedded, source);
+            if (text && text[0]) {
+                bases[count++] = strcmp(ts_node_type(ts_node_child(field, 0)), "*") == 0
+                                     ? cbm_arena_sprintf(a, "*%s", text) : text;
+            }
+        }
+        bases[count] = NULL;
+        return count ? bases : NULL;
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -7521,6 +7599,22 @@ static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDef
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
+    if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(node), "func_literal") == 0) {
+        TSNode anchor = cbm_go_local_literal_anchor(node);
+        const char *qn = cbm_go_local_literal_qn(a, ctx->module_qn, ctx->rel_path, anchor);
+        if (qn) {
+            CBMDefinition def = {.name = "func", .qualified_name = qn, .label = "Function",
+                                 .file_path = ctx->rel_path, .is_test = ctx->result->is_test_file,
+                                 .start_line = ts_node_start_point(node).row + 1,
+                                 .end_line = ts_node_end_point(node).row + 1,
+                                 .name_start_byte = ts_node_start_byte(anchor),
+                                 .name_end_byte = ts_node_end_byte(anchor),
+                                 .name_source_origin = CBM_SOURCE_ORIGIN_RAW};
+            cbm_defs_push(&ctx->result->defs, a, def);
+        }
+        return;
+    }
+
     TSNode name_node = cbm_resolve_func_name(node, ctx->language);
     if (ctx->language == CBM_LANG_C && ctx->test_declarations &&
         ctx->test_declarations_raw_source) {
@@ -7595,6 +7689,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     memset(&def, 0, sizeof(def));
 
     def.name = name;
+    def_set_source_name(ctx, &def, name_node);
     def.test_role = configured ? configured_rule.role : CBM_TEST_ROLE_NONE;
     if (configured) {
         TSNode candidate_name, body;
@@ -7716,6 +7811,41 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             if (ctx->language == CBM_LANG_GO && def.parent_class) {
                 def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
             }
+        }
+    }
+    if (ctx->language == CBM_LANG_GO) {
+        bool generic = !ts_node_is_null(
+            ts_node_child_by_field_name(func_node, TS_FIELD("type_parameters")));
+        if (!generic && !ts_node_is_null(recv) && ts_node_named_child_count(recv)) {
+            TSNode parameter = {0};
+            int parameter_count = 0;
+            for (uint32_t i = 0; i < ts_node_named_child_count(recv); i++) {
+                TSNode child = ts_node_named_child(recv, i);
+                if (ts_node_is_extra(child) ||
+                    strcmp(ts_node_type(child), "parameter_declaration") != 0)
+                    continue;
+                parameter = child;
+                parameter_count++;
+            }
+            TSNode receiver_type = ts_node_child_by_field_name(
+                parameter_count == 1 ? parameter : (TSNode){0}, TS_FIELD("type"));
+            while (!ts_node_is_null(receiver_type) &&
+                   (strcmp(ts_node_type(receiver_type), "pointer_type") == 0 ||
+                    strcmp(ts_node_type(receiver_type), "parenthesized_type") == 0) &&
+                   ts_node_named_child_count(receiver_type))
+                receiver_type = ts_node_named_child(
+                    receiver_type, ts_node_named_child_count(receiver_type) - 1);
+            generic = !ts_node_is_null(receiver_type) &&
+                      strcmp(ts_node_type(receiver_type), "generic_type") == 0;
+        }
+        if (generic) {
+            TSNode body = ts_node_child_by_field_name(func_node, TS_FIELD("body"));
+            uint32_t start = ts_node_start_byte(func_node);
+            uint32_t end = ts_node_is_null(body) ? ts_node_end_byte(func_node)
+                                                : ts_node_start_byte(body);
+            if (end >= start && end <= (uint32_t)ctx->source_len)
+                def.go_generic_declaration =
+                    cbm_arena_strndup(a, ctx->source + start, end - start);
         }
     }
 
@@ -8790,23 +8920,453 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
 // lineage edge (e.g. a view -> the tables it selects from). Emitting them here
 // (rather than via the generic identifier walker) sets the correct enclosing
 // scope and bypasses the is_definition_name suppression that drops them.
-static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
-    if (strcmp(ts_node_type(node), "relation") == 0) {
-        TSNode nm = resolve_sql_func_name(node); // object_reference -> identifier
-        if (!ts_node_is_null(nm)) {
-            char *tname = cbm_node_text(ctx->arena, nm, ctx->source);
-            if (tname && tname[0]) {
-                CBMUsage usage = {0};
-                usage.ref_name = tname;
-                usage.enclosing_func_qn = enclosing_qn;
-                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+static void emit_sql_relation_usage(CBMExtractCtx *ctx, TSNode name, const char *enclosing_qn,
+                                    CBMUsageKind kind) {
+    if (ts_node_is_null(name))
+        return;
+    const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+    if (text && text[0]) {
+        CBMUsage usage = {.ref_name = text, .enclosing_func_qn = enclosing_qn,
+                          .site_start_byte = ts_node_start_byte(name),
+                          .site_end_byte = ts_node_end_byte(name), .kind = kind};
+        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+    }
+}
+
+static TSNode sql_next_token(TSNode node) {
+    do {
+        node = ts_node_next_sibling(node);
+    } while (!ts_node_is_null(node) && ts_node_is_extra(node));
+    return node;
+}
+
+static bool sql_node_kind(TSNode node, const char *kind) {
+    return !ts_node_is_null(node) && strcmp(ts_node_type(node), kind) == 0;
+}
+
+static char *sql_node_key(CBMArena *arena, const char *source, TSNode name);
+
+static bool sql_bracket_name(const char *source, TSNode node) {
+    return !ts_node_is_null(node) && source[ts_node_start_byte(node)] == '[';
+}
+
+static bool sql_main_object(CBMExtractCtx *ctx, TSNode object) {
+    if (ts_node_is_null(object) ||
+        !ts_node_is_null(ts_node_child_by_field_name(object, TS_FIELD("database"))))
+        return false;
+    TSNode schema = ts_node_child_by_field_name(object, TS_FIELD("schema"));
+    if (ts_node_is_null(schema))
+        return true;
+    const char *name = sql_node_key(ctx->arena, ctx->source, schema);
+    return name && strcmp(name, "main") == 0;
+}
+
+static bool sql_main_create(CBMExtractCtx *ctx, TSNode node) {
+    return !ts_node_has_error(node) &&
+           ts_node_is_null(cbm_find_child_by_kind(node, "keyword_temp")) &&
+           ts_node_is_null(cbm_find_child_by_kind(node, "keyword_temporary")) &&
+           sql_main_object(ctx, cbm_find_child_by_kind(node, "object_reference"));
+}
+
+/* shortcut: keep generic SQL matching exact until lineage knows the dialect. */
+bool cbm_sql_relation_is_cte(CBMExtractCtx *ctx, TSNode relation, TSNode name, TSNode owner) {
+    const char *source = ctx->source;
+    uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+    const bool bracket = sql_bracket_name(source, name);
+    const char *key = NULL;
+    for (TSNode child = relation, scope = ts_node_parent(child); !ts_node_eq(scope, owner);
+         child = scope, scope = ts_node_parent(scope)) {
+        TSNode with = cbm_find_child_by_kind(scope, "keyword_with");
+        if (ts_node_is_null(with))
+            continue;
+        bool visible = true;
+        bool recursive = sql_node_kind(sql_next_token(with), "keyword_recursive");
+        for (TSNode cte = ts_node_next_named_sibling(with); !ts_node_is_null(cte);
+             cte = ts_node_next_named_sibling(cte)) {
+            if (ts_node_eq(cte, child) && !recursive)
+                visible = false;
+            if (!sql_node_kind(cte, "cte"))
+                continue;
+            TSNode decl = cbm_find_child_by_kind(cte, "identifier");
+            if (ts_node_is_null(decl))
+                continue;
+            if (bracket || sql_bracket_name(source, decl)) {
+                if (!key)
+                    key = sql_node_key(ctx->arena, source, name);
+                const char *decl_key = sql_node_key(ctx->arena, source, decl);
+                if (!key || !decl_key || strcmp(key, decl_key) == 0)
+                    return true;
+            }
+            uint32_t decl_start = ts_node_start_byte(decl);
+            if (visible && ts_node_end_byte(decl) - decl_start == end - start &&
+                memcmp(source + decl_start, source + start, end - start) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn,
+                                       bool foreign_keys, TSNode owner) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "relation") == 0) {
+        TSNode object = cbm_find_child_by_kind(node, "object_reference");
+        if (!ts_node_is_null(object)) {
+            TSNode name = ts_node_child_by_field_name(object, TS_FIELD("name"));
+            TSNode schema = ts_node_child_by_field_name(object, TS_FIELD("schema"));
+            bool qualified = !ts_node_is_null(schema);
+            bool bracket = sql_bracket_name(ctx->source, name) || sql_bracket_name(ctx->source, schema);
+            if (!ts_node_is_null(name) &&
+                (qualified || !cbm_sql_relation_is_cte(ctx, node, name, owner))) {
+                if (!bracket)
+                    emit_sql_relation_usage(ctx, name, enclosing_qn, CBM_USAGE_VALUE);
+                else if (sql_node_kind(owner, "create_view") && sql_main_create(ctx, owner) &&
+                         sql_main_object(ctx, object) &&
+                         ts_node_eq(ts_node_parent(ts_node_parent(owner)), ctx->root))
+                    emit_sql_relation_usage(ctx, name, enclosing_qn, CBM_USAGE_SQL_TABLE_TARGET);
+            }
+        }
+    }
+    if (foreign_keys && !ts_node_has_error(node) &&
+        (strcmp(kind, "column_definition") == 0 || strcmp(kind, "constraint") == 0)) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode keyword = ts_node_named_child(node, i);
+            if (!sql_node_kind(keyword, "keyword_references"))
+                continue;
+            TSNode target = sql_next_token(keyword);
+            if (sql_node_kind(target, "object_reference") && ts_node_named_child_count(target) == 1) {
+                TSNode name = ts_node_child_by_field_name(target, TS_FIELD("name"));
+                emit_sql_relation_usage(ctx, name, enclosing_qn, CBM_USAGE_SQL_FOREIGN_TABLE);
             }
         }
     }
     uint32_t n = ts_node_child_count(node);
     for (uint32_t i = 0; i < n; i++) {
-        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn);
+        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn, foreign_keys, owner);
     }
+}
+
+static bool sql_plain_table(TSNode node) {
+    TSNode object = cbm_find_child_by_kind(node, "object_reference");
+    return !ts_node_is_null(object) && ts_node_named_child_count(object) == 1 &&
+           ts_node_is_null(cbm_find_child_by_kind(node, "keyword_temp")) &&
+           ts_node_is_null(cbm_find_child_by_kind(node, "keyword_temporary"));
+}
+
+typedef struct {
+    const char *qn, *key;
+    TSNode create, first_alter, last_alter;
+    bool columns_changed;
+} SqlForeignTable;
+
+typedef struct {
+    TSNode local_decl, remote_decl, remote_ref;
+} SqlForeignColumnPair;
+
+static unsigned char sql_fold_char(unsigned char c) {
+    return c >= 'A' && c <= 'Z' ? (unsigned char)(c + ('a' - 'A')) : c;
+}
+
+/* SQLite compares identifiers after dequoting and folding ASCII only. */
+char *cbm_sql_identifier_key(CBMArena *arena, const char *text, size_t length) {
+    if (!text || !length)
+        return NULL;
+    unsigned char first = (unsigned char)text[0];
+    bool quoted = first == '"' || first == '`' || first == '\'' || first == '[';
+    unsigned char close = first == '[' ? ']' : first;
+    if (quoted && (length < 2 || (unsigned char)text[length - 1] != close))
+        return NULL;
+    for (size_t i = quoted ? 1 : 0; i < length - quoted; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (quoted && c == close && (first == '[' || i + 2 >= length ||
+                                     (unsigned char)text[++i] != close))
+            return NULL;
+        if (!quoted && !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                         (c >= '0' && c <= '9') || c == '_' || c == '$' || c >= 0x80))
+            return NULL;
+    }
+    char *key = cbm_arena_alloc(arena, length + 1);
+    if (!key)
+        return NULL;
+    size_t used = 0;
+    for (size_t i = quoted ? 1 : 0; i < length - quoted; i++) {
+        unsigned char c = (unsigned char)text[i];
+        key[used++] = (char)sql_fold_char(c);
+        if (quoted && c == close)
+            i++;
+    }
+    key[used] = '\0';
+    return key;
+}
+
+static char *sql_node_key(CBMArena *arena, const char *source, TSNode name) {
+    if (!sql_node_kind(name, "identifier") && !sql_node_kind(name, "literal"))
+        return NULL;
+    uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+    if (sql_node_kind(name, "literal") &&
+        (start >= end || !strchr("\"'`[", source[start])))
+        return NULL;
+    return cbm_sql_identifier_key(arena, source + start, end - start);
+}
+
+static CBMSQLColumnAlter sql_table_column_alter(CBMExtractCtx *ctx, const SqlForeignTable *table,
+                                                TSNode stmt, CBMArena *scratch) {
+    TSNode alter = cbm_find_child_by_kind(stmt, "alter_table");
+    if (ts_node_is_null(alter))
+        return (CBMSQLColumnAlter){0};
+    TSNode object = cbm_find_child_by_kind(alter, "object_reference");
+    if (!ts_node_is_null(object)) {
+        TSNode name = ts_node_child_by_field_name(object, TS_FIELD("name"));
+        const char *target = sql_node_key(scratch, ctx->source, name);
+        if (target && strcmp(table->key, target) == 0)
+            return cbm_sql_column_alter(ctx, alter, object);
+    }
+    return (CBMSQLColumnAlter){0};
+}
+
+static const char *sql_final_column_key(CBMExtractCtx *ctx, const SqlForeignTable *table, TSNode ref,
+                                        bool local_constraint) {
+    const char *key = sql_node_key(ctx->arena, ctx->source, ref);
+    if (!key || ts_node_is_null(table->first_alter))
+        return key;
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, CBM_SZ_256);
+    const uint32_t site = ts_node_end_byte(ref), limit = ts_node_start_byte(table->last_alter);
+    /* SQLite rewrites FK names on rename. A drop leaves inbound references by name. */
+    for (TSNode stmt = table->first_alter; !ts_node_is_null(stmt) &&
+         ts_node_start_byte(stmt) <= limit; stmt = ts_node_next_named_sibling(stmt)) {
+        if (ts_node_start_byte(stmt) <= site)
+            continue;
+        CBMSQLColumnAlter change = sql_table_column_alter(ctx, table, stmt, &scratch);
+        const char *old_key = sql_node_key(&scratch, ctx->source, change.old_name);
+        if (old_key && strcmp(key, old_key) == 0) {
+            if (!ts_node_is_null(change.new_name))
+                key = sql_node_key(ctx->arena, ctx->source, change.new_name);
+            else if (local_constraint)
+                key = NULL;
+            if (!key)
+                break;
+        }
+        cbm_arena_rewind(&scratch);
+    }
+    cbm_arena_destroy(&scratch);
+    return key;
+}
+
+static TSNode sql_find_column(CBMExtractCtx *ctx, const SqlForeignTable *table, const char *key,
+                              uint32_t site) {
+    TSNode none = {0}, matched = {0};
+    if (!key)
+        return none;
+    TSNode columns = cbm_find_child_by_kind(table->create, "column_definitions");
+    if (ts_node_is_null(columns))
+        return none;
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, CBM_SZ_256);
+    /* Follow the name back to its declaration, stopping at a drop or addition. */
+    for (TSNode stmt = table->last_alter;
+         !ts_node_is_null(stmt) && ts_node_start_byte(stmt) > ts_node_start_byte(table->create);
+         stmt = ts_node_prev_named_sibling(stmt)) {
+        if (ts_node_end_byte(stmt) > site)
+            continue;
+        CBMSQLColumnAlter change = sql_table_column_alter(ctx, table, stmt, &scratch);
+        const char *new_key = sql_node_key(&scratch, ctx->source, change.new_name);
+        const char *old_key = sql_node_key(&scratch, ctx->source, change.old_name);
+        if (new_key && strcmp(key, new_key) == 0) {
+            if (!old_key) {
+                matched = change.new_name;
+                goto done;
+            }
+            key = sql_node_key(ctx->arena, ctx->source, change.old_name);
+            if (!key)
+                goto done;
+        } else if (old_key && strcmp(key, old_key) == 0) {
+            goto done;
+        }
+        cbm_arena_rewind(&scratch);
+    }
+    for (uint32_t i = 0; i < ts_node_named_child_count(columns); i++) {
+        TSNode col = ts_node_named_child(columns, i);
+        if (strcmp(ts_node_type(col), "column_definition") != 0)
+            continue;
+        TSNode name = ts_node_child_by_field_name(col, TS_FIELD("name"));
+        const char *candidate = sql_node_key(&scratch, ctx->source, name);
+        if (!candidate || (strcmp(key, candidate) == 0 && !ts_node_is_null(matched))) {
+            matched = none;
+            break;
+        }
+        if (strcmp(key, candidate) == 0)
+            matched = name;
+        cbm_arena_rewind(&scratch);
+    }
+done:
+    cbm_arena_destroy(&scratch);
+    return matched;
+}
+
+static const char *sql_emit_column_def(CBMExtractCtx *ctx, const SqlForeignTable *table,
+                                       TSNode name_node, CBMHashTable *emitted) {
+    CBMArena *arena = ctx->arena;
+    const char *name = cbm_node_text(arena, name_node, ctx->source);
+    const char *owner = table->qn;
+    if (!owner || !name)
+        return NULL;
+    const char *qn = sql_node_kind(ts_node_parent(ts_node_parent(name_node)), "add_column")
+                         ? cbm_arena_sprintf(arena, "%s.%s@%u", owner, name,
+                                             ts_node_start_byte(name_node))
+                         : cbm_arena_sprintf(arena, "%s.%s", owner, name);
+    if (!qn)
+        return NULL;
+    if (!cbm_ht_has(emitted, qn)) {
+        cbm_ht_set(emitted, qn, (void *)qn);
+        if (!cbm_ht_has(emitted, qn))
+            return NULL;
+        uint32_t line = ts_node_start_point(name_node).row + TS_LINE_OFFSET;
+        CBMDefinition def = {.name = name, .qualified_name = qn, .label = "Field",
+                             .file_path = ctx->rel_path, .parent_class = owner, .start_line = line,
+                             .end_line = line, .name_start_byte = ts_node_start_byte(name_node),
+                             .name_end_byte = ts_node_end_byte(name_node),
+                             .name_source_origin = CBM_SOURCE_ORIGIN_RAW};
+        cbm_defs_push(&ctx->result->defs, arena, def);
+    }
+    return qn;
+}
+
+/* Return the sole primary key's column definition or ordered column list. */
+static TSNode sql_primary_key(const SqlForeignTable *table) {
+    TSNode none = {0}, key = {0};
+    TSNode columns = cbm_find_child_by_kind(table->create, "column_definitions");
+    if (ts_node_is_null(columns))
+        return none;
+    for (uint32_t i = 0; i < ts_node_named_child_count(columns); i++) {
+        TSNode column = ts_node_named_child(columns, i);
+        if (!sql_node_kind(column, "column_definition"))
+            continue;
+        for (uint32_t j = 0; j < ts_node_named_child_count(column); j++) {
+            if (!sql_node_kind(ts_node_named_child(column, j), "keyword_primary"))
+                continue;
+            if (!ts_node_is_null(key))
+                return none;
+            key = column;
+        }
+    }
+    TSNode constraints = cbm_find_child_by_kind(columns, "constraints");
+    uint32_t count = ts_node_is_null(constraints) ? 0 : ts_node_named_child_count(constraints);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode constraint = ts_node_named_child(constraints, i);
+        if (!sql_node_kind(constraint, "constraint") ||
+            ts_node_is_null(cbm_find_child_by_kind(constraint, "keyword_primary")))
+            continue;
+        if (!ts_node_is_null(key))
+            return none;
+        key = cbm_find_child_by_kind(constraint, "ordered_columns");
+        if (ts_node_is_null(key))
+            return none;
+    }
+    return key;
+}
+
+static void sql_bind_foreign_columns(CBMExtractCtx *ctx, const CBMUsage *usage,
+                                     const SqlForeignTable *local, const SqlForeignTable *remote,
+                                     CBMHashTable *emitted) {
+    if (local->columns_changed || remote->columns_changed)
+        return;
+    TSNode name = ts_node_named_descendant_for_byte_range(ctx->root, usage->site_start_byte,
+                                                         usage->site_end_byte);
+    TSNode object = ts_node_parent(name);
+    TSNode fk = ts_node_parent(object);
+    TSNode open = sql_next_token(object);
+    if (!sql_node_kind(object, "object_reference"))
+        return;
+    bool implicit = !sql_node_kind(open, "(");
+    bool in_column = sql_node_kind(fk, "column_definition");
+    TSNode locals = {0};
+    uint32_t count = 1;
+    if (!in_column) {
+        locals = cbm_find_child_by_kind(fk, "ordered_columns");
+        if (!sql_node_kind(fk, "constraint") || ts_node_is_null(locals) ||
+            ts_node_is_null(cbm_find_child_by_kind(fk, "keyword_foreign")))
+            return;
+        count = 0;
+        for (uint32_t i = 0; i < ts_node_named_child_count(locals); i++) {
+            TSNode col = ts_node_named_child(locals, i);
+            if (ts_node_is_extra(col))
+                continue;
+            if (!sql_node_kind(col, "column") || ts_node_named_child_count(col) != 1)
+                return;
+            count++;
+        }
+        if (!count)
+            return;
+    }
+    TSNode remote_ref = {0};
+    bool remote_inline = false;
+    if (implicit) {
+        TSNode key = sql_primary_key(remote);
+        if (ts_node_is_null(key))
+            return;
+        remote_inline = sql_node_kind(key, "column_definition");
+        if (remote_inline && count != 1)
+            return;
+        remote_ref = remote_inline ? ts_node_child_by_field_name(key, TS_FIELD("name"))
+                                    : sql_next_token(ts_node_child(key, 0));
+    } else {
+        remote_ref = sql_next_token(open);
+    }
+    SqlForeignColumnPair *pairs = calloc(count, sizeof(*pairs));
+    if (!pairs)
+        return;
+    TSNode local_ref = in_column ? ts_node_child_by_field_name(fk, TS_FIELD("name"))
+                                 : sql_next_token(ts_node_child(locals, 0));
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode local_name = in_column ? local_ref
+                                      : ts_node_child_by_field_name(local_ref, TS_FIELD("name"));
+        TSNode left = sql_find_column(ctx, local, sql_final_column_key(ctx, local, local_name, true),
+                                      UINT32_MAX);
+        TSNode remote_name = remote_ref;
+        if (implicit && !remote_inline) {
+            if (!sql_node_kind(remote_ref, "column"))
+                goto done;
+            remote_name = ts_node_child_by_field_name(remote_ref, TS_FIELD("name"));
+        }
+        const char *remote_key = implicit ? sql_node_key(ctx->arena, ctx->source, remote_name)
+                                          : sql_final_column_key(ctx, remote, remote_name, false);
+        TSNode right = sql_find_column(ctx, remote, remote_key,
+                                       implicit ? ts_node_end_byte(remote->create) : UINT32_MAX);
+        if (ts_node_is_null(left) || ts_node_is_null(right) ||
+            (in_column && !ts_node_eq(left, local_name)))
+            goto done;
+        for (uint32_t j = 0; j < i; j++) {
+            if (ts_node_eq(left, pairs[j].local_decl) || ts_node_eq(right, pairs[j].remote_decl))
+                goto done;
+        }
+        pairs[i] = (SqlForeignColumnPair){left, right, implicit ? name : remote_ref};
+        if (!remote_inline) {
+            remote_ref = sql_next_token(remote_ref);
+            if (!sql_node_kind(remote_ref, i + 1 < count ? "," : ")"))
+                goto done;
+        }
+        if (i + 1 < count) {
+            remote_ref = sql_next_token(remote_ref);
+            local_ref = sql_next_token(sql_next_token(local_ref));
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const char *src = sql_emit_column_def(ctx, local, pairs[i].local_decl, emitted);
+        const char *dst = sql_emit_column_def(ctx, remote, pairs[i].remote_decl, emitted);
+        if (src && dst) {
+            CBMUsage column = {.ref_name = dst, .enclosing_func_qn = src,
+                               .site_start_byte = ts_node_start_byte(pairs[i].remote_ref),
+                               .site_end_byte = ts_node_end_byte(pairs[i].remote_ref),
+                               .kind = implicit ? CBM_USAGE_SQL_FOREIGN_IMPLICIT_COLUMN
+                                                : CBM_USAGE_SQL_FOREIGN_COLUMN,
+                               .source_origin = CBM_SOURCE_ORIGIN_RAW};
+            cbm_usages_push(&ctx->result->usages, ctx->arena, column);
+        }
+    }
+done:
+    free(pairs);
 }
 
 // Handle SQL DDL relation defs: CREATE TABLE / VIEW / MATERIALIZED VIEW become
@@ -8839,8 +9399,411 @@ static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const cha
     // or pass_usages cannot find the enclosing def for the lineage source.
     const char *qn =
         cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, qn_safe_segment(ctx->arena, name));
-    collect_sql_relation_usages(ctx, node, qn);
+    collect_sql_relation_usages(ctx, node, qn,
+                               qn && strcmp(label, "Table") == 0 && sql_plain_table(node), node);
     return true;
+}
+
+/* A commit marker also occurs in dumps whose FK enforcement is disabled. */
+static bool sql_transaction_has_commit(TSNode node) {
+    if (ts_node_has_error(node) ||
+        ts_node_is_null(cbm_find_child_by_kind(node, "keyword_commit")))
+        return false;
+    // Parser recovery can put an invalid END suffix beside the transaction.
+    TSNode delimiter = ts_node_next_sibling(node);
+    while (!ts_node_is_null(delimiter) && ts_node_is_extra(delimiter) && !ts_node_has_error(delimiter))
+        delimiter = ts_node_next_sibling(delimiter);
+    return ts_node_is_null(delimiter) ||
+           (sql_node_kind(delimiter, ";") && !ts_node_is_missing(delimiter));
+}
+
+static bool sql_schema_transaction(TSNode node, TSNode verified_transaction, bool require_replay) {
+    return ts_node_eq(node, verified_transaction) ||
+           (!require_replay && sql_node_kind(node, "transaction") && sql_transaction_has_commit(node));
+}
+
+/* A single plain ADD preserves the columns and keys declared by CREATE TABLE. */
+static TSNode sql_plain_added_column(TSNode add) {
+    TSNode none = {0};
+    TSNode keyword = ts_node_child(add, 0);
+    if (!sql_node_kind(keyword, "keyword_add"))
+        return none;
+    TSNode column = sql_next_token(keyword);
+    if (sql_node_kind(column, "keyword_column"))
+        column = sql_next_token(column);
+    if (!sql_node_kind(column, "column_definition") || !ts_node_is_null(sql_next_token(column)))
+        return none;
+    TSNode name = ts_node_child_by_field_name(column, TS_FIELD("name"));
+    TSNode type = ts_node_child_by_field_name(column, TS_FIELD("type"));
+    if (ts_node_is_null(name) || !ts_node_eq(name, ts_node_child(column, 0)) ||
+        !ts_node_eq(sql_next_token(name), type) ||
+        (!ts_node_is_null(type) && !ts_node_is_null(sql_next_token(type))))
+        return none;
+    return name;
+}
+
+CBMSQLColumnAlter cbm_sql_column_alter(CBMExtractCtx *ctx, TSNode alter, TSNode object) {
+    CBMSQLColumnAlter none = {0};
+    if (!sql_main_object(ctx, object))
+        return none;
+    TSNode keyword = ts_node_child(alter, 0);
+    if (!sql_node_kind(keyword, "keyword_alter"))
+        return none;
+    keyword = sql_next_token(keyword);
+    if (!sql_node_kind(keyword, "keyword_table") || !ts_node_eq(sql_next_token(keyword), object))
+        return none;
+    TSNode operation = sql_next_token(object);
+    if (ts_node_is_null(operation) || !ts_node_is_null(sql_next_token(operation)))
+        return none;
+    if (sql_node_kind(operation, "add_column"))
+        return (CBMSQLColumnAlter){.new_name = sql_plain_added_column(operation)};
+
+    bool rename = sql_node_kind(operation, "rename_column");
+    if (!rename && !sql_node_kind(operation, "drop_column"))
+        return none;
+    TSNode old_name = ts_node_child_by_field_name(operation, rename ? "old_name" : "name",
+                                                 rename ? 8 : 4);
+    TSNode start = sql_next_token(ts_node_child(operation, 0));
+    if (sql_node_kind(start, "keyword_column"))
+        start = sql_next_token(start);
+    if (ts_node_is_null(old_name) || !ts_node_eq(start, old_name))
+        return none;
+    return (CBMSQLColumnAlter){.old_name = old_name,
+                              .new_name = ts_node_child_by_field_name(operation, "new_name", 8)};
+}
+
+static TSNode sql_next_schema_statement(TSNode root, TSNode previous, TSNode verified_transaction,
+                                        bool require_replay) {
+    TSNode node = ts_node_is_null(previous) ? ts_node_named_child(root, 0)
+                                           : ts_node_next_named_sibling(previous);
+    if (!ts_node_is_null(previous)) {
+        TSNode parent = ts_node_parent(previous);
+        if (sql_node_kind(parent, "transaction") || ts_node_eq(parent, verified_transaction)) {
+            while (!ts_node_is_null(node) && !sql_node_kind(node, "statement"))
+                node = ts_node_next_named_sibling(node);
+            if (!ts_node_is_null(node))
+                return node;
+            node = ts_node_next_named_sibling(parent);
+        }
+    }
+    for (; !ts_node_is_null(node); node = ts_node_next_named_sibling(node)) {
+        if (sql_node_kind(node, "statement"))
+            return node;
+        if (sql_schema_transaction(node, verified_transaction, require_replay)) {
+            TSNode statement = cbm_find_child_by_kind(node, "statement");
+            if (!ts_node_is_null(statement))
+                return statement;
+        }
+    }
+    return node;
+}
+
+typedef enum { SQL_TARGET_NONE, SQL_TARGET_LOCAL, SQL_TARGET_DISCARD } SqlTableTarget;
+
+static SqlTableTarget sql_table_target(CBMExtractCtx *ctx, const CBMUsage *usage,
+                                       TSNode verified_transaction, bool require_replay) {
+    if (usage->kind != CBM_USAGE_VALUE || !usage->enclosing_func_qn || !ctx->module_qn ||
+        usage->site_end_byte <= usage->site_start_byte ||
+        strcmp(usage->enclosing_func_qn, ctx->module_qn) != 0)
+        return SQL_TARGET_NONE;
+    TSNode name = ts_node_named_descendant_for_byte_range(ctx->root, usage->site_start_byte,
+                                                         usage->site_end_byte);
+    TSNode object = ts_node_parent(name);
+    if (!sql_node_kind(object, "object_reference") ||
+        !ts_node_eq(ts_node_child_by_field_name(object, TS_FIELD("name")), name))
+        return SQL_TARGET_NONE;
+    TSNode operation = ts_node_parent(object);
+    const bool insert = sql_node_kind(operation, "insert");
+    if (!insert && !sql_node_kind(operation, "create_index"))
+        return SQL_TARGET_NONE;
+    TSNode marker = cbm_find_child_by_kind(operation, insert ? "keyword_into" : "keyword_on");
+    if (ts_node_is_null(marker) || !ts_node_eq(sql_next_token(marker), object))
+        return SQL_TARGET_NONE;
+    if (insert && !sql_node_kind(ts_node_named_child(operation, 0), "keyword_insert"))
+        return SQL_TARGET_NONE;
+    TSNode statement = ts_node_parent(operation);
+    TSNode container = ts_node_parent(statement);
+    if (!sql_node_kind(statement, "statement"))
+        return SQL_TARGET_NONE;
+    if (require_replay && sql_node_kind(container, "transaction") &&
+        ts_node_eq(ts_node_parent(container), ctx->root) &&
+        !ts_node_eq(container, verified_transaction))
+        return SQL_TARGET_DISCARD;
+    if (ts_node_named_child_count(object) != 1 &&
+        !(insert && ts_node_eq(container, verified_transaction) &&
+          sql_main_object(ctx, object)))
+        return SQL_TARGET_NONE;
+    if (ts_node_eq(container, ctx->root) ||
+        (ts_node_eq(ts_node_parent(container), ctx->root) &&
+         sql_schema_transaction(container, verified_transaction, require_replay)))
+        return SQL_TARGET_LOCAL;
+    return SQL_TARGET_NONE;
+}
+
+/* shortcut: bind only a unique unqualified CREATE in this DDL file, until
+ * the index has an explicit schema and migration-order model. */
+void cbm_bind_sql_columns(CBMExtractCtx *ctx, TSNode verified_transaction, bool require_replay,
+                          TSNode verified_top_level_alter) {
+    CBMUsageArray *usages = &ctx->result->usages;
+    bool has_foreign_tables = false, has_trigger_columns = false, has_table_targets = false;
+    bool has_view_targets = false;
+    bool complete = !ts_node_has_error(ctx->root);
+    int candidate_count = 0;
+    for (int i = 0; i < usages->count; i++) {
+        CBMUsage usage = usages->items[i];
+        has_foreign_tables |= usage.kind == CBM_USAGE_SQL_FOREIGN_TABLE;
+        has_trigger_columns |= usage.kind == CBM_USAGE_SQL_TRIGGER_COLUMN ||
+                               usage.kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN;
+        has_view_targets |= usage.kind == CBM_USAGE_SQL_TABLE_TARGET;
+        SqlTableTarget target = complete || require_replay
+                                    ? sql_table_target(ctx, &usage, verified_transaction, require_replay)
+                                    : SQL_TARGET_NONE;
+        if (target == SQL_TARGET_DISCARD)
+            continue;
+        if (complete && target == SQL_TARGET_LOCAL) {
+            usage.kind = CBM_USAGE_SQL_TABLE_TARGET;
+            has_table_targets = true;
+        }
+        usages->items[candidate_count++] = usage;
+    }
+    usages->count = candidate_count;
+    if (!has_foreign_tables && !has_trigger_columns && !has_table_targets && !has_view_targets)
+        return;
+
+    CBMHashTable *tables = cbm_ht_create(0);
+    CBMHashTable *qns = cbm_ht_create(0);
+    CBMHashTable *views = has_table_targets ? cbm_ht_create(0) : NULL;
+    /* shortcut: use stable top-level main DDL until transaction replay can prove it. */
+    CBMHashTable *main_tables =
+        has_view_targets && complete &&
+        ts_node_is_null(cbm_find_child_by_kind(ctx->root, "transaction")) ? cbm_ht_create(0) : NULL;
+    CBMArena *arena = ctx->arena;
+    SqlForeignTable ambiguous = {0}, unbound = {0};
+    bool has_alter = false;
+    bool reliable = tables && qns;
+    for (int i = 0; reliable && i < ctx->result->defs.count; i++) {
+        const CBMDefinition *def = &ctx->result->defs.items[i];
+        if (!def->qualified_name ||
+            (strcmp(def->label, "Table") != 0 && strcmp(def->label, "View") != 0))
+            continue;
+        SqlForeignTable *entry = cbm_ht_has(qns, def->qualified_name) ? &ambiguous : &unbound;
+        cbm_ht_set(qns, def->qualified_name, entry);
+        reliable = cbm_ht_get(qns, def->qualified_name) == entry;
+        if (views && def->name && strcmp(def->label, "View") == 0) {
+            const char *key = cbm_sql_identifier_key(arena, def->name, strlen(def->name));
+            if (key)
+                cbm_ht_set(views, key, &ambiguous);
+            if (!key || !cbm_ht_has(views, key)) {
+                cbm_ht_free(views);
+                views = NULL;
+            }
+        }
+    }
+    for (TSNode statement = sql_next_schema_statement(ctx->root, (TSNode){0}, verified_transaction,
+                                                     require_replay);
+         reliable && !ts_node_is_null(statement);
+         statement = sql_next_schema_statement(ctx->root, statement, verified_transaction,
+                                                require_replay)) {
+        TSNode node = cbm_find_child_by_kind(statement, "create_table");
+        if (ts_node_is_null(node)) {
+            if (main_tables && !ts_node_is_null(cbm_find_child_by_kind(statement, "drop_view"))) {
+                cbm_ht_free(main_tables);
+                main_tables = NULL;
+            }
+            TSNode view = cbm_find_child_by_kind(statement, "create_view");
+            if (main_tables && !ts_node_is_null(view) && sql_main_create(ctx, view)) {
+                const char *key = sql_node_key(arena, ctx->source, resolve_sql_func_name(view));
+                if (key)
+                    cbm_ht_set(main_tables, key, (void *)"");
+                if (!key || !cbm_ht_has(main_tables, key)) {
+                    cbm_ht_free(main_tables);
+                    main_tables = NULL;
+                }
+            }
+            TSNode alter = cbm_find_child_by_kind(statement, "alter_table");
+            has_alter |= !ts_node_is_null(alter);
+            if (!ts_node_is_null(cbm_find_child_by_kind(statement, "drop_table")) ||
+                (!ts_node_is_null(cbm_find_child_by_kind(statement, "keyword_rename")) &&
+                 !ts_node_is_null(cbm_find_child_by_kind(statement, "keyword_table"))) ||
+                (!ts_node_is_null(alter) &&
+                 (!ts_node_is_null(cbm_find_child_by_kind(alter, "rename_object")) ||
+                  !ts_node_is_null(cbm_find_child_by_kind(alter, "set_schema")) ||
+                  ts_node_has_error(alter)))) {
+                reliable = false;
+            }
+            continue;
+        }
+        TSNode identifier = resolve_sql_func_name(node);
+        char *name = ts_node_is_null(identifier) ? NULL : cbm_node_text(arena, identifier, ctx->source);
+        const char *key = sql_node_key(arena, ctx->source, identifier);
+        const char *qn = name ? cbm_fqn_compute(arena, ctx->project, ctx->rel_path,
+                                                qn_safe_segment(arena, name)) : NULL;
+        if (!key || !qn) {
+            reliable = false;
+            break;
+        }
+        if (main_tables && sql_main_create(ctx, node)) {
+            const char *entry = !cbm_ht_has(main_tables, key) && cbm_ht_get(qns, qn) == &unbound &&
+                                    !ts_node_is_null(cbm_find_child_by_kind(node, "column_definitions"))
+                                    ? qn : "";
+            cbm_ht_set(main_tables, key, (void *)entry);
+            if (cbm_ht_get(main_tables, key) != entry) {
+                cbm_ht_free(main_tables);
+                main_tables = NULL;
+            }
+        }
+        SqlForeignTable *target = &ambiguous;
+        if (!ts_node_has_error(node) && sql_plain_table(node) && !cbm_ht_has(tables, key) &&
+            cbm_ht_get(qns, qn) == &unbound) {
+            target = cbm_arena_alloc(arena, sizeof(*target));
+            if (!target) {
+                reliable = false;
+                break;
+            }
+            *target = (SqlForeignTable){.qn = qn, .key = key, .create = node};
+            cbm_ht_set(qns, qn, target);
+            if (cbm_ht_get(qns, qn) != target) {
+                reliable = false;
+                break;
+            }
+        }
+        cbm_ht_set(tables, key, target);
+        reliable = cbm_ht_get(tables, key) == target;
+    }
+    bool columns_reliable = reliable;
+    if (columns_reliable && has_alter) {
+        for (TSNode stmt = sql_next_schema_statement(ctx->root, (TSNode){0}, verified_transaction,
+                                                    require_replay);
+             !ts_node_is_null(stmt);
+             stmt = sql_next_schema_statement(ctx->root, stmt, verified_transaction,
+                                              require_replay)) {
+            TSNode alter = cbm_find_child_by_kind(stmt, "alter_table");
+            if (ts_node_is_null(alter))
+                continue;
+            TSNode object = cbm_find_child_by_kind(alter, "object_reference");
+            TSNode id = ts_node_is_null(object) ? object
+                                               : ts_node_child_by_field_name(object, TS_FIELD("name"));
+            const char *key = sql_node_key(arena, ctx->source, id);
+            if (!key) {
+                columns_reliable = false;
+                break;
+            }
+            SqlForeignTable *changed = cbm_ht_get(tables, key);
+            if (!changed || !changed->qn)
+                continue;
+            CBMSQLColumnAlter change = cbm_sql_column_alter(ctx, alter, object);
+            if (ts_node_eq(ts_node_parent(stmt), verified_transaction)) {
+                if (ts_node_is_null(changed->first_alter))
+                    changed->first_alter = stmt;
+                changed->last_alter = stmt;
+            } else if (!ts_node_is_null(change.old_name) || ts_node_is_null(change.new_name)) {
+                changed->columns_changed = true;
+            }
+        }
+    }
+    CBMHashTable *emitted = columns_reliable ? cbm_ht_create(0) : NULL;
+    CBMHashTable *owners = emitted && has_trigger_columns ? cbm_ht_create(0) : NULL;
+    if (owners) {
+        for (int i = 0; i < ctx->result->defs.count; i++) {
+            const CBMDefinition *def = &ctx->result->defs.items[i];
+            if (!def->qualified_name || strcmp(def->label, "Function") != 0)
+                continue;
+            bool seen = cbm_ht_has(owners, def->qualified_name);
+            cbm_ht_set(owners, def->qualified_name, seen ? (void *)"" : (void *)def->qualified_name);
+        }
+    }
+    int kept = 0;
+    for (int i = 0; i < usages->count; i++) {
+        CBMUsage usage = usages->items[i];
+        if (usage.kind == CBM_USAGE_SQL_FOREIGN_TABLE) {
+            const char *key = reliable ? cbm_sql_identifier_key(arena, usage.ref_name,
+                                                            strlen(usage.ref_name)) : NULL;
+            const SqlForeignTable *table = key ? cbm_ht_get(tables, key) : NULL;
+            const SqlForeignTable *owner = reliable && usage.enclosing_func_qn
+                                               ? cbm_ht_get(qns, usage.enclosing_func_qn) : NULL;
+            if (!table || !table->qn || !owner || !owner->key ||
+                cbm_ht_get(tables, owner->key) != owner)
+                continue;
+            if (!ts_node_is_null(owner->first_alter)) {
+                TSNode target = ts_node_named_descendant_for_byte_range(ctx->root, usage.site_start_byte,
+                                                                       usage.site_end_byte);
+                TSNode object = ts_node_is_null(target) ? target : ts_node_parent(target);
+                TSNode clause = ts_node_is_null(object) ? object : ts_node_parent(object);
+                if (sql_node_kind(clause, "column_definition") &&
+                    !sql_final_column_key(ctx, owner,
+                                          ts_node_child_by_field_name(clause, TS_FIELD("name")), true))
+                    continue;
+            }
+            usage.ref_name = table->qn;
+        } else if (usage.kind == CBM_USAGE_SQL_TABLE_TARGET) {
+            const char *key = reliable ? cbm_sql_identifier_key(arena, usage.ref_name,
+                                                            strlen(usage.ref_name)) : NULL;
+            if (usage.enclosing_func_qn && strcmp(usage.enclosing_func_qn, ctx->module_qn) != 0) {
+                const char *target = main_tables && key ? cbm_ht_get(main_tables, key) : NULL;
+                if (!target || !target[0] || cbm_ht_get(qns, usage.enclosing_func_qn) != &unbound)
+                    continue;
+                usage.ref_name = target;
+            } else {
+                const SqlForeignTable *table = key ? cbm_ht_get(tables, key) : NULL;
+                if (table && table->qn && views && !cbm_ht_has(views, key) &&
+                    ts_node_end_byte(table->create) <= usage.site_start_byte) {
+                    usage.ref_name = table->qn;
+                } else {
+                    usage.kind = CBM_USAGE_VALUE;
+                }
+            }
+        } else if (usage.kind == CBM_USAGE_SQL_TRIGGER_COLUMN ||
+                   usage.kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN) {
+            const char *owner = owners ? cbm_ht_get(owners, usage.enclosing_func_qn) : NULL;
+            const char *key = owner && owner[0] ? cbm_sql_identifier_key(arena, usage.ref_name,
+                                                                     strlen(usage.ref_name)) : NULL;
+            const SqlForeignTable *table = key ? cbm_ht_get(tables, key) : NULL;
+            if (!table || !table->qn || table->columns_changed ||
+                ts_node_end_byte(table->create) > usage.site_start_byte)
+                continue;
+            TSNode ref = {0};
+            const char *column;
+            if (usage.kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN) {
+                /* The compatibility projection masks the trigger header. */
+                column = cbm_sql_identifier_key(arena, ctx->source + usage.site_start_byte,
+                                                usage.site_end_byte - usage.site_start_byte);
+            } else {
+                ref = ts_node_named_descendant_for_byte_range(ctx->root, usage.site_start_byte,
+                                                              usage.site_end_byte);
+                column = sql_node_key(arena, ctx->source, ref);
+            }
+            SqlForeignTable history = *table;
+            if (!ts_node_is_null(verified_top_level_alter))
+                history.last_alter = verified_top_level_alter;
+            TSNode declaration = sql_find_column(ctx, &history, column, usage.site_start_byte);
+            if (ts_node_is_null(declaration))
+                continue;
+            usage.ref_name = sql_emit_column_def(ctx, table, declaration, emitted);
+            if (!usage.ref_name)
+                continue;
+            if (!ts_node_is_null(ref))
+                usage.site_start_byte = ts_node_start_byte(ts_node_parent(ref));
+        }
+        usages->items[kept++] = usage;
+    }
+    usages->count = kept;
+    if (emitted) {
+        for (int i = 0; i < kept; i++) {
+            CBMUsage usage = usages->items[i];
+            if (usage.kind != CBM_USAGE_SQL_FOREIGN_TABLE)
+                continue;
+            const SqlForeignTable *owner = cbm_ht_get(qns, usage.enclosing_func_qn);
+            const SqlForeignTable *target = cbm_ht_get(qns, usage.ref_name);
+            if (owner && target)
+                sql_bind_foreign_columns(ctx, &usage, owner, target, emitted);
+        }
+        cbm_ht_free(emitted);
+    }
+    cbm_ht_free(owners);
+    cbm_ht_free(views);
+    cbm_ht_free(main_tables);
+    cbm_ht_free(qns);
+    cbm_ht_free(tables);
 }
 
 /* ── Python annotated instance fields (#1277) ─────────────────────
@@ -9464,7 +10427,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (!name || !name[0]) {
         return;
     }
-    emit_class_def(ctx, node, spec, kind, name);
+    emit_class_def(ctx, node, spec, kind, name, name_node);
 }
 
 /* Emit the class-like def for `node` under `name`, plus its members (enum
@@ -9472,7 +10435,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
  * C `typedef struct { ... } Name;` can name its anonymous struct after the
  * typedef (extract_c_typedef). */
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                           const char *kind, char *name) {
+                           const char *kind, char *name, TSNode name_node) {
     CBMArena *a = ctx->arena;
 
     // For nested classes, prefix with enclosing class QN (e.g., Outer.Inner).
@@ -9560,6 +10523,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
+    def_set_source_name(ctx, &def, name_node);
     def.qualified_name = class_qn;
     def.label = label;
     def.file_path = ctx->rel_path;
@@ -9595,6 +10559,21 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         if (!ts_node_is_null(target)) {
             def.alias_target = cbm_node_text(a, target, ctx->source);
         }
+    }
+    if (ctx->language == CBM_LANG_GO &&
+        (strcmp(kind, "type_spec") == 0 || strcmp(kind, "type_alias") == 0) &&
+        ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("type_parameters")))) {
+        TSNode target = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (!ts_node_is_null(target) && strcmp(ts_node_type(target), "struct_type") != 0 &&
+            strcmp(ts_node_type(target), "interface_type") != 0)
+            def.go_underlying_type = cbm_node_text(a, target, ctx->source);
+    }
+    if (ctx->language == CBM_LANG_GO &&
+        (strcmp(kind, "type_spec") == 0 || strcmp(kind, "type_alias") == 0) &&
+        !ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("type_parameters")))) {
+        const char *declaration = cbm_node_text(a, node, ctx->source);
+        if (declaration)
+            def.go_generic_declaration = cbm_arena_sprintf(a, "type %s", declaration);
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
@@ -9759,7 +10738,7 @@ static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
         if (anonymous_body && ts_node_eq(decl, alias_node)) {
             /* its doc is the comment above the typedef (doc_anchor_c) */
-            emit_class_def(ctx, type, spec, tk, name);
+            emit_class_def(ctx, type, spec, tk, name, alias_node);
             anonymous_body = false; /* a second plain name is an alias of the first */
             continue;
         }
@@ -10068,6 +11047,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
+    def_set_source_name(ctx, &def, name_node);
     def.qualified_name = method_qn;
     if (ctx->language == CBM_LANG_SWIFT) {
         if (!method_qn) {
@@ -10092,6 +11072,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.is_exported = cbm_is_exported(name, ctx->language);
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
+        def.is_abstract = true;
+    }
+    if ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_QML) &&
+        (strcmp(ts_node_type(child), "method_signature") == 0 ||
+         strcmp(ts_node_type(child), "abstract_method_signature") == 0)) {
         def.is_abstract = true;
     }
 
@@ -11075,6 +12061,14 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     push_var_def_qn(ctx, name, NULL, node);
 }
 
+static void push_named_var_def(CBMExtractCtx *ctx, TSNode name, TSNode node) {
+    int before = ctx->result->defs.count;
+    push_var_def(ctx, cbm_node_text(ctx->arena, name, ctx->source), node);
+    if (ctx->result->defs.count > before) {
+        def_set_source_name(ctx, &ctx->result->defs.items[before], name);
+    }
+}
+
 // Helper: extract name from a declarator chain (C/C++/ObjC)
 // declaration > init_declarator > declarator (may be pointer_declarator > identifier)
 static const char *extract_c_declarator_name(CBMArena *a, TSNode decl, const char *source) {
@@ -11463,7 +12457,7 @@ static void extract_destructured_vars(CBMExtractCtx *ctx, TSNode pattern, TSNode
         }
         char *id_text = cbm_node_text(a, ident, ctx->source);
         if (id_text && id_text[0]) {
-            push_var_def(ctx, id_text, decl);
+            push_named_var_def(ctx, ident, decl);
         }
     }
 }
@@ -11652,7 +12646,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     continue;
                 }
                 int before = ctx->result->defs.count;
-                push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                push_named_var_def(ctx, vname, child);
                 if (ctx->result->defs.count > before &&
                     js_is_axios_create_call(value, ctx->source)) {
                     js_mark_axios_client(a, &ctx->result->defs.items[before], value, ctx->source);
@@ -11749,20 +12743,25 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
                             ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("value")));
                 const char *vtype = bare ? repeated : go_value_type_text(a, child, ctx->source);
                 repeated = vtype;
-                TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
-                if (!ts_node_is_null(vname)) {
-                    int before = ctx->result->defs.count;
-                    push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
-                    /* The value's type reaches other files (pkg.V.Method()),
-                     * never the graph (CBMDefTypeFacts.value_type). */
-                    CBMDefTypeFacts *facts =
-                        vtype && ctx->result->defs.count == before + 1
-                            ? def_type_facts(a, &ctx->result->defs.items[before])
-                            : NULL;
-                    if (facts) {
-                        facts->value_type = vtype;
-                    }
+                TSTreeCursor names = ts_tree_cursor_new(child);
+                if (ts_tree_cursor_goto_first_child(&names)) {
+                    do {
+                        const char *field = ts_tree_cursor_current_field_name(&names);
+                        if (field && strcmp(field, "name") == 0) {
+                            int before = ctx->result->defs.count;
+                            push_named_var_def(ctx, ts_tree_cursor_current_node(&names), child);
+                            /* Carry the value type to the cross-file resolver. */
+                            if (vtype && ctx->result->defs.count > before) {
+                                CBMDefTypeFacts *facts =
+                                    def_type_facts(a, &ctx->result->defs.items[before]);
+                                if (facts) {
+                                    facts->value_type = vtype;
+                                }
+                            }
+                        }
+                    } while (ts_tree_cursor_goto_next_sibling(&names));
                 }
+                ts_tree_cursor_delete(&names);
             }
         }
         break;
@@ -13052,6 +14051,15 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             continue;
         }
 
+        bool ts_field = ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX;
+        if (ts_field) {
+            TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
+            if (!ts_node_is_null(value) &&
+                cbm_kind_in_set(value, spec->function_node_types)) {
+                continue; /* already extracted as a Method */
+            }
+        }
+
         if (is_c_member_declaration(ctx, child)) {
             extract_c_member_fields(ctx, child, class_qn, spec);
             continue;
@@ -13283,7 +14291,9 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
          * walking named children for a variable_declaration. */
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
         TSNode empty_node = {0};
-        TSNode name_node = ts_node_is_null(type_node) ? empty_node : resolve_field_name_node(child);
+        TSNode name_node = !ts_field && ts_node_is_null(type_node)
+                               ? empty_node
+                               : resolve_field_name_node(child);
 
         if (ts_node_is_null(type_node)) {
             uint32_t cnc = ts_node_named_child_count(child);
@@ -13309,11 +14319,12 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             }
         }
 
-        if (ts_node_is_null(type_node)) {
+        if (ts_node_is_null(type_node) && !ts_field) {
             continue;
         }
-        char *type_text = cbm_node_text(a, type_node, ctx->source);
-        if (!type_text || !type_text[0]) {
+        char *type_text =
+            ts_node_is_null(type_node) ? NULL : cbm_node_text(a, type_node, ctx->source);
+        if (!ts_node_is_null(type_node) && (!type_text || !type_text[0])) {
             continue;
         }
 
@@ -13338,6 +14349,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
         def.name = name;
+        def_set_source_name(ctx, &def, name_node);
         def.qualified_name = field_qn;
         def.label = "Field";
         def.file_path = ctx->rel_path;
@@ -14468,12 +15480,22 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     s.path = ctx->rel_path;
     s.arena = ctx->scratch;
     wd_push(&s, root, ctx->enclosing_class_qn);
+    uint32_t go_body_end = 0;
 
     while (s.top > 0) {
         walk_defs_frame_t frame = s.data[--s.top];
         TSNode node = frame.node;
         ctx->enclosing_class_qn = frame.enclosing_class_qn;
         const char *kind = ts_node_type(node);
+
+        /* Inside Go function bodies only closures may introduce graph definitions. */
+        if (go_body_end && ts_node_start_byte(node) < go_body_end) {
+            if (strcmp(kind, "func_literal") == 0)
+                extract_func_def(ctx, node, spec);
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
+            continue;
+        }
+        go_body_end = 0;
 
         /* Kotlin: recover class/object declarations the grammar lost inside an
          * ERROR node (companion-object-with-delegation, inner-class-with-base).
@@ -14583,6 +15605,14 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                     continue;
                 }
                 extract_func_def(ctx, node, spec);
+                if (ctx->language == CBM_LANG_GO) {
+                    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+                    if (!ts_node_is_null(body)) {
+                        go_body_end = ts_node_end_byte(body);
+                        wd_push(&s, body, frame.enclosing_class_qn);
+                    }
+                    continue;
+                }
                 // Most languages stop here. JS/TS (and Wolfram) descend into the
                 // function body so NESTED named definitions are also captured —
                 // e.g. arrow methods of an object literal returned from a factory
@@ -14660,6 +15690,104 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     }
 }
 
+static int js_def_qn_order(const void *left, const void *right) {
+    const CBMDefinition *a = *(CBMDefinition *const *)left;
+    const CBMDefinition *b = *(CBMDefinition *const *)right;
+    return strcmp(a->qualified_name, b->qualified_name);
+}
+
+static TSNode js_def_callable(CBMExtractCtx *ctx, const CBMDefinition *def) {
+    if (strcmp(def->label, "Function") != 0 || def->name_start_byte >= def->name_end_byte)
+        return (TSNode){0};
+    TSNode name = ts_node_named_descendant_for_byte_range(ctx->root, def->name_start_byte,
+                                                         def->name_end_byte);
+    if (ts_node_is_null(name) || ts_node_start_byte(name) != def->name_start_byte ||
+        ts_node_end_byte(name) != def->name_end_byte)
+        return (TSNode){0};
+    TSNode parent = ts_node_parent(name);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "pair") == 0 &&
+        ts_node_eq(name, ts_node_child_by_field_name(parent, TS_FIELD("key"))))
+        return ts_node_child_by_field_name(parent, TS_FIELD("value"));
+    return parent;
+}
+
+static bool js_page_callback_local(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "variable_declarator") != 0)
+        return false;
+    TSNode declaration = ts_node_parent(node);
+    TSNode owner = ts_node_parent(declaration);
+    TSNode value = ts_node_child_by_field_name(node, TS_FIELD("value"));
+    if (ts_node_is_null(owner) || ts_node_is_null(value) ||
+        strcmp(ts_node_type(owner), "statement_block") != 0 ||
+        !js_node_text_is(ts_node_child(declaration, 0), ctx->source, "const") ||
+        (strcmp(ts_node_type(value), "arrow_function") != 0 &&
+         strcmp(ts_node_type(value), "function_expression") != 0))
+        return false;
+    TSNode callback = ts_node_parent(owner);
+    TSNode args = ts_node_parent(callback);
+    if (ts_node_is_null(args) || strcmp(ts_node_type(args), "arguments") != 0 ||
+        !ts_node_eq(ts_node_named_child(args, 0), callback))
+        return false;
+    TSNode call = ts_node_parent(args);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0)
+        return false;
+    TSNode callee = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "member_expression") != 0)
+        return false;
+    TSNode property = ts_node_child_by_field_name(callee, TS_FIELD("property"));
+    // The LSP verifies the Playwright receiver before entering the isolated scope.
+    return js_node_text_is(property, ctx->source, "evaluate") ||
+           js_node_text_is(property, ctx->source, "evaluateHandle");
+}
+
+static void js_separate_object_collisions(CBMExtractCtx *ctx, int first) {
+    CBMDefArray *defs = &ctx->result->defs;
+    int count = defs->count - first;
+    if (count < 2)
+        return;
+    CBMDefinition **rows = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)count * sizeof(*rows));
+    if (!rows)
+        return;
+    int used = 0;
+    for (int i = first; i < defs->count; i++)
+        if (defs->items[i].qualified_name)
+            rows[used++] = &defs->items[i];
+    qsort(rows, (size_t)used, sizeof(*rows), js_def_qn_order);
+    for (int lo = 0, hi; lo < used; lo = hi) {
+        hi = lo + 1;
+        while (hi < used && strcmp(rows[lo]->qualified_name, rows[hi]->qualified_name) == 0)
+            hi++;
+        if (hi - lo < 2)
+            continue;
+        int lexical = -1;
+        int i = lo;
+        for (; i < hi; i++) {
+            TSNode node = js_def_callable(ctx, rows[i]);
+            if (!ts_node_is_null(node) && strcmp(ts_node_type(node), "function_declaration") == 0 &&
+                lexical < 0) {
+                lexical = i;
+            } else if (!cbm_js_object_callable(node)) {
+                break;
+            }
+        }
+        bool object_collision = i == hi && lexical >= 0;
+        for (i = lo; i < hi; i++) {
+            CBMDefinition *def = rows[i];
+            const char *kind = js_page_callback_local(ctx, js_def_callable(ctx, def))
+                                   ? "local" : object_collision && i != lexical ? "object" : NULL;
+            if (!kind)
+                continue;
+            const char *qn = cbm_arena_sprintf(ctx->arena, "%s#%s:%u", def->qualified_name, kind,
+                                             def->name_start_byte);
+            if (qn) {
+                def->qualified_name = qn;
+                def->js_object_collision = true;
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, rows);
+}
+
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -14667,16 +15795,17 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
     }
 
     // Walk AST for function/class definitions
+    int first = ctx->result->defs.count;
+    walk_defs(ctx, ctx->root, spec, 0);
     if (is_c_declarator_lang(ctx->language)) {
-        int first = ctx->result->defs.count;
-        walk_defs(ctx, ctx->root, spec, 0);
         drop_c_typedefs_shadowed_by_tags(ctx, first);
-    } else {
-        walk_defs(ctx, ctx->root, spec, 0);
     }
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX)
+        js_separate_object_collisions(ctx, first);
 }
 
 /* True when rel_path names a Blazor component file. */

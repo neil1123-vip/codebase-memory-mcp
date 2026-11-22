@@ -15,6 +15,15 @@ char *cbm_node_text(CBMArena *a, TSNode node, const char *source);
 // Check if a string is a language keyword (should be skipped as callee/usage).
 bool cbm_is_keyword(const char *name, CBMLanguage lang);
 
+// Check a Go builtin function spelling; callers handle name shadowing.
+bool cbm_go_is_builtin_func(const char *name);
+
+/* C declarations embedded in Go source have a physical identity only. */
+#define CBM_CGO_PREAMBLE_PROPERTY "cgo_preamble"
+#define CBM_CGO_PREAMBLE_QN_PREFIX "@cgo:"
+bool cbm_go_cgo_enabled(void);
+bool cbm_cgo_preamble_qn(const char *qn);
+
 // Check if a name is a builtin we mint a real graph node for, so a CALL to it
 // must NOT be keyword-filtered out of call extraction (the LSP resolves it to
 // the injected builtin node and forms a CALLS edge). Narrower than
@@ -120,6 +129,16 @@ TSNode cbm_c_macro_wrapped_name_node(TSNode decl);
 // `"kebab-case" = a: a;` is named kebab-case rather than "kebab-case". Takes the
 // language for that reason; every caller must pass ctx->language.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang);
+
+bool cbm_js_object_callable(TSNode node);
+
+typedef struct {
+    const CBMDefinition **items;
+    int count;
+} CBMJsObjectOwners;
+
+CBMJsObjectOwners cbm_js_object_owners(CBMArena *arena, const CBMDefArray *defs);
+const char *cbm_js_object_owner(const CBMJsObjectOwners *owners, TSNode name);
 
 // ── Nix attrpath helpers ──
 // A Nix binding's name is a PATH (`a.b.c = …`) whose segments may be quoted or
@@ -320,6 +339,9 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
  * QN. A NULL base_qn or rel_path returns base_qn unchanged. */
 const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_path, TSNode fn_node,
                            const char *source);
+TSNode cbm_go_local_literal_anchor(TSNode node);
+const char *cbm_go_local_literal_qn(CBMArena *a, const char *module_qn, const char *rel_path,
+                                    TSNode anchor);
 
 // --- FQN computation ---
 

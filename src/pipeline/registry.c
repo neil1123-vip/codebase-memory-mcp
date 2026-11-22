@@ -1867,6 +1867,11 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     if (!r || !qualified_name || !label) {
         return;
     }
+    /* SQL columns bind through a verified table and column declaration. */
+    if (lang == CBM_LANG_SQL && strcmp(label, "Field") == 0) {
+        (void)registry_add_exact(r, qualified_name, label);
+        return;
+    }
     if (lang == CBM_LANG_PYTHON &&
         cbm_registry_qn_is_function_local(r, qualified_name, module_prefix_len)) {
         (void)registry_add_exact(r, qualified_name, label);
@@ -3254,9 +3259,13 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
      * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
      * present and future) is thereby relation-safe by construction. The SQL
      * lineage path opts in via cbm_registry_resolve_lineage. */
-    if (res.qualified_name && res.qualified_name[0] &&
-        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
-        res = empty_result();
+    if (res.qualified_name && res.qualified_name[0]) {
+        const char *fence = strchr(simple_name(res.qualified_name), '#');
+        /* Keep a callback local from causing a different short-name guess. */
+        if ((fence && strncmp(fence, "#local:", sizeof("#local:") - 1) == 0) ||
+            cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+            res = empty_result();
+        }
     }
 
     /* Cache the result (including empty — caching the negative answer

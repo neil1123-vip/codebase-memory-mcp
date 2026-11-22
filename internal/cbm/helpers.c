@@ -7,7 +7,9 @@
 #include "foundation/compat.h"   // CBM_TLS
 #include "foundation/log.h"      // cbm_log_error -- walker stack allocation failure
 #include "foundation/mem_core.h" // cbm_alloc/cbm_realloc/cbm_free -- walker stacks
+#include "foundation/platform.h"
 #include <stdlib.h>              // calloc/free for the symbol-set cache
+#include <string.h>
 
 enum {
     MIN_ROUTE_LEN = 3,
@@ -27,9 +29,24 @@ enum {
 
 /* Prefix length helper for strncmp with string literals. */
 #define SLEN(s) (sizeof(s) - SKIP_ONE)
+
+bool cbm_go_cgo_enabled(void) {
+#ifdef __linux__
+    char setting[8];
+    const char *value = cbm_safe_getenv("CBM_GO_FACTS_CGO", setting, sizeof(setting), NULL);
+    return value && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+bool cbm_cgo_preamble_qn(const char *qn) {
+    const char *suffix = qn ? strrchr(qn, '.') : NULL;
+    return suffix && strncmp(suffix + 1, CBM_CGO_PREAMBLE_QN_PREFIX,
+                             SLEN(CBM_CGO_PREAMBLE_QN_PREFIX)) == 0;
+}
 #include <stdint.h> // uint32_t, SIZE_MAX
 #include <limits.h> // INT_MAX
-#include <string.h>
 #include <ctype.h>
 #include <stdio.h>
 
@@ -320,6 +337,18 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
         if (strcmp(name, *kw) == 0) {
             return true;
         }
+    }
+    return false;
+}
+
+bool cbm_go_is_builtin_func(const char *name) {
+    static const char *builtins[] = {"make",   "new",     "append",  "len",   "cap",
+                                     "delete", "close",   "copy",    "panic", "recover",
+                                     "print",  "println", "complex", "real",  "imag",
+                                     "min",    "max",     "clear",   NULL};
+    for (const char **b = builtins; *b; b++) {
+        if (strcmp(name, *b) == 0)
+            return true;
     }
     return false;
 }
@@ -1189,6 +1218,118 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
            lang == CBM_LANG_GLSL || lang == CBM_LANG_OBJC || lang == CBM_LANG_ISPC;
 }
 
+static bool js_binding_binds_window(TSNode program, const char *source) {
+    bool found = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(program);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TSNode parent = ts_node_parent(node);
+        const char *pk = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        const char *field = NULL;
+        if (strcmp(pk, "variable_declarator") == 0 ||
+            strcmp(pk, "function_declaration") == 0 ||
+            strcmp(pk, "generator_function_declaration") == 0 ||
+            strcmp(pk, "class_declaration") == 0) {
+            field = "name";
+        } else if (strcmp(pk, "pair_pattern") == 0) {
+            field = "value";
+        } else if (strcmp(pk, "assignment_pattern") == 0 ||
+                   strcmp(pk, "object_assignment_pattern") == 0) {
+            field = "left";
+        } else if (strcmp(pk, "import_specifier") == 0) {
+            TSNode alias = ts_node_child_by_field_name(parent, TS_FIELD("alias"));
+            field = ts_node_is_null(alias) ? "name" : "alias";
+        }
+        TSNode binding = field ? ts_node_child_by_field_name(parent, field, (uint32_t)strlen(field))
+                               : node;
+        bool selected = !field || ts_node_eq(node, binding);
+        if (selected &&
+            (strcmp(kind, "identifier") == 0 ||
+             strcmp(kind, "shorthand_property_identifier_pattern") == 0) &&
+            ts_node_end_byte(node) - ts_node_start_byte(node) == strlen("window") &&
+            strncmp(source + ts_node_start_byte(node), "window", strlen("window")) == 0) {
+            found = true;
+            break;
+        }
+        bool descend = selected &&
+                       (strcmp(kind, "program") == 0 || strcmp(kind, "export_statement") == 0 ||
+                        strcmp(kind, "lexical_declaration") == 0 ||
+                        strcmp(kind, "variable_declaration") == 0 ||
+                        strcmp(kind, "variable_declarator") == 0 ||
+                        strcmp(kind, "function_declaration") == 0 ||
+                        strcmp(kind, "generator_function_declaration") == 0 ||
+                        strcmp(kind, "class_declaration") == 0 ||
+                        strcmp(kind, "import_statement") == 0 ||
+                        strcmp(kind, "import_clause") == 0 ||
+                        strcmp(kind, "namespace_import") == 0 ||
+                        strcmp(kind, "named_imports") == 0 ||
+                        strcmp(kind, "import_specifier") == 0 ||
+                        strcmp(kind, "object_pattern") == 0 || strcmp(kind, "array_pattern") == 0 ||
+                        strcmp(kind, "pair_pattern") == 0 || strcmp(kind, "rest_pattern") == 0 ||
+                        strcmp(kind, "assignment_pattern") == 0 ||
+                        strcmp(kind, "object_assignment_pattern") == 0);
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+static bool js_program_binds_window(TSNode program, const char *source) {
+    if (js_binding_binds_window(program, source)) {
+        return true;
+    }
+    /* var in a module-level control block is hoisted to the module. Only walk
+     * statements here: function/class bodies and block-scoped bindings stay local. */
+    bool found = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(program);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "variable_declaration") == 0 &&
+            js_binding_binds_window(node, source)) {
+            found = true;
+            break;
+        }
+        if (strcmp(kind, "for_in_statement") == 0) {
+            TSNode declaration = ts_node_child_by_field_name(node, TS_FIELD("kind"));
+            TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
+            if (!ts_node_is_null(declaration) && !ts_node_is_null(left) &&
+                ts_node_end_byte(declaration) - ts_node_start_byte(declaration) == 3 &&
+                strncmp(source + ts_node_start_byte(declaration), "var", 3) == 0 &&
+                js_binding_binds_window(left, source)) {
+                found = true;
+                break;
+            }
+        }
+        bool descend =
+            strcmp(kind, "program") == 0 || strcmp(kind, "export_statement") == 0 ||
+            strcmp(kind, "statement_block") == 0 || strcmp(kind, "if_statement") == 0 ||
+            strcmp(kind, "else_clause") == 0 || strcmp(kind, "while_statement") == 0 ||
+            strcmp(kind, "do_statement") == 0 || strcmp(kind, "for_statement") == 0 ||
+            strcmp(kind, "for_in_statement") == 0 || strcmp(kind, "labeled_statement") == 0 ||
+            strcmp(kind, "switch_statement") == 0 || strcmp(kind, "switch_body") == 0 ||
+            strcmp(kind, "switch_case") == 0 || strcmp(kind, "switch_default") == 0 ||
+            strcmp(kind, "try_statement") == 0 || strcmp(kind, "catch_clause") == 0 ||
+            strcmp(kind, "finally_clause") == 0 || strcmp(kind, "with_statement") == 0;
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
 // Convert a resolved function/method name node to its name string. Most nodes
 // map directly to their text, but a C++ conversion-operator's `operator_cast`
 // node spans the full "operator bool() const" — this grammar folds the parameter
@@ -1198,6 +1339,24 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
 // const", and a member lookup for "operator bool" (the implicit call in
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
+    if ((lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) &&
+        strcmp(ts_node_type(name_node), "member_expression") == 0) {
+        TSNode object = ts_node_child_by_field_name(name_node, TS_FIELD("object"));
+        TSNode property = ts_node_child_by_field_name(name_node, TS_FIELD("property"));
+        if (ts_node_is_null(object) || ts_node_is_null(property) ||
+            strcmp(ts_node_type(object), "identifier") != 0 ||
+            strcmp(ts_node_type(property), "property_identifier") != 0 ||
+            ts_node_end_byte(object) - ts_node_start_byte(object) != strlen("window") ||
+            strncmp(source + ts_node_start_byte(object), "window", strlen("window")) != 0) {
+            return NULL;
+        }
+        TSNode program = ts_node_parent(ts_node_parent(ts_node_parent(name_node)));
+        if (ts_node_is_null(program) || strcmp(ts_node_type(program), "program") != 0 ||
+            js_program_binds_window(program, source)) {
+            return NULL;
+        }
+        return cbm_node_text(a, property, source);
+    }
     if (lang == CBM_LANG_SWIFT) {
         const char *kind = ts_node_type(name_node);
         if (strcmp(kind, "init_declaration") == 0) {
@@ -1250,6 +1409,53 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
         return cbm_arena_sprintf(a, "(%s)", text);
     }
     return text;
+}
+
+bool cbm_js_object_callable(TSNode callable) {
+    if (ts_node_is_null(callable))
+        return false;
+    TSNode parent = ts_node_parent(callable);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "pair") == 0 &&
+        ts_node_eq(callable, ts_node_child_by_field_name(parent, TS_FIELD("value")))) {
+        parent = ts_node_parent(parent);
+    }
+    return !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "object") == 0;
+}
+
+static int js_owner_order(const void *left, const void *right) {
+    uint32_t a = (*(const CBMDefinition *const *)left)->name_start_byte;
+    uint32_t b = (*(const CBMDefinition *const *)right)->name_start_byte;
+    return (a > b) - (a < b);
+}
+
+CBMJsObjectOwners cbm_js_object_owners(CBMArena *arena, const CBMDefArray *defs) {
+    CBMJsObjectOwners owners = {0};
+    if (!defs)
+        return owners;
+    for (int i = 0; i < defs->count; i++)
+        owners.count += defs->items[i].js_object_collision;
+    if (!owners.count)
+        return owners;
+    owners.items = cbm_arena_alloc(arena, (size_t)owners.count * sizeof(*owners.items));
+    if (!owners.items)
+        return (CBMJsObjectOwners){0};
+    for (int i = 0, j = 0; i < defs->count; i++)
+        if (defs->items[i].js_object_collision)
+            owners.items[j++] = &defs->items[i];
+    qsort(owners.items, (size_t)owners.count, sizeof(*owners.items), js_owner_order);
+    return owners;
+}
+
+const char *cbm_js_object_owner(const CBMJsObjectOwners *owners, TSNode name) {
+    if (!owners->count || ts_node_is_null(name))
+        return NULL;
+    const CBMDefinition key = {.name_start_byte = ts_node_start_byte(name)};
+    const CBMDefinition *key_ptr = &key;
+    const CBMDefinition *const *match =
+        bsearch(&key_ptr, owners->items, (size_t)owners->count, sizeof(*owners->items),
+                js_owner_order);
+    return match && (*match)->name_end_byte == ts_node_end_byte(name) ? (*match)->qualified_name
+                                                                     : NULL;
 }
 
 /* ── Nix attrpath helpers ───────────────────────────────────
@@ -1499,6 +1705,10 @@ bool cbm_elixir_def_head_is(TSNode signature, TSNode node) {
 
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        TSNode name = cbm_resolve_func_name(func_node, lang);
+        return ts_node_is_null(name) ? NULL : cbm_func_name_node_text(a, name, source, lang);
+    }
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
     if (lang == CBM_LANG_WOLFRAM) {
         const char *nk = ts_node_type(func_node);
@@ -2507,6 +2717,48 @@ const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_pat
     const char *qn =
         cbm_arena_sprintf(a, "%s#%s:%d", base_qn, base, go_init_ordinal(fn_node, source));
     return qn ? qn : base_qn;
+}
+
+static TSNode go_only_named_child(TSNode node) {
+    TSNode child = {0};
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+        TSNode candidate = ts_node_named_child(node, i);
+        if (ts_node_is_extra(candidate))
+            continue;
+        if (!ts_node_is_null(child))
+            return (TSNode){0};
+        child = candidate;
+    }
+    return child;
+}
+
+TSNode cbm_go_local_literal_anchor(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "func_literal") != 0)
+        return (TSNode){0};
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "parenthesized_expression") == 0)
+        parent = ts_node_parent(parent);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "expression_list") != 0 ||
+        ts_node_is_null(go_only_named_child(parent)))
+        return (TSNode){0};
+    TSNode decl = ts_node_parent(parent);
+    if (ts_node_is_null(decl) || strcmp(ts_node_type(decl), "short_var_declaration") != 0 ||
+        !ts_node_eq(parent, ts_node_child_by_field_name(decl, TS_FIELD("right"))))
+        return (TSNode){0};
+    TSNode lhs = go_only_named_child(ts_node_child_by_field_name(decl, TS_FIELD("left")));
+    if (ts_node_is_null(lhs) || strcmp(ts_node_type(lhs), "identifier") != 0)
+        return (TSNode){0};
+    TSNode anchor = ts_node_child(node, 0);
+    return !ts_node_is_null(anchor) && strcmp(ts_node_type(anchor), "func") == 0
+               ? anchor : (TSNode){0};
+}
+
+const char *cbm_go_local_literal_qn(CBMArena *a, const char *module_qn, const char *rel_path,
+                                    TSNode anchor) {
+    if (ts_node_is_null(anchor) || !module_qn || !rel_path)
+        return NULL;
+    return cbm_arena_sprintf(a, "%s.@closure:%s:%u", module_qn, rel_path,
+                             ts_node_start_byte(anchor));
 }
 
 /* Flatten a JS/TS `template_string` node into plain text (issue #1006).

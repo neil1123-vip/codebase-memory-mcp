@@ -158,6 +158,11 @@ static inline bool cbm_pipeline_reference_candidate_fallback_allowed(
     if (!usage) {
         return false;
     }
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        const char *fence = usage->enclosing_func_qn ? strrchr(usage->enclosing_func_qn, '#') : NULL;
+        if (fence && strncmp(fence, "#local:", sizeof("#local:") - 1) == 0)
+            return false;
+    }
     bool reference_candidate =
         usage->kind == CBM_USAGE_CALL_REFERENCE ||
         (lang == CBM_LANG_KOTLIN && usage->kind == CBM_USAGE_VALUE && usage->may_be_call_reference);
@@ -383,10 +388,16 @@ static inline const char *cbm_pipeline_service_name(const CBMCall *call,
 static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *strategy) {
     return strategy &&
            (strcmp(strategy, "lsp_func_ptr") == 0 || strcmp(strategy, "lsp_callable_alias") == 0 ||
+            strcmp(strategy, "lsp_compiler_static") == 0 ||
+            strcmp(strategy, "lsp_compiler_external") == 0 ||
             strcmp(strategy, "lsp_dll_resolve") == 0 ||
             strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
             strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
+            strcmp(strategy, "lsp_ts_local") == 0 ||
+            strcmp(strategy, "lsp_go_same_file") == 0 ||
+            strcmp(strategy, "lsp_go_test_variant") == 0 ||
+            strcmp(strategy, "lsp_go_build_variant") == 0 ||
             strcmp(strategy, "lsp_import_alias") == 0 ||
             strcmp(strategy, "lsp_constructor_init") == 0 ||
             strcmp(strategy, "php_method_dynamic") == 0);
@@ -396,6 +407,12 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
                                                         const CBMCall *call, int site_rank) {
     if (!resolved || !resolved->callee_qn || !call || !call->callee_name) {
         return false;
+    }
+    if (resolved->strategy && (strcmp(resolved->strategy, "lsp_go_same_file") == 0 ||
+                               strcmp(resolved->strategy, "lsp_go_test_variant") == 0 ||
+                               strcmp(resolved->strategy, "lsp_go_build_variant") == 0)) {
+        return site_rank == 2 && resolved->reason &&
+               strcmp(resolved->reason, call->callee_name) == 0;
     }
     const char *resolved_leaf = cbm_lsp_bare_segment(resolved->callee_qn);
     const char *call_leaf = cbm_lsp_bare_segment(call->callee_name);

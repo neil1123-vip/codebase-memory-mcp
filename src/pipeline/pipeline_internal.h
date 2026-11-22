@@ -10,8 +10,10 @@
 
 #include "pipeline/pipeline.h"
 #include "pipeline/path_alias.h"
+#include "pipeline/compiler_runner.h"
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
+#include "store/call_sites.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "discover/test_conventions.h"
@@ -375,6 +377,9 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
            (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
 }
 
+bool cbm_pipeline_call_is_self(const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
+                                const CBMCall *call, CBMLanguage lang);
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL
@@ -482,6 +487,10 @@ typedef struct {
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
 
+    /* Prepared after final definitions; coordinator may record registry
+     * degradation before workers borrow immutable facts. */
+    CBMCompilerRun *compiler_run;
+
     /* Run-owned immutable snapshot; direct borrow also works for probe contexts
      * whose pipeline back-pointer is NULL. Workers only write the fatal latch. */
     const cbm_test_declarations_t *test_declarations;
@@ -563,6 +572,8 @@ typedef struct {
      * the incremental and probe routes still hand the cache array to passes
      * that index it directly, so they keep results in memory (follow-up). */
     bool spill_allowed;
+    bool incremental_declarations;
+    bool mixed_declarations;
 
     /* Doc-comment references -> MENTIONS (doc_links.h). doc_links is the
      * run's resolver state while the resolve phase runs (NULL otherwise);
@@ -983,6 +994,8 @@ void cbm_pipeline_import_maps_build(const cbm_pipeline_ctx_t *ctx, const cbm_fil
                                     int file_count, const char *const *namespaces,
                                     CBMHashTable **namespace_map, cbm_scala_index_t **scala_index);
 void cbm_pipeline_import_maps_free(CBMHashTable *namespace_map, cbm_scala_index_t *scala_index);
+void cbm_pipeline_format_import_edge(char *props, size_t capacity, CBMLanguage language,
+                                     const CBMImport *imp);
 
 /* PHP binding arrays borrow current result and graph strings. Free before
  * releasing/reloading the result; never cache this state across files. */
@@ -1045,6 +1058,22 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
 }
 
 /* ── Testable helpers ────────────────────────────────────────────── */
+
+/* IRIS literal class dispatch carries its whole identity, even when a resolver
+ * supplies a typed or unique-name candidate. Graph QNs may add a project/file
+ * prefix, but cannot replace any class or method segment. */
+static inline bool cbm_call_string_identity_matches(const CBMCall *call,
+                                                     const char *target_qn) {
+    if (!call->callee_has_string_identity)
+        return true;
+    if (!call->callee_name || !call->callee_name[0] || !target_qn)
+        return false;
+    size_t callee_len = strlen(call->callee_name);
+    size_t target_len = strlen(target_qn);
+    return target_len >= callee_len &&
+           (target_len == callee_len || target_qn[target_len - callee_len - 1] == '.') &&
+           strcmp(target_qn + target_len - callee_len, call->callee_name) == 0;
+}
 
 /* #1934: whether the import resolver's name-guess fallbacks — Strategy 1b
  * (sibling file; its label filter admits symbols) and Strategy 3 (symbol
@@ -1357,6 +1386,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+int cbm_pipeline_pass_calls_serial(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                   int file_count);
 
 /* Cross-file LSP type-aware call resolution pass. Augments per-file
  * resolved_calls with cross-file resolutions before call edges are emitted.
@@ -1369,6 +1400,15 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
                                        int file_count);
 
 int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+static inline bool cbm_pipeline_is_grouped_sql_usage(const CBMUsage *usage) {
+    return usage->kind == CBM_USAGE_SQL_FOREIGN_COLUMN ||
+           usage->kind == CBM_USAGE_SQL_FOREIGN_IMPLICIT_COLUMN ||
+           usage->kind == CBM_USAGE_SQL_TRIGGER_COLUMN ||
+           usage->kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN ||
+           usage->kind == CBM_USAGE_SQL_TABLE_TARGET;
+}
+int cbm_pipeline_emit_grouped_sql_usages(const cbm_gbuf_t *graph, cbm_gbuf_t *output,
+                                        const CBMFileResult *result, const char *rel);
 
 int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count);
@@ -1688,6 +1728,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
  * an already opened generation: true when that generation is current for the
  * pipeline's mode and records exactly the baseline manifest. */
 bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_info_t *files, int file_count,
                                                const cbm_file_hash_t *baseline_manifest,
                                                int baseline_count);
 
@@ -1801,11 +1842,127 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: Go lexical callbacks cannot fall back to unrelated same-name functions;
+ *      JS window-assigned functions have definitions and correct caller scopes.
+ *      Old indices retain wrong or missing calls even when files are unchanged,
+ *      so they rebuild once on upgrade.
+ *  15: distinguish Go conversions from calls, recover new(expression), JS/CSS
+ *      and SQLite dialect constructs, and index Plan 9 TEXT entry points.
+ *  16: parse Plan 9 operands and SQLite triggers with original source spans,
+ *      trigger definitions, call scopes and relation dependencies; report
+ *      hidden missing-token parse errors through their visible owners.
+ *  17: recover SQLite column constraints and HTML paragraph EOF omissions.
+ *  18: preserve Go cross-file imports and exact JS callable bindings, classify
+ *      unresolved sites with full callees, and validate SQLite DEFAULT syntax.
+ *  19: isolate Go closure parameters, classify missing standard-library package
+ *      symbols, and recover SQLite keyword DEFAULT values after validation.
+ *  20: retain source and canonical imports while materializing Go struct fields.
+ *  21: propagate anonymous Go fields and callback results with field precedence,
+ *      validate complete SQLite column lists and retain inner SQL parse errors.
+ *  22: resolve anonymous Go embedded members by selector depth and preserve
+ *      source container return types for range and chained field inference.
+ *  23: complete Go receiver placeholders in place and retain diagnostics for
+ *      resolved standard-library calls whose graph targets are not indexed.
+ *  24: prefer cross-file standard-library evidence over stale unresolved
+ *      diagnostics at the same source occurrence, including at coverage limits.
+ *  25: bind Go expression lists and tuple returns by position, evaluating all
+ *      right-hand values before changing any variable or callable alias.
+ *  26: keep JS catch parameters and hoisted local window declarations from
+ *      resolving to unrelated module functions or browser-global exports.
+ *  27: preserve Go callable assignments across ordinary blocks while isolating
+ *      conditional branches, loops and closures from outer exact identities.
+ *  28: publish complete invocation summaries and admit exact compiler facts.
+ *  29: persist complete call sites with raw source hashes for snapshot comparison.
+ *  30: retain C/C++ unresolved spans and reject interface/external-name guesses.
+ *  31: distinguish complete compiler call occurrences from nested callee aliases.
+ *  32: preserve JavaScript using properties and admit proven local TS targets.
+ *  33: retain architecture edges for proven external Go compiler APIs.
+ *  34: resolve Python module compound calls, require literal dispatch identity,
+ *      validate SQLite extensions, and retain JS contextual identifier calls.
+ *  35: retain Go named function/container shapes through cross-file and
+ *      persisted surface restoration, with definition-file import bindings.
+ *  36: retain Go use-site type arguments when applying compiler member and
+ *      underlying function/container shapes.
+ *  37: retain nested Go generic signatures, grouped positions and import bindings.
+ *  38: retain generic Go declarations in shared and restored registries.
+ *  39: preserve grouped and variadic Go closure signatures without truncation.
+ *  40: infer trailing Go type parameters after explicit type arguments.
+ *  41: infer generic Go element types from expanded variadic arguments.
+ *  42: infer generic Go elements from named ordinary slice arguments.
+ *  43: reject Go generic inference through callbacks with mismatched arity.
+ *  44: infer named Go composite arguments with exact nested channel directions.
+ *  45: reject repeated Go type-parameter bindings with proven concrete identity conflicts.
+ *  46: admit partial TS proof indexes without replacing unavailable native facts.
+ *  47: keep authoritative compiler builtin/conversion sites free of unknown-call diagnostics.
+ *  48: retain guarded whole-call sites for Go function-value invocations.
+ *  49: invalidate exact Go callable targets across closure capture boundaries.
+ *  50: retain guarded Go builtin and conversion whole-call inventory.
+ *  51: preserve Go recursive identity across physical caller binding.
+ *  52: retain native Go physical callers without compiler facts.
+ *  53: bind Go environment and channel edges to physical declarations.
+ *  54: stabilize Go interface overrides and preserve compatible call candidates.
+ *  55: separate colliding JS/TS lexical and object callable owners.
+ *  56: bind proven Go local closure calls to their source declarations.
+ *  57: split colliding Go and JS/TS declaration identities.
+ *  58: bind JS/TS module calls to their file when a Go declaration occupies their QN.
+ *  59: bind same-file SQL foreign key tables.
+ *  60: bind explicit same-file SQL foreign key columns.
+ *  61: bind SQLite trigger row images to same-file table columns.
+ *  62: bind quoted SQLite trigger row images.
+ *  63: recover bracket and single-quoted SQLite trigger qualifiers.
+ *  64: isolate Playwright callbacks and bind proven page-script calls.
+ *  65: recover SQLite row-image relation aliases in trigger SELECT statements.
+ *  86: recover SQLite foreign key deferral clauses.
+ *  87: retain comments within SQLite foreign key deferral clauses.
+ *  88: recover named SQLite foreign keys.
+ *  89: recover SQLite CREATE TABLE conflict clauses.
+ *  90: diagnose invalid SQLite generated column clauses.
+ *  91: parse SQLite generated columns without a type.
+ *  92: parse ordinary SQLite CREATE TABLE columns without a type.
+ *  93: parse SQLite typeless ADD COLUMN and column collations.
+ *  94: parse omitted foreign-key column lists and bind proven single-column primary keys.
+ *  95: bind composite implicit foreign keys in declared primary key order.
+ *  96: bind multiple inline foreign keys on the same SQL column.
+ *  97: parse collated SQLite primary-key columns and bind implicit references.
+ *  98: parse collated SQLite UNIQUE constraint columns.
+ *  99: parse named SQLite UNIQUE table constraints.
+ * 100: preserve repeated SQLite foreign-key Field usage spans.
+ * 101: bind same-file SQLite references with quoted names.
+ * 102: report verified Go build exclusions in per-file call summaries.
+ * 103: parse doubled quote delimiters in SQL identifiers.
+ * 104: bind SQLite schema names in explicit END transactions.
+ * 105: parse bracketed identifiers in SQLite table definitions.
+ * 106: bind same-file SQLite INSERT and CREATE INDEX table targets.
+ * 107: parse legacy single-quoted SQLite table and foreign-key names.
+ * 108: parse SQLite bracketed fields after a qualifier.
+ * 109: exclude CTE names and derived relation aliases from SQL DDL lineage.
+ * 110: parse bracketed SQL relations and bind same-file SQLite main view usages.
+ * 111: honor SQLite CTE and schema scope in trigger table dependencies.
+ * 112: parse SQLite bracketed relation aliases without treating them as table usages.
+ * 113: bind foreign keys in verified SQLite BEGIN/END schema blocks.
+ * 114: parse and bind verified SQLite BEGIN/END schema blocks at EOF.
+ * 115: bind verified SQLite BEGIN/END schema blocks with simple CREATE INDEX.
+ * 116: parse bracketed table names in SQLite CREATE INDEX targets.
+ * 117: bind SQLite schema transactions with verified literal INSERT statements.
+ * 118: parse bracketed INSERT targets and bind main-qualified targets after replay.
+ * 119: verify explicitly committed SQLite transactions with FK enforcement.
+ * 120: preserve SQLite field bindings after a plain column addition.
+ * 121: replay plain column additions in self-contained SQLite transactions.
+ * 122: parse bracketed column names in SQLite RENAME and DROP clauses.
+ * 123: preserve column identities through verified SQLite RENAME and DROP.
+ * 124: verify SQLite foreign keys after committed column changes.
+ * 125: replay supported SQLite declarations preceding a transaction.
+ * 126: preserve column usage spans in SQLite trigger UPDATE OF clauses.
+ * 127: classify verified CommonJS Node loader calls as external dependencies.
+ * 128: omit compatibility edges for Node builtins from the published graph.
+ * 129: extend verified CommonJS load prefixes over inert declarations.
+ * 130: verify the first relative CommonJS load at the end of a safe prefix.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 131 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
+    cbm_pipeline_t *pipeline;
     const char *final_db_path;
     const char *project;
     atomic_int *cancelled;
@@ -1814,6 +1971,10 @@ typedef struct {
     const cbm_coverage_row_t *coverage;
     int coverage_count;
     cbm_coverage_meta_t coverage_meta;
+    cbm_call_site_spool_t *call_site_spool;
+    /* NULL for a full generation; incremental publication carries unchanged
+     * site rows from this live snapshot after checking its semantic hashes. */
+    const char *call_site_baseline;
     /* Per-file LSP surfaces for the generation being published (may be NULL:
      * cross-LSP disabled, or a caller that has none). Written into the
      * staging store alongside the manifest so surface data and graph always
@@ -1963,14 +2124,71 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
  * strings are borrowed from the graph and copied by coverage capture. */
 typedef struct {
     const char *candidate_qn;
+    /* Only a successful CALLS edge to a callable declaration sets this.
+     * Route registrations can emit CALLS without an internal callable target. */
+    const char *emitted_target_qn;
+    /* Exact compiler recursion is resolved even though self edges are omitted. */
+    const char *compiler_self_qn;
+    bool ambiguous_target;
     bool calls_emitted;
 } CBMCallEvidence;
-void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+
+/* Shared classification after call-target resolution. Graph lookups use
+ * main_gbuf; writes go to gbuf (the same graph in the sequential pass). */
+bool cbm_pipeline_emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                     const cbm_gbuf_node_t *target, const CBMCall *call,
+                                     const cbm_resolution_t *res, const char *module_qn,
+                                     const char *project_name,
+                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                     const char **imp_keys, const char **imp_vals, int imp_count,
+                                     bool suppress_plain_calls, const char *route_mount,
+                                     CBMLanguage lang, const char *rel, CBMCallEvidence *evidence);
+
+/* Exact native net/http calls can veto textual route heuristics. */
+bool cbm_pipeline_handle_native_go_http_call(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                            const CBMCall *call, const CBMResolvedCall *lsp,
+                                            CBMLanguage lang);
+bool cbm_pipeline_handle_browser_fetch(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                       const CBMCall *call, const CBMResolvedCall *lsp);
+
+/* Compiler external identities can prove an architecture API without an
+ * internal CALLS target. Both resolvers use this before their strict veto. */
+bool cbm_pipeline_emit_compiler_external(
+    cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+    const CBMResolvedCallArray *resolved, const char *module_qn,
+    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    const char *route_mount, CBMLanguage lang, CBMCallEvidence *evidence);
+
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const cbm_gbuf_t *active_gbuf,
+                                          const char *rel_path,
                                           const CBMFileResult *result,
-                                          const CBMCallEvidence *evidence);
+                                          const CBMCallEvidence *evidence,
+                                          const CBMCompilerRun *compiler_run);
 void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
 void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
                                        bool *complete);
+/* Complete per-file counters, separate from bounded unresolved site samples. */
+void cbm_pipeline_get_call_summaries(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count);
+cbm_call_site_spool_t *cbm_pipeline_get_call_site_spool(cbm_pipeline_t *p);
+
+#define CBM_COMPILER_FACTS_COVERAGE_PATH ".compiler-facts"
+bool cbm_pipeline_prepare_compiler(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count);
+int cbm_pipeline_prepare_declarations(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache);
+bool cbm_pipeline_mixed_declaration(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *node);
+bool cbm_pipeline_bind_js_calls(const cbm_pipeline_ctx_t *ctx, CBMFileResult *result,
+                                const cbm_file_info_t *file);
+bool cbm_pipeline_bind_go_callers(const cbm_gbuf_t *gbuf, CBMFileResult *result,
+                                   const char *rel_path);
+bool cbm_pipeline_bind_go_declaration_owners(const cbm_gbuf_t *gbuf, CBMFileResult *result,
+                                              const char *rel_path);
+/* A merged declaration has no exact target variant for a function-value reference. */
+bool cbm_pipeline_go_reference_target_allowed(const cbm_gbuf_node_t *node);
+/* Transfer one live-noop preflight into the staged incremental planner. */
+void cbm_pipeline_set_compiler_preflight(cbm_pipeline_t *p, CBMCompilerRun *run);
+CBMCompilerRun *cbm_pipeline_take_compiler_preflight(cbm_pipeline_t *p);
 
 /* The run's doc_link_unresolved rows and failure flag (doc_links.h), taken
  * over by the pipeline (set replaces and frees earlier rows; NULL p frees).
@@ -2071,9 +2289,9 @@ typedef enum {
     CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR,
 } cbm_incremental_route_t;
 
-/* Deterministic one-shot fault injection for the incremental-parallel result
- * cache allocation. Reset explicitly so one test cannot affect another. */
+/* Deterministic one-shot allocation faults. Reset so tests cannot affect each other. */
 void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
+void cbm_pipeline_incremental_test_fail_deleted_set_alloc_once(void);
 void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);

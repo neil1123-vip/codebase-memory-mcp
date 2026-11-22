@@ -56,14 +56,18 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #define CBM_NS_PER_SEC 1000000000LL
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-/* One-shot fault injection for the parallel incremental result cache. The
- * production build has no hook or branch at this allocation site. */
+/* One-shot allocation faults; production builds have no hooks or branches. */
 static atomic_bool g_incr_test_fail_result_cache_alloc = false;
+static atomic_bool g_incr_test_fail_deleted_set_alloc = false;
 static atomic_bool g_incr_test_force_legacy_partial = false;
 static atomic_int g_incr_test_last_route = CBM_INCREMENTAL_ROUTE_NONE;
 
 void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, true);
+}
+
+void cbm_pipeline_incremental_test_fail_deleted_set_alloc_once(void) {
+    atomic_store(&g_incr_test_fail_deleted_set_alloc, true);
 }
 
 void cbm_pipeline_incremental_test_force_legacy_partial_once(void) {
@@ -98,6 +102,7 @@ static void incr_test_note_plan(int files, int surface_changed, int dependents,
 
 void cbm_pipeline_incremental_test_reset_faults(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, false);
+    atomic_store(&g_incr_test_fail_deleted_set_alloc, false);
     atomic_store(&g_incr_test_force_legacy_partial, false);
     atomic_store(&g_incr_test_last_route, CBM_INCREMENTAL_ROUTE_NONE);
     incr_test_note_plan(-1, -1, -1, NULL);
@@ -325,6 +330,16 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
     return 0;
 }
 
+static int semantic_manifest_add_cgo_preamble(semantic_manifest_builder_t *builder,
+                                               const char *project) {
+    if (!cbm_go_cgo_enabled())
+        return 0;
+    static const char profile[] = CBM_SEMANTIC_INPUT_PREFIX "linux-cgo-preamble-v1";
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(profile, sizeof(profile) - 1, digest);
+    return semantic_manifest_add_digest(builder, project, profile, digest, 0, 0);
+}
+
 static int semantic_manifest_add(semantic_manifest_builder_t *builder, const char *project,
                                  const char *rel_path, const char *abs_path) {
     if (cbm_pipeline_frozen_checkpoint(builder->frozen))
@@ -347,6 +362,24 @@ static int semantic_manifest_add(semantic_manifest_builder_t *builder, const cha
         return CBM_NOT_FOUND;
     }
     return semantic_manifest_add_digest(builder, project, rel_path, sha, mtime_ns, size);
+}
+
+static int semantic_manifest_add_control(semantic_manifest_builder_t *builder, const char *project,
+                                         const char *rel_path, const char *abs_path) {
+    if (!rel_path || !rel_path[0] || cbm_ht_has(builder->seen_paths, rel_path))
+        return 0;
+    int rc = semantic_manifest_add(builder, project, rel_path, abs_path);
+    if (rc != 0)
+        return rc;
+    /* Role changes must invalidate exact reuse even when control bytes are unchanged. */
+    char marker[CBM_SZ_4K];
+    int n = snprintf(marker, sizeof(marker), CBM_SEMANTIC_INPUT_PREFIX "control-only/%s", rel_path);
+    if (n < 0 || (size_t)n >= sizeof(marker))
+        return CBM_NOT_FOUND;
+    static const char domain[] = "cbm-semantic-control-only-v1";
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(domain, sizeof(domain) - 1, digest);
+    return semantic_manifest_add_digest(builder, project, marker, digest, 0, 0);
 }
 
 static void semantic_manifest_git_digest(const cbm_git_context_t *git_ctx,
@@ -475,8 +508,9 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
         return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
                                                excluded_dirs, excluded_count);
     }
-    return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
-                                      : 0;
+    return info.is_regular && control
+               ? semantic_manifest_add_control(builder, project, rel_path, abs_path)
+               : 0;
 }
 
 static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
@@ -580,6 +614,8 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
     }
+    if (rc == 0)
+        rc = semantic_manifest_add_cgo_preamble(&builder, project);
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
     int hash_workers = cbm_pipeline_worker_count(p);
@@ -674,7 +710,7 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
                 int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, rel);
                 rc = (n < 0 || n >= (int)sizeof(abs_path))
                          ? CBM_NOT_FOUND
-                         : semantic_manifest_add(&builder, project, rel, abs_path);
+                         : semantic_manifest_add_control(&builder, project, rel, abs_path);
             }
             cbm_path_alias_collection_free(aliases);
         }
@@ -742,6 +778,8 @@ static int frozen_manifest_seed(semantic_manifest_builder_t *builder, cbm_pipeli
     if (rc == 0)
         rc = semantic_manifest_add_digest(builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           config->project_source_sha256, 0, 0);
+    if (rc == 0)
+        rc = semantic_manifest_add_cgo_preamble(builder, project);
     return rc;
 }
 
@@ -762,7 +800,8 @@ static int frozen_manifest_aliases(semantic_manifest_builder_t *builder, cbm_pip
         int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", root, rel);
         rc = n < 0 || (size_t)n >= sizeof(abs_path)
                  ? CBM_NOT_FOUND
-                 : semantic_manifest_add(builder, cbm_pipeline_project_name(p), rel, abs_path);
+                 : semantic_manifest_add_control(builder, cbm_pipeline_project_name(p), rel,
+                                                 abs_path);
     }
     cbm_path_alias_collection_free(aliases);
     return rc;
@@ -1006,10 +1045,12 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * mode-skipped files into out_mode_skipped (caller frees both).
  *
  * A stored file is classified as:
- *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
- *                       be purged and its hash row dropped.
- *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
- *                       current discovery pass didn't visit it (e.g. excluded
+ *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR, or the verified
+ *                       current manifest excludes the file. Its nodes
+ *                       will be purged and its hash row dropped.
+ *   - "mode-skipped" — no exact manifest was supplied and `stat()` succeeds.
+ *                       The file exists on disk but the current discovery
+ *                       pass didn't visit it (e.g. excluded
  *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
  *                       must be preserved AND its hash row must be carried
  *                       forward into the new DB so subsequent reindexes can
@@ -1028,11 +1069,8 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * can correctly detect a real on-disk deletion of a mode-skipped file (as
  * opposed to seeing it as "never existed" → noop → orphaned graph nodes).
  *
- * Fail-safe rules (preserve nodes on uncertainty):
- *   - repo_path NULL → log error and preserve everything (return 0
- *     deletions, empty mode_skipped). The caller contract is that
- *     repo_path is required; a NULL means a misconfigured pipeline,
- *     not a deletion signal.
+ * A verified manifest is authoritative. Without one, legacy classification
+ * preserves nodes on filesystem uncertainty:
  *   - snprintf truncation (combined path ≥ CBM_SZ_4K) → preserve. We can't
  *     reliably stat a truncated path. Treat as mode-skipped.
  *   - stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
@@ -1042,10 +1080,13 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * Note: we use stat() (not lstat()) on purpose. A symlink whose target was
  * deleted should be classified as deleted from the indexer's perspective
  * because the indexer follows symlinks during discovery — a stale symlink
- * has no source to parse. */
+ * has no source to parse. Allocation failures return -1, never a partial set. */
+static void free_mode_skipped(cbm_file_hash_t *ms, int count);
+
 static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
                               cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
-                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
+                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count,
+                              const cbm_file_hash_t *manifest, int manifest_count) {
     *out_deleted = NULL;
     *out_mode_skipped = NULL;
     *out_mode_skipped_count = 0;
@@ -1055,60 +1096,71 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
          * silently re-introducing the destructive overwrite this function
          * was rewritten to prevent. */
         cbm_log_error("incremental.err", "msg", "find_deleted_files_null_repo_path");
-        return 0;
-    }
-
-    CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
-    for (int i = 0; i < file_count; i++) {
-        cbm_ht_set(current, files[i].rel_path, &files[i]);
+        return -1;
     }
 
     int del_count = 0;
     int del_cap = CBM_SZ_64;
-    char **deleted = malloc((size_t)del_cap * sizeof(char *));
-    if (!deleted) {
-        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
-        cbm_ht_free(current);
-        return 0;
-    }
-
+    char **deleted = NULL;
     int ms_count = 0;
     int ms_cap = CBM_SZ_64;
-    cbm_file_hash_t *mode_skipped = malloc((size_t)ms_cap * sizeof(cbm_file_hash_t));
-    if (!mode_skipped) {
-        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_ms");
-        free(deleted);
-        cbm_ht_free(current);
-        return 0;
+    cbm_file_hash_t *mode_skipped = NULL;
+    CBMHashTable *current = NULL;
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (atomic_exchange(&g_incr_test_fail_deleted_set_alloc, false))
+        goto fail;
+#endif
+    current = cbm_ht_create((size_t)file_count * PAIR_LEN);
+    if (!current)
+        goto fail;
+    for (int i = 0; i < file_count; i++) {
+        cbm_ht_set(current, files[i].rel_path, &files[i]);
+        if (!cbm_ht_get(current, files[i].rel_path))
+            goto fail;
     }
+    for (int i = 0; i < manifest_count; i++) {
+        cbm_ht_set(current, manifest[i].rel_path, (void *)&manifest[i]);
+        if (!cbm_ht_get(current, manifest[i].rel_path))
+            goto fail;
+    }
+
+    deleted = malloc((size_t)del_cap * sizeof(char *));
+    if (!deleted)
+        goto fail;
+
+    mode_skipped = malloc((size_t)ms_cap * sizeof(cbm_file_hash_t));
+    if (!mode_skipped)
+        goto fail;
 
     for (int i = 0; i < stored_count; i++) {
         if (semantic_manifest_is_virtual_path(stored[i].rel_path)) {
             continue; /* synthetic semantic inputs are not repository files */
         }
         if (cbm_ht_get(current, stored[i].rel_path)) {
-            continue; /* still visited by current pass */
+            continue; /* still present in the current scope */
         }
-        /* Not in current discovery — check if it's truly deleted or just
+        /* Not in the current scope — check if it's deleted/excluded or just
          * mode-skipped (excluded by FAST_SKIP_DIRS etc.). */
         bool preserve = false;
-        char abs_path[CBM_SZ_4K];
-        int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
-        if (n < 0 || n >= (int)sizeof(abs_path)) {
-            /* Truncation or encoding error — can't reliably stat. Preserve. */
-            cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
-            preserve = true;
-        } else {
-            struct stat st;
-            if (stat(abs_path, &st) == 0) {
-                /* File exists on disk — mode-skipped, not deleted. */
+        /* A verified manifest is authoritative even when the old path is unreadable. */
+        if (manifest == NULL) {
+            char abs_path[CBM_SZ_4K];
+            int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
+            if (n < 0 || n >= (int)sizeof(abs_path)) {
+                /* Truncation or encoding error — can't reliably stat. Preserve. */
+                cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
                 preserve = true;
-            } else if (errno != ENOENT && errno != ENOTDIR) {
-                /* Transient or permission error — fail safe by preserving.
-                 * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
-                cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path, "errno",
-                             itoa_buf(errno));
-                preserve = true;
+            } else {
+                struct stat st;
+                if (stat(abs_path, &st) == 0) {
+                    preserve = true;
+                } else if (errno != ENOENT && errno != ENOTDIR) {
+                    /* Transient or permission error — fail safe by preserving.
+                     * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
+                    cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path,
+                                 "errno", itoa_buf(errno));
+                    preserve = true;
+                }
             }
         }
 
@@ -1118,24 +1170,16 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             if (ms_count >= ms_cap) {
                 ms_cap *= PAIR_LEN;
                 cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)ms_cap * sizeof(*tmp));
-                if (!tmp) {
-                    cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom_ms");
-                    break;
-                }
+                if (!tmp)
+                    goto fail;
                 mode_skipped = tmp;
             }
             char *rp = strdup(stored[i].rel_path);
             char *sh = stored[i].sha256 ? strdup(stored[i].sha256) : NULL;
             if (!rp || (stored[i].sha256 && !sh)) {
-                /* OOM mid-record. Drop this entry rather than persist a
-                 * row with a NULL rel_path that would silently fail the
-                 * NOT NULL constraint in upsert and reintroduce the
-                 * orphaned-node bug. */
-                cbm_log_error("incremental.err", "msg", "find_deleted_files_strdup_oom", "rel_path",
-                              stored[i].rel_path);
                 free(rp);
                 free(sh);
-                break;
+                goto fail;
             }
             mode_skipped[ms_count].project = NULL; /* unused by upsert API */
             mode_skipped[ms_count].rel_path = rp;
@@ -1146,17 +1190,18 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             continue;
         }
 
-        /* File is truly gone — record for purge. */
+        /* File is gone or explicitly excluded — record for purge. */
         if (del_count >= del_cap) {
             del_cap *= PAIR_LEN;
             char **tmp = realloc(deleted, (size_t)del_cap * sizeof(char *));
-            if (!tmp) {
-                cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom");
-                break;
-            }
+            if (!tmp)
+                goto fail;
             deleted = tmp;
         }
-        deleted[del_count++] = strdup(stored[i].rel_path);
+        deleted[del_count] = strdup(stored[i].rel_path);
+        if (!deleted[del_count])
+            goto fail;
+        del_count++;
     }
 
     cbm_ht_free(current);
@@ -1164,6 +1209,15 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     *out_mode_skipped = mode_skipped;
     *out_mode_skipped_count = ms_count;
     return del_count;
+
+fail:
+    cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
+    cbm_ht_free(current);
+    for (int i = 0; i < del_count; i++)
+        free(deleted[i]);
+    free(deleted);
+    free_mode_skipped(mode_skipped, ms_count);
+    return -1;
 }
 
 /* Free a mode_skipped array allocated by find_deleted_files. */
@@ -1416,7 +1470,8 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     }
     /* A generated member stays out of the short-name index here as in the
      * full index (pass_definitions.c); its node carries the mark. */
-    if (cbm_node_props_generated(node->properties_json)) {
+    if (cbm_node_props_generated(node->properties_json) ||
+        cbm_cgo_preamble_qn(node->qualified_name)) {
         cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
         return;
     }
@@ -1547,6 +1602,10 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    const CBMCompilerRun *compiler_preflight;
+    const cbm_file_info_t *discovery;
+    int discovery_count;
+    CBMCompilerRun *compiler_run;
 } closure_resolve_t;
 
 typedef struct {
@@ -1556,6 +1615,7 @@ typedef struct {
     int n_changed;
     int n_dependents;
     int fatal_rc; /* configured probe failures cannot decline to a full retry */
+    CBMCompilerRun *compiler_preflight;
     cbm_lsp_surface_row_t *stored_rows; /* whole previous generation */
     int stored_count;
     /* The previous generation's doc_link_unresolved rows: carried forward for
@@ -1566,6 +1626,7 @@ typedef struct {
 
 static void closure_plan_free(closure_plan_t *plan) {
     free(plan->files);
+    cbm_compiler_runner_free(plan->compiler_preflight);
     cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
     cbm_store_free_doc_links(plan->doc_rows, plan->doc_row_count);
     memset(plan, 0, sizeof(*plan));
@@ -1941,6 +2002,7 @@ static void legacy_doc_free(legacy_doc_t *d) {
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
                                closure_resolve_t *closure) {
     struct timespec t;
+    ctx->incremental_declarations = true;
 
     /* Per-file LSP always runs (every mode). Cross-file LSP: the legacy
      * partial route still skips it (NULL cross_registries below); the
@@ -1998,6 +2060,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc != 0) {
             free_incremental_result_cache(cache, ci);
             return rc;
+        }
+        if (closure && closure->compiler_preflight) {
+            char error[256] = {0};
+            closure->compiler_run = cbm_compiler_runner_rebind(
+                closure->compiler_preflight, ctx->repo_path, closure->discovery,
+                closure->discovery_count, ctx->gbuf, ctx->cancelled, error, sizeof(error));
+            if (!closure->compiler_run) {
+                cbm_log_warn("incremental.compiler_rebind", "reason", error);
+                free_incremental_result_cache(cache, ci);
+                return cbm_compiler_runner_has_chunk_index(closure->compiler_preflight)
+                    ? CBM_PIPELINE_ABORT_PRESERVE_DB : CBM_NOT_FOUND;
+            }
+            ctx->compiler_run = closure->compiler_run;
         }
 
         /* Registry construction can materialize serial resource nodes after
@@ -2091,7 +2166,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
                     cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
                                                    &cross_registries);
+                } else if (ctx->compiler_run) {
+                    const CBMLanguage compiler_langs[] = {CBM_LANG_GO, CBM_LANG_TYPESCRIPT};
+                    for (size_t i = 0; i < sizeof(compiler_langs) / sizeof(compiler_langs[0]); i++) {
+                        CBMLanguage lang = compiler_langs[i];
+                        if (cbm_compiler_runner_facts(ctx->compiler_run, lang)) {
+                            (void)cbm_pxc_build_engine_registry(cbm_pxc_engine_of_lang(lang),
+                                                                &closure->arena, all_defs,
+                                                                all_def_count, &cross_registries);
+                        }
+                    }
                 }
+                cbm_pxc_merge_compiler_registries(&cross_registries, &closure->arena,
+                                                  ctx->compiler_run);
             } else {
                 all_def_count = 0;
             }
@@ -2326,17 +2413,18 @@ typedef struct {
     bool failed;
 } legacy_doc_rows_t;
 
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+static int dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
                             int manifest_count, const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
                             const cbm_lsp_surface_row_t *surface_rows, int surface_row_count,
                             legacy_doc_rows_t doc, const cbm_doc_candidate_t *doc_candidates,
-                            int doc_candidate_count) {
+                            int doc_candidate_count, cbm_call_site_spool_t *call_site_spool) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_generation_t generation = {
         .gbuf = gbuf,
+        .pipeline = p,
         .final_db_path = db_path,
         .project = project,
         .cancelled = cancelled,
@@ -2344,6 +2432,8 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         .manifest_count = manifest_count,
         .coverage = cov,
         .coverage_count = cov_count,
+        .call_site_spool = call_site_spool,
+        .call_site_baseline = db_path,
         .coverage_meta = meta_template ? *meta_template : (cbm_coverage_meta_t){0},
         .surface_rows = surface_rows,
         .surface_row_count = surface_row_count,
@@ -2994,6 +3084,46 @@ static const char *closure_python_namespace_decline(const char *stored_json,
     return change > 0 ? "python_namespace_changed" : NULL;
 }
 
+static bool closure_go_package_variables(const char *json) {
+    if (!json || !strstr(json, "\"Variable\""))
+        return false;
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return true;
+    yyjson_val *defs = yyjson_obj_get(yyjson_doc_get_root(doc), "lsp");
+    yyjson_arr_iter iter = yyjson_arr_iter_with(defs);
+    yyjson_val *def;
+    bool found = false;
+    while ((def = yyjson_arr_iter_next(&iter))) {
+        if (yyjson_equals_str(yyjson_obj_get(def, "lb"), "Variable") &&
+            yyjson_is_str(yyjson_obj_get(def, "ret"))) {
+            found = true;
+            break;
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+/* A new declaration can make an unresolved selector bind in an untouched file. */
+static bool closure_go_package_surface_changed(const closure_plan_t *plan, const char *path,
+                                               const char *fresh_json) {
+    size_t len = strlen(path);
+    if (len < 3 || strcmp(path + len - 3, ".go") != 0)
+        return false;
+    if (closure_go_package_variables(fresh_json))
+        return true;
+    const char *slash = strrchr(path, '/');
+    size_t prefix = slash ? (size_t)(slash - path + 1) : 0;
+    for (int i = 0; i < plan->stored_count; i++) {
+        const cbm_lsp_surface_row_t *row = &plan->stored_rows[i];
+        if (strncmp(row->rel_path, path, prefix) == 0 && !strchr(row->rel_path + prefix, '/') &&
+            closure_go_package_variables(row->defs_json))
+            return true;
+    }
+    return false;
+}
+
 static bool closure_is_swift_manifest(const char *path) {
     const char *slash = strrchr(path, '/');
     return strcmp(slash ? slash + SKIP_ONE : path, "Package.swift") == 0;
@@ -3140,8 +3270,10 @@ static const char *closure_add_includers(const cbm_lsp_surface_row_t *rows, int 
 static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
                             cbm_file_info_t *files, int file_count, const cbm_file_hash_t *stored,
                             int stored_count, const cbm_file_hash_t *fresh, int fresh_count,
-                            closure_plan_t *plan) {
+                            closure_plan_t *plan, const CBMHashTable *compiler_seeds) {
+    CBMCompilerRun *preflight = plan->compiler_preflight;
     memset(plan, 0, sizeof(*plan));
+    plan->compiler_preflight = preflight;
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     const char *decline = NULL;
@@ -3184,6 +3316,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     for (int i = 0; i < stored_count; i++) {
         cbm_ht_set(stored_by_path, stored[i].rel_path, (void *)&stored[i]);
     }
+    for (int i = 0; i < file_count; i++) {
+        if (compiler_seeds && cbm_ht_get(compiler_seeds, files[i].rel_path))
+            cbm_ht_set(closure_set, files[i].rel_path, files[i].rel_path);
+    }
 
     /* Delta classification straight from the semantic manifests (content
      * hashes, not mtimes). Virtual entries are config/lockfile digests —
@@ -3196,7 +3332,7 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         goto done;
     }
     plan_aliases = cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), NULL, 0);
-    bool governed_seeded = false;
+    bool governed_seeded = cbm_ht_count(closure_set) != 0;
     for (int i = 0; i < fresh_count; i++) {
         const cbm_file_hash_t *old_row = cbm_ht_get(stored_by_path, fresh[i].rel_path);
         bool synthetic = semantic_manifest_is_virtual_path(fresh[i].rel_path);
@@ -3230,6 +3366,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     for (int i = 0; i < stored_count; i++) {
         if (!cbm_ht_get(fresh_by_path, stored[i].rel_path)) {
+            if (semantic_manifest_is_virtual_path(stored[i].rel_path)) {
+                decline = "semantic_input_changed";
+                goto done;
+            }
             if (!cbm_ht_get(files_by_path, stored[i].rel_path) &&
                 closure_is_alias_config(plan_aliases, stored[i].rel_path)) {
                 /* Removed alias config: its governed files resolve without
@@ -3399,6 +3539,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             body_targets[body_target_count++] = changed_paths[i];
             continue;
         }
+        if (closure_go_package_surface_changed(plan, changed_paths[i], fresh_row->defs_json)) {
+            why = "go_package_variable_surface_changed";
+            break;
+        }
         bool added = false;
         if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
             added) {
@@ -3415,6 +3559,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     bool gone_scope_changed = false; /* a deleted file takes its declarations along */
     for (int i = 0; i < n_deleted && !why; i++) {
+        if (closure_go_package_surface_changed(plan, changed_paths[n_changed + i], NULL)) {
+            why = "go_package_variable_surface_changed";
+            break;
+        }
         const cbm_lsp_surface_row_t *gone = cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
         why = closure_python_namespace_decline(gone ? gone->defs_json : NULL, NULL);
         if (why) {
@@ -3567,10 +3715,8 @@ done:
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
         incr_test_note_plan(-1, -1, -1, decline);
 #endif
-        cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
         int fatal_rc = plan->fatal_rc;
-        cbm_store_free_doc_links(plan->doc_rows, plan->doc_row_count);
-        memset(plan, 0, sizeof(*plan));
+        closure_plan_free(plan);
         plan->fatal_rc = fatal_rc;
         return 0;
     }
@@ -3817,6 +3963,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     }
     cbm_arena_init(&cr.arena);
     cr_arena_live = true;
+    cr.compiler_preflight = plan->compiler_preflight;
+    cr.discovery = files;
+    cr.discovery_count = file_count;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     {
         /* Eligible rows first (skip everything being re-parsed or deleted),
@@ -4102,8 +4251,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     bool unresolved_complete = false;
     cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
                                       &unresolved_complete);
+    cbm_coverage_row_t *run_summaries = NULL;
+    int run_summary_count = 0;
+    cbm_pipeline_get_call_summaries(p, &run_summaries, &run_summary_count);
+    const char *compiler_status = cbm_compiler_runner_status(cr.compiler_run);
     int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
-                  run_unresolved_count;
+                  run_unresolved_count + run_summary_count + (compiler_status ? 1 : 0);
     bool coverage_rows_available = cov_cap == 0;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
@@ -4112,7 +4265,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     if (cov) {
         for (int i = 0; i < old_cov_count; i++) {
             bool by_design = old_cov[i].kind && strncmp(old_cov[i].kind, "not_indexed", 11) == 0;
-            if (!by_design && old_cov[i].rel_path &&
+            bool compiler = compiler_status && old_cov[i].kind &&
+                            strcmp(old_cov[i].kind, "compiler_facts") == 0;
+            if (!by_design && !compiler && old_cov[i].rel_path &&
                 !cbm_ht_get(stale_surface_set, old_cov[i].rel_path)) {
                 cov[cov_n++] = old_cov[i];
             }
@@ -4126,6 +4281,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         for (int i = 0; i < run_unresolved_count; i++) {
             cov[cov_n++] = run_unresolved[i];
         }
+        for (int i = 0; i < run_summary_count; i++) {
+            cov[cov_n++] = run_summaries[i];
+        }
+        if (compiler_status)
+            cov[cov_n++] = (cbm_coverage_row_t){.rel_path = CBM_COMPILER_FACTS_COVERAGE_PATH,
+                                                .kind = "compiler_facts",
+                                                .detail = compiler_status};
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
             cov[cov_n].kind = "not_indexed_dir";
@@ -4203,6 +4365,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         int index_mode = cbm_pipeline_get_mode(p);
         cbm_pipeline_generation_t generation = {
             .gbuf = NULL,
+            .pipeline = p,
             .final_db_path = db_path,
             .project = project,
             .cancelled = cbm_pipeline_cancelled_ptr(p),
@@ -4210,6 +4373,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .manifest_count = manifest_count,
             .coverage = cov,
             .coverage_count = cov_n,
+            .call_site_spool = cbm_pipeline_get_call_site_spool(p),
+            .call_site_baseline = db_path,
             .coverage_meta =
                 {
                     .index_mode = incr_mode_name(index_mode),
@@ -4280,6 +4445,12 @@ out:
         free(cr.rehydrate_arenas);
         cbm_arena_destroy(&cr.arena);
     }
+    if (result == 0 && cbm_compiler_runner_has_chunk_index(cr.compiler_run)) {
+        /* The outer publication guard still needs the immutable chunk transport. */
+        cbm_pipeline_set_compiler_preflight(p, cr.compiler_run);
+        cr.compiler_run = NULL;
+    }
+    cbm_compiler_runner_free(cr.compiler_run);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(cov);
     free(purge_paths);
@@ -4303,6 +4474,24 @@ out:
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
+
+static bool incr_declarations_unambiguous(cbm_store_t *store, const char *project) {
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    if (!db || sqlite3_prepare_v2(
+                   db,
+                   "SELECT 1 FROM nodes WHERE project = ?1"
+                   " AND instr(properties, '\"decl_ambiguous\"') > 0"
+                   " AND json_type(properties, '$.decl_ambiguous') = 'true' LIMIT 1",
+                   CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    bool reusable = sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_STATIC) == SQLITE_OK &&
+                    sqlite3_step(stmt) == SQLITE_DONE;
+    int close_rc = sqlite3_finalize(stmt);
+    return reusable && close_rc == SQLITE_OK;
+}
 
 /* The stored generation's doc-link layer is usable: its doc_link_unresolved
  * table exists and records no failure of the layer. */
@@ -4347,7 +4536,303 @@ static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const c
     return exact;
 }
 
+static bool incr_compiler_selection_current(yyjson_val *old, yyjson_val *now) {
+    yyjson_val *previous = yyjson_obj_get(old, "selection_evidence_sha256");
+    yyjson_val *next = yyjson_obj_get(now, "selection_evidence_sha256");
+    return (!previous && !next) || yyjson_equals(previous, next);
+}
+
+static bool incr_compiler_language_current(yyjson_val *old, yyjson_val *now) {
+    if (yyjson_equals_str(yyjson_obj_get(old, "profile"), "proof_index_v1") ||
+        yyjson_equals_str(yyjson_obj_get(now, "profile"), "proof_index_v1"))
+        return false;
+    const char *status = yyjson_get_str(yyjson_obj_get(now, "status"));
+    if (!status || !yyjson_equals(yyjson_obj_get(old, "status"), yyjson_obj_get(now, "status")) ||
+        !yyjson_equals(yyjson_obj_get(old, "files"), yyjson_obj_get(now, "files")) ||
+        !yyjson_equals(yyjson_obj_get(old, "sites"), yyjson_obj_get(now, "sites")) ||
+        !incr_compiler_selection_current(old, now) ||
+        yyjson_get_uint(yyjson_obj_get(old, "facts_schema")) !=
+            yyjson_get_uint(yyjson_obj_get(now, "facts_schema")))
+        return false;
+    if (strcmp(status, "complete") == 0) {
+        yyjson_val *old_key = yyjson_obj_get(yyjson_obj_get(old, "cache"), "key");
+        yyjson_val *new_key = yyjson_obj_get(yyjson_obj_get(now, "cache"), "key");
+        return yyjson_is_str(old_key) && yyjson_equals(old_key, new_key) &&
+               yyjson_is_obj(yyjson_obj_get(old, "context")) &&
+               yyjson_equals(yyjson_obj_get(old, "context"), yyjson_obj_get(now, "context"));
+    }
+    return strcmp(status, "disabled") == 0 || strcmp(status, "no_files") == 0;
+}
+
+static bool incr_go_base_context_current(yyjson_val *old, yyjson_val *now) {
+    if (!yyjson_is_obj(old) || !yyjson_is_obj(now))
+        return false;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *a = doc ? yyjson_val_mut_copy(doc, old) : NULL;
+    yyjson_mut_val *b = doc ? yyjson_val_mut_copy(doc, now) : NULL;
+    const char *digests[] = {"manifest_sha256", "source_sha256", "exports_sha256",
+                             "dependencies_sha256"};
+    for (size_t i = 0; a && b && i < sizeof(digests) / sizeof(*digests); i++) {
+        yyjson_mut_obj_remove_key(a, digests[i]);
+        yyjson_mut_obj_remove_key(b, digests[i]);
+    }
+    bool equal = a && b && yyjson_mut_equals(a, b);
+    yyjson_mut_doc_free(doc);
+    return equal;
+}
+
+/* Keys include recursively resolved imports, so their difference includes
+ * consumers absent from yesterday's CALLS graph, including test variants. */
+static const char *incr_compiler_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
+                                     const cbm_file_info_t *files, int file_count,
+                                     const cbm_file_hash_t *stored, int stored_count,
+                                     closure_plan_t *plan, CBMHashTable **seeds, bool *current) {
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    const char *reason = "compiler_context_recheck";
+    yyjson_doc *previous = NULL, *fresh = NULL;
+    CBMCompilerInput *inputs = NULL;
+    cbm_gbuf_t *empty = NULL;
+    bool enabled = cbm_compiler_runner_enabled();
+    if (cbm_store_coverage_get_path(store, project, CBM_COMPILER_FACTS_COVERAGE_PATH,
+                                     &rows, &count) != CBM_STORE_OK)
+        goto done;
+    if (!enabled && !count) {
+        reason = NULL;
+        goto done;
+    }
+    if (!enabled || count != 1 || !rows[0].kind ||
+        strcmp(rows[0].kind, "compiler_facts") != 0 || !rows[0].detail)
+        goto done;
+    previous = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    yyjson_val *old_root = yyjson_doc_get_root(previous);
+    if (yyjson_get_uint(yyjson_obj_get(old_root, "schema")) != 1)
+        goto done;
+    yyjson_val *old_ts = yyjson_obj_get(old_root, "typescript");
+    /* A proof index requires a full rebuild regardless of the fresh facts. */
+    if (yyjson_equals_str(yyjson_obj_get(old_ts, "profile"), "proof_index_v1")) {
+        reason = "typescript_compiler_context_changed";
+        goto done;
+    }
+    plan->compiler_preflight = cbm_pipeline_take_compiler_preflight(p);
+    if (!plan->compiler_preflight) {
+        empty = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
+        char error[256] = {0};
+        if (empty)
+            plan->compiler_preflight = cbm_compiler_runner_prepare(
+                cbm_pipeline_repo_path(p), files, file_count, empty, cbm_pipeline_cancelled_ptr(p),
+                error, sizeof(error));
+        if (!plan->compiler_preflight || error[0])
+            goto done;
+    }
+    const char *status = cbm_compiler_runner_status(plan->compiler_preflight);
+    fresh = status ? yyjson_read(status, strlen(status), 0) : NULL;
+    yyjson_val *new_root = yyjson_doc_get_root(fresh);
+    if (!fresh || !incr_compiler_language_current(old_ts, yyjson_obj_get(new_root, "typescript"))) {
+        reason = "typescript_compiler_context_changed";
+        goto done;
+    }
+    yyjson_val *old_go = yyjson_obj_get(old_root, "go");
+    yyjson_val *new_go = yyjson_obj_get(new_root, "go");
+    *current = incr_compiler_language_current(old_go, new_go);
+    if (yyjson_equals_str(yyjson_obj_get(old_go, "status"), "partial") ||
+        yyjson_equals_str(yyjson_obj_get(new_go, "status"), "partial")) {
+        reason = "go_compiler_partial_coverage";
+        goto done;
+    }
+    if (!yyjson_equals_str(yyjson_obj_get(old_go, "status"), "complete") ||
+        !yyjson_equals_str(yyjson_obj_get(new_go, "status"), "complete")) {
+        reason = *current ? NULL : "go_compiler_status_changed";
+        goto done;
+    }
+    if (yyjson_get_uint(yyjson_obj_get(old_go, "facts_schema")) !=
+        yyjson_get_uint(yyjson_obj_get(new_go, "facts_schema"))) {
+        reason = "go_compiler_protocol_changed";
+        goto done;
+    }
+    if (!incr_go_base_context_current(yyjson_obj_get(old_go, "context"),
+                                       yyjson_obj_get(new_go, "context"))) {
+        reason = "go_build_context_changed";
+        goto done;
+    }
+    if (!incr_compiler_selection_current(old_go, new_go)) {
+        reason = "go_selection_evidence_changed";
+        goto done;
+    }
+    inputs = calloc((size_t)(stored_count ? stored_count : 1), sizeof(*inputs));
+    if (!inputs)
+        goto done;
+    size_t n = 0;
+    for (int i = 0; i < stored_count; i++) {
+        const char *path = stored[i].rel_path;
+        size_t length = path ? strlen(path) : 0;
+        if (length >= 3 && strcmp(path + length - 3, ".go") == 0)
+            inputs[n++] = (CBMCompilerInput){.path = path};
+    }
+    yyjson_val *old_cache = yyjson_obj_get(old_go, "cache");
+    yyjson_val *new_cache = yyjson_obj_get(new_go, "cache");
+    if (!cbm_compiler_facts_go_package_manifest_valid(old_cache, inputs, n)) {
+        reason = "go_package_manifest_missing_or_invalid";
+        goto done;
+    }
+    yyjson_val *old_members = yyjson_obj_get(old_cache, "package_files");
+    yyjson_val *new_members = yyjson_obj_get(new_cache, "package_files");
+    if (!yyjson_equals(old_members, new_members)) {
+        reason = "go_package_membership_changed";
+        goto done;
+    }
+    *seeds = cbm_ht_create(CBM_SZ_64);
+    if (!*seeds)
+        goto done;
+    yyjson_val *old_keys = yyjson_obj_get(old_cache, "package_keys");
+    yyjson_val *new_keys = yyjson_obj_get(new_cache, "package_keys");
+    yyjson_obj_iter iter = yyjson_obj_iter_with(old_keys);
+    yyjson_val *key;
+    int changed_packages = 0;
+    while ((key = yyjson_obj_iter_next(&iter))) {
+        const char *id = yyjson_get_str(key);
+        if (yyjson_equals(yyjson_obj_iter_get_val(key), yyjson_obj_get(new_keys, id)))
+            continue;
+        changed_packages++;
+        yyjson_val *paths = yyjson_obj_get(new_members, id);
+        for (size_t i = 0; i < yyjson_arr_size(paths); i++) {
+            const char *path = yyjson_get_str(yyjson_arr_get(paths, i));
+            if (!surface_name_set_put(*seeds, path))
+                goto done;
+        }
+    }
+    cbm_log_info("incremental.go_packages", "changed", itoa_buf(changed_packages), "seed_files",
+                 itoa_buf((int)cbm_ht_count(*seeds)));
+    reason = NULL;
+done:
+    cbm_gbuf_free(empty);
+    free(inputs);
+    yyjson_doc_free(previous);
+    yyjson_doc_free(fresh);
+    cbm_store_free_coverage(rows, count);
+    return reason;
+}
+
+/* Fresh helpers validate dependency and resolution inputs, including files
+ * outside discovery. A source-manifest match alone cannot establish a no-op. */
+static bool incr_compiler_context_current(cbm_pipeline_t *p, cbm_store_t *store,
+                                          const char *project, const cbm_file_info_t *files,
+                                          int file_count) {
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    bool ok = cbm_store_coverage_get_path(store, project, CBM_COMPILER_FACTS_COVERAGE_PATH,
+                                         &rows, &count) == CBM_STORE_OK;
+    bool enabled = cbm_compiler_runner_enabled();
+    if (!ok || !enabled || count != 1) {
+        cbm_store_free_coverage(rows, count);
+        return ok && !enabled && count == 0;
+    }
+    yyjson_doc *previous = rows[0].detail
+        ? yyjson_read(rows[0].detail, strlen(rows[0].detail), 0) : NULL;
+    yyjson_val *old_root = yyjson_doc_get_root(previous);
+    ok = rows[0].kind && strcmp(rows[0].kind, "compiler_facts") == 0 &&
+         yyjson_get_uint(yyjson_obj_get(old_root, "schema")) == 1;
+    yyjson_val *old_ts = yyjson_obj_get(old_root, "typescript");
+    if (ok && yyjson_equals_str(yyjson_obj_get(old_ts, "profile"), "proof_index_v1")) {
+        char path[CBM_SZ_4K];
+        bool configured = cbm_safe_getenv("CBM_TYPESCRIPT_PATH", path, sizeof(path), NULL) != NULL;
+        cbm_normalize_path_sep(path);
+        if (configured &&
+            !cbm_compiler_facts_ts_dependencies_current(yyjson_obj_get(old_ts, "context"), path)) {
+            /* The staged route already requires a full rebuild for proof indexes. */
+            cbm_log_info("compiler_facts.preflight", "language", "typescript", "status", "skipped",
+                         "reason", "stored_dependencies_not_current");
+            yyjson_doc_free(previous);
+            cbm_store_free_coverage(rows, count);
+            return false;
+        }
+    }
+    cbm_gbuf_t *empty = ok ? cbm_gbuf_new(project, cbm_pipeline_repo_path(p)) : NULL;
+    char error[256] = {0};
+    CBMCompilerRun *run = empty
+        ? cbm_compiler_runner_prepare(cbm_pipeline_repo_path(p), files, file_count, empty,
+                                       cbm_pipeline_cancelled_ptr(p), error, sizeof(error))
+        : NULL;
+    const char *status = cbm_compiler_runner_status(run);
+    yyjson_doc *fresh = status ? yyjson_read(status, strlen(status), 0) : NULL;
+    yyjson_val *new_root = yyjson_doc_get_root(fresh);
+    const char *languages[] = {"go", "typescript"};
+    ok = ok && fresh && !error[0];
+    for (size_t i = 0; ok && i < sizeof(languages) / sizeof(*languages); i++) {
+        yyjson_val *old = yyjson_obj_get(old_root, languages[i]);
+        yyjson_val *now = yyjson_obj_get(new_root, languages[i]);
+        const char *old_status = yyjson_get_str(yyjson_obj_get(old, "status"));
+        const char *new_status = yyjson_get_str(yyjson_obj_get(now, "status"));
+        ok = old_status && new_status && strcmp(old_status, new_status) == 0 &&
+             yyjson_equals(yyjson_obj_get(old, "files"), yyjson_obj_get(now, "files")) &&
+             yyjson_equals(yyjson_obj_get(old, "sites"), yyjson_obj_get(now, "sites")) &&
+             incr_compiler_selection_current(old, now) &&
+             yyjson_get_uint(yyjson_obj_get(old, "facts_schema")) ==
+                 yyjson_get_uint(yyjson_obj_get(now, "facts_schema"));
+        if (ok && strcmp(new_status, "complete") == 0) {
+            yyjson_val *old_key = yyjson_obj_get(yyjson_obj_get(old, "cache"), "key");
+            yyjson_val *new_key = yyjson_obj_get(yyjson_obj_get(now, "cache"), "key");
+            yyjson_val *old_context = yyjson_obj_get(old, "context");
+            yyjson_val *new_context = yyjson_obj_get(now, "context");
+            ok = yyjson_is_str(old_key) && yyjson_equals(old_key, new_key) &&
+                 yyjson_is_obj(old_context) && yyjson_equals(old_context, new_context);
+        } else if (ok && strcmp(languages[i], "typescript") == 0 &&
+                   strcmp(new_status, "partial") == 0) {
+            /* This gate runs only after the whole semantic manifest matched. */
+            yyjson_val *old_key = yyjson_obj_get(yyjson_obj_get(old, "cache"), "key");
+            yyjson_val *new_key = yyjson_obj_get(yyjson_obj_get(now, "cache"), "key");
+            yyjson_val *old_context = yyjson_obj_get(old, "context");
+            yyjson_val *new_context = yyjson_obj_get(now, "context");
+            yyjson_val *old_evidence = yyjson_obj_get(old, "evidence");
+            yyjson_val *new_evidence = yyjson_obj_get(now, "evidence");
+            const char *key = yyjson_get_str(new_key);
+            const char *digest = yyjson_get_str(yyjson_obj_get(new_evidence, "sha256"));
+            bool proof = yyjson_equals_str(yyjson_obj_get(now, "profile"), "proof_index_v1");
+            if (proof) {
+                yyjson_val *diagnostics = yyjson_obj_get(now, "diagnostics");
+                ok = yyjson_get_uint(yyjson_obj_get(now, "facts_schema")) == 3 &&
+                     yyjson_equals_str(yyjson_obj_get(now, "kind"), "typescript_chunk_index") &&
+                     yyjson_equals_str(yyjson_obj_get(now, "reason"), "proof_index_partial") &&
+                     yyjson_is_false(yyjson_obj_get(now, "complete")) &&
+                     yyjson_is_false(yyjson_obj_get(old, "complete")) &&
+                     yyjson_is_arr(diagnostics) &&
+                     yyjson_equals(yyjson_obj_get(old, "diagnostics"), diagnostics);
+            } else {
+                ok = yyjson_get_uint(yyjson_obj_get(now, "facts_schema")) == 2 &&
+                     yyjson_equals_str(yyjson_obj_get(now, "kind"), "typescript_local_target_index") &&
+                     yyjson_equals_str(yyjson_obj_get(now, "profile"), "lexical_target_v1") &&
+                     yyjson_equals_str(yyjson_obj_get(now, "reason"), "project_errors_local_targets_only");
+            }
+            ok = ok && key && strlen(key) == CBM_SHA256_HEX_LEN &&
+                 strspn(key, "0123456789abcdef") == CBM_SHA256_HEX_LEN &&
+                 yyjson_equals(old_key, new_key) && yyjson_is_obj(old_context) &&
+                 yyjson_equals(old_context, new_context) &&
+                 yyjson_is_obj(yyjson_obj_get(now, "coverage")) &&
+                 yyjson_get_uint(yyjson_obj_get(new_evidence, "version")) == 1 &&
+                 digest && strlen(digest) == CBM_SHA256_HEX_LEN &&
+                 strspn(digest, "0123456789abcdef") == CBM_SHA256_HEX_LEN &&
+                 yyjson_equals(old_evidence, new_evidence);
+            const char *fields[] = {"kind", "profile", "reason", "coverage"};
+            for (size_t f = 0; ok && f < sizeof(fields) / sizeof(*fields); f++)
+                ok = yyjson_equals(yyjson_obj_get(old, fields[f]), yyjson_obj_get(now, fields[f]));
+        } else if (ok) {
+            ok = strcmp(new_status, "disabled") == 0 || strcmp(new_status, "no_files") == 0;
+        }
+    }
+    yyjson_doc_free(fresh);
+    if (run && (!ok || cbm_compiler_runner_has_chunk_index(run))) {
+        cbm_pipeline_set_compiler_preflight(p, run);
+        run = NULL;
+    }
+    cbm_compiler_runner_free(run);
+    cbm_gbuf_free(empty);
+    yyjson_doc_free(previous);
+    cbm_store_free_coverage(rows, count);
+    return ok;
+}
+
 bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_info_t *files, int file_count,
                                                const cbm_file_hash_t *baseline_manifest,
                                                int baseline_count) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -4368,6 +4853,8 @@ bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *s
     bool doc_links_current = false;
     bool exact = incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
                                        baseline_count, &metadata_current, &doc_links_current);
+    if (exact)
+        exact = incr_compiler_context_current(p, store, project, files, file_count);
     cbm_store_free_file_hashes(stored, stored_count);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (exact) {
@@ -4416,20 +4903,41 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_close(store);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
+    CBMHashTable *compiler_seeds = NULL;
+    bool compiler_current = true;
+    const char *compiler_decline = incr_compiler_plan(
+        p, store, project, files, file_count, stored, stored_count, &closure_plan, &compiler_seeds,
+        &compiler_current);
+    if (compiler_decline || (force_legacy_partial && closure_plan.compiler_preflight)) {
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        surface_name_set_free(compiler_seeds);
+        closure_plan_free(&closure_plan);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+        cbm_log_info("incremental.force_full", "reason",
+                     compiler_decline ? compiler_decline : "compiler_legacy_partial_unsupported");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
 
-    /* Production incremental routing is deliberately binary: an exact
-     * semantic-manifest match is a no-op; any byte/set/mode/migration delta
-     * rebuilds the complete graph. This avoids partial LSP/package/config
-     * convergence gaps while retaining the common unchanged-repo fast path. */
+    /* A current semantic and compiler snapshot can no-op. Otherwise the
+     * planner proves a bounded repair or declines to a complete rebuild. */
     if (!force_legacy_partial) {
         bool metadata_current = false;
         bool doc_links_current = false;
         bool exact =
             incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
                                   baseline_count, &metadata_current, &doc_links_current);
-        if (exact) {
+        if (exact && compiler_current) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
+            surface_name_set_free(compiler_seeds);
+            if (cbm_compiler_runner_has_chunk_index(closure_plan.compiler_preflight)) {
+                cbm_pipeline_set_compiler_preflight(p, closure_plan.compiler_preflight);
+                closure_plan.compiler_preflight = NULL;
+            }
+            closure_plan_free(&closure_plan);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NOOP);
 #endif
@@ -4439,6 +4947,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         if (force_full_on_mismatch) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
+            surface_name_set_free(compiler_seeds);
+            closure_plan_free(&closure_plan);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 #endif
@@ -4455,9 +4965,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * closure repair, independently of database row order. */
         metadata_current = closure_metadata_current(metadata_current, stored, stored_count,
                                                     baseline_manifest, baseline_count);
-        if (metadata_current &&
-            closure_try_plan(p, store, project, files, file_count, stored, stored_count,
-                             baseline_manifest, baseline_count, &closure_plan)) {
+        bool planned = metadata_current &&
+                       closure_try_plan(p, store, project, files, file_count, stored, stored_count,
+                                        baseline_manifest, baseline_count, &closure_plan,
+                                        compiler_seeds);
+        surface_name_set_free(compiler_seeds);
+        compiler_seeds = NULL;
+        if (planned) {
             closure_active = true;
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
@@ -4471,9 +4985,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 #endif
-            if (closure_plan.fatal_rc) {
-                return closure_plan.fatal_rc;
-            }
+            int fatal_rc = closure_plan.fatal_rc;
+            closure_plan_free(&closure_plan);
+            if (fatal_rc)
+                return fatal_rc;
             cbm_log_info("incremental.force_full", "reason",
                          metadata_current && !doc_links_current ? "doc_links_not_current"
                                                                 : "semantic_manifest_changed");
@@ -4500,7 +5015,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int mode_skipped_count = 0;
     int deleted_count =
         find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
-                           &deleted, &mode_skipped, &mode_skipped_count);
+                           &deleted, &mode_skipped, &mode_skipped_count,
+                           closure_active ? baseline_manifest : NULL,
+                           closure_active ? baseline_count : 0);
+    if (deleted_count < 0) {
+        free(is_changed);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        closure_plan_free(&closure_plan);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
@@ -4520,6 +5044,29 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return 0;
+    }
+
+    /* Source changes can leave a non-winning declaration behind. A compiler
+     * dependency repair also purges physical Go declarations, whose catalogue
+     * requires the full raw inventory rather than this closure's subset. */
+    if ((!compiler_current ||
+         !cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
+                                                 baseline_count)) &&
+        !incr_declarations_unambiguous(store, project)) {
+        free(is_changed);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        closure_plan_free(&closure_plan);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+        cbm_log_info("incremental.force_full", "reason", "declaration_identity_ambiguous");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -4801,6 +5348,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_gbuf_free(existing);
         cbm_arena_destroy(&decl_arena);
         legacy_doc_free(&legacy_doc);
+        if (phase_rc == CBM_PIPELINE_FORCE_FULL_REINDEX) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+            return phase_rc;
+        }
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
@@ -4849,8 +5402,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     bool unresolved_complete = false;
     cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
                                       &unresolved_complete);
+    cbm_coverage_row_t *run_summaries = NULL;
+    int run_summary_count = 0;
+    cbm_pipeline_get_call_summaries(p, &run_summaries, &run_summary_count);
     int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
-                  run_unresolved_count;
+                  run_unresolved_count + run_summary_count;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
@@ -4876,6 +5432,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         for (int i = 0; i < run_unresolved_count; i++) {
             cov[cov_n++] = run_unresolved[i];
+        }
+        for (int i = 0; i < run_summary_count; i++) {
+            cov[cov_n++] = run_summaries[i];
         }
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
@@ -4959,9 +5518,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int doc_cand_n = 0;
     const cbm_doc_candidate_t *doc_cands = cbm_pipeline_doc_candidates(p, &doc_cand_n);
     /* ADRs are not captured/re-applied here (sidecar store), so no adr argument. */
-    int persist_rc = dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p),
+    int persist_rc = dump_and_persist(p, existing, db_path, project, cbm_pipeline_cancelled_ptr(p),
                                       manifest, manifest_count, cov, cov_n, &coverage_meta, NULL, 0,
-                                      doc_out, doc_cands, doc_cand_n);
+                                      doc_out, doc_cands, doc_cand_n,
+                                      cbm_pipeline_get_call_site_spool(p));
     cbm_doclinks_free_rows(doc_rows, doc_row_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(cov);

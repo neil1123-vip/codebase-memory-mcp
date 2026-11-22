@@ -2,6 +2,7 @@
 #define CBM_EXTRACT_UNIFIED_H
 
 #include "cbm.h"
+#include "helpers.h"
 #include "lang_specs.h"
 
 // Scope kinds for the walk state stack.
@@ -230,6 +231,7 @@ typedef struct {
     TSNode amd_dependencies;
 
     CBMLanguage language;
+    CBMJsObjectOwners js_object_owners;
 
     os_type_map_t os_type_map; // ObjectScript variable → type mapping
 } WalkState;

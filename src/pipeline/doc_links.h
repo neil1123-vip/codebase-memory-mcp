@@ -50,6 +50,7 @@ typedef enum {
 } cbm_doclink_reason_t;
 
 const char *cbm_doclink_reason_name(int reason);
+bool cbm_doclinks_go_name_constrained(const char *rel_path);
 
 typedef enum {
     CBM_DOCLINK_EDGE = 0,   /* target set: one MENTIONS edge */

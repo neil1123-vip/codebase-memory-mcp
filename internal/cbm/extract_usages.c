@@ -110,7 +110,8 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
         return strcmp(kind, "property_identifier") == 0 ||
                strcmp(kind, "private_property_identifier") == 0;
     case CBM_LANG_GO:
-        return strcmp(kind, "field_identifier") == 0 || strcmp(kind, "package_identifier") == 0;
+        /* The package in pkg.Type is an import qualifier, not a value. */
+        return strcmp(kind, "field_identifier") == 0;
     case CBM_LANG_PYTHON:
         return strcmp(kind, "attribute") == 0;
     case CBM_LANG_RUST:
@@ -879,6 +880,13 @@ static bool cfml_argument_tag_name_binding(CBMExtractCtx *ctx, TSNode node) {
 static bool is_exact_language_binding(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
     const char *kind = ts_node_type(node);
     switch (ctx->language) {
+    case CBM_LANG_SQL: {
+        if (strcmp(kind, "identifier") != 0 || ctx->source[ts_node_start_byte(node)] != '[')
+            return false;
+        TSNode relation = ts_node_parent(node);
+        return !ts_node_is_null(relation) && strcmp(ts_node_type(relation), "relation") == 0 &&
+               field_contains_node(relation, "alias", node);
+    }
     case CBM_LANG_OCAML: {
         if (strcmp(kind, "value_pattern") != 0) {
             return false;
@@ -2325,6 +2333,22 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
                                    bool import_binding) {
     if (!ctx || !state || !raw_name || !raw_name[0] || state->lexical_binding_tracking_failed) {
         return;
+    }
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "property_identifier") == 0 ||
+            strcmp(kind, "private_property_identifier") == 0) {
+            TSNode owner = {0};
+            const char *field = NULL;
+            if (occurrence_parent(reset_occurrence_cursor(state, node), node, &owner, &field) &&
+                field && strcmp(field, "name") == 0 &&
+                ((spec->field_node_types && cbm_kind_in_set(owner, spec->field_node_types)) ||
+                 (spec->function_node_types && cbm_kind_in_set(owner, spec->function_node_types)))) {
+                /* A declared member names a property, not a bare lexical value. */
+                return;
+            }
+        }
     }
     bool parameter = binding_is_parameter(ctx, node, spec);
     if (ctx->language == CBM_LANG_VIMSCRIPT && parameter && !strchr(raw_name, ':')) {

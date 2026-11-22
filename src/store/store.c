@@ -4392,6 +4392,21 @@ int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const ch
     return CBM_STORE_OK;
 }
 
+int cbm_store_delete_node_builtin_imports(cbm_store_t *s, const char *project, int *removed) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "DELETE FROM edges WHERE project=?1 AND type='IMPORTS' "
+                      "AND json_type(properties, '$.node_builtin_compat')='true';";
+    bool ok = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK &&
+              bind_text(stmt, 1, project) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_DONE;
+    if (ok) {
+        *removed = sqlite3_changes(s->db);
+    } else {
+        store_set_error_sqlite(s, "delete_node_builtin_imports");
+    }
+    sqlite3_finalize(stmt);
+    return ok ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
 /* ── Edge batch ─────────────────────────────────────────────────── */
 
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count) {
@@ -4602,7 +4617,8 @@ static void cov_json_escape(char *dst, size_t dstsz, const char *src) {
 static bool cov_kind_outside_miss_graph(const char *kind) {
     static const char by_design_prefix[] = "not_indexed";
     return strncmp(kind, by_design_prefix, sizeof(by_design_prefix) - 1) == 0 ||
-           strcmp(kind, "unresolved_calls") == 0;
+           strcmp(kind, "unresolved_calls") == 0 || strcmp(kind, "call_summary") == 0 ||
+           strcmp(kind, "compiler_facts") == 0;
 }
 
 /* Fingerprint of the FAILURE rows the shadow graph derives from. When the
@@ -5077,11 +5093,13 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
      * the repo): file_hashes is the authoritative live-file set after
      * persist. By-design not_indexed_* rows are exempt — deliberately
      * unindexed paths never have hash rows (discovery rewrites them fresh
-     * every run instead). */
+     * every run instead). compiler_facts describes the run's analysis context,
+     * so its synthetic path also has no file hash. */
     sqlite3_stmt *prune = NULL;
     if (sqlite3_prepare_v2(s->db,
                            "DELETE FROM index_coverage WHERE project = ?1 "
-                           "AND kind NOT LIKE 'not_indexed%' AND rel_path NOT IN "
+                           "AND kind NOT LIKE 'not_indexed%' AND kind != 'compiler_facts' "
+                           "AND rel_path NOT IN "
                            "(SELECT rel_path FROM file_hashes WHERE project = ?1);",
                            CBM_NOT_FOUND, &prune, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage prune prepare");

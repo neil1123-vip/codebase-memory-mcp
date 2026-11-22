@@ -232,6 +232,7 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
 static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node);
 static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
+static TSNode py_type_checking_body(PyLSPContext *ctx, TSNode stmt);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
 static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -283,7 +284,22 @@ static void py_disable_callable_value_proof(PyLSPContext *ctx) {
         ctx->callable_value_proof_disabled = true;
 }
 
+static void py_invalidate_legacy_dispatch(PyLSPContext *ctx, const char *name) {
+    if (!ctx || !name || ctx->class_body_outer_scope)
+        return;
+    for (int i = 0; i < ctx->lambda_count; i++) {
+        if (ctx->lambdas[i].name && strcmp(ctx->lambdas[i].name, name) == 0)
+            ctx->lambdas[i].name = NULL;
+    }
+    for (int i = 0; i < ctx->dict_literal_count; i++) {
+        if (ctx->dict_literals[i].var_name &&
+            strcmp(ctx->dict_literals[i].var_name, name) == 0)
+            ctx->dict_literals[i].var_name = NULL;
+    }
+}
+
 static void py_scope_bind(PyLSPContext *ctx, const char *name, const CBMType *type) {
+    py_invalidate_legacy_dispatch(ctx, name);
     ctx->type_cache_gen++;
     if (!cbm_scope_bind_checked(ctx->current_scope, name, type))
         py_disable_callable_value_proof(ctx);
@@ -291,6 +307,7 @@ static void py_scope_bind(PyLSPContext *ctx, const char *name, const CBMType *ty
 
 static void py_scope_bind_callable(PyLSPContext *ctx, const char *name, const CBMType *type,
                                    const char *callable_qn) {
+    py_invalidate_legacy_dispatch(ctx, name);
     ctx->type_cache_gen++;
     if (!cbm_scope_bind_callable_checked(ctx->current_scope, name, type, callable_qn))
         py_disable_callable_value_proof(ctx);
@@ -3918,6 +3935,8 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
     if (!ts_node_is_null(alt)) {
         py_resolve_calls_in(ctx, alt);
     }
+    py_invalidate_possible_bindings(ctx, body, 0);
+    py_invalidate_possible_bindings(ctx, alt, 0);
 
     // Early-return narrowing: if the consequence block terminates and the
     // condition negates a type guard, apply the *positive* narrow to the
@@ -4091,6 +4110,10 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
+    if (!ts_node_is_null(py_type_checking_body(ctx, node))) {
+        py_resolve_calls_in(ctx, ts_node_child_by_field_name(node, "alternative", 11));
+        return;
+    }
 
     // Statement-level binding effects.
     py_process_statement(ctx, node);
@@ -5913,23 +5936,26 @@ static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt, unsigned 
     }
 }
 
-/* The consequence block of a module-level `if TYPE_CHECKING:` /
- * `if <module>.TYPE_CHECKING:` statement, else a null node. Mirrors the
- * extraction's py_is_type_checking_condition (extract_imports.c). */
+/* Only a proven module-level typing import is a runtime-false guard.
+ * Function locals need full LEGB proof; module attributes can be reassigned.
+ * Keep those conditions visible rather than pruning them by spelling. */
 static TSNode py_type_checking_body(PyLSPContext *ctx, TSNode stmt) {
     TSNode none = {0};
-    if (strcmp(ts_node_type(stmt), "if_statement") != 0)
+    if (!ctx || !ctx->enclosing_func_qn || !ctx->file_module_qn ||
+        ctx->class_body_outer_scope ||
+        strcmp(ctx->enclosing_func_qn, ctx->file_module_qn) != 0 ||
+        strcmp(ts_node_type(stmt), "if_statement") != 0)
         return none;
     TSNode cond = ts_node_child_by_field_name(stmt, "condition", 9);
-    if (ts_node_is_null(cond))
+    if (ts_node_is_null(cond) || strcmp(ts_node_type(cond), "identifier") != 0)
         return none;
-    TSNode name = cond;
-    if (strcmp(ts_node_type(cond), "attribute") == 0)
-        name = ts_node_child_by_field_name(cond, "attribute", 9);
-    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0)
-        return none;
-    char *text = py_node_text(ctx, name);
-    if (!text || strcmp(text, "TYPE_CHECKING") != 0)
+    char *name = py_node_text(ctx, cond);
+    const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+    const char *imported = py_exact_imported_reference_candidate(ctx, name);
+    if (!binding || !binding->type || binding->type->kind != CBM_TYPE_NAMED ||
+        !binding->type->data.named.qualified_name ||
+        strcmp(binding->type->data.named.qualified_name, "typing.TYPE_CHECKING") != 0 ||
+        !imported || strcmp(imported, "typing.TYPE_CHECKING") != 0)
         return none;
     return ts_node_child_by_field_name(stmt, "consequence", 11);
 }
@@ -6054,7 +6080,12 @@ static void py_lsp_process_tree(PyLSPContext *ctx, TSNode root) {
                         ctx->current_scope = runtime_scope;
                     }
                 }
+                py_resolve_calls_in(ctx, ts_node_child_by_field_name(c, "alternative", 11));
+            } else {
+                py_resolve_calls_in(ctx, c);
             }
+            /* The walk may bind values on only one path; keep the join conservative. */
+            py_invalidate_possible_bindings(ctx, c, 0);
         }
     }
     // Pass 2: top-level calls (rare) and nested definitions.

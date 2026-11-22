@@ -21,8 +21,7 @@
  *
  * Conventions (mirrors c_lsp / go_lsp):
  *   - Persistent results use ctx->arena; temporary walk/index buffers use tracked allocations.
- *   - ts_emit_resolved_call requires a non-NULL enclosing_func_qn — calls outside any
- *     function (module top-level) are not emitted.
+ *   - Module initializer calls use the module QN, matching parser-backed calls.
  *   - eval_depth caps at TS_LSP_MAX_EVAL_DEPTH to defend against pathological recursion.
  */
 
@@ -32,11 +31,156 @@
 #include "../helpers.h"
 #include "../../../src/foundation/log.h"
 #include "../../../src/foundation/mem_core.h"
+#include "../../../src/foundation/hash_table.h"
+#include "../../../src/foundation/sha256.h"
+#include "../../../src/pipeline/compiler_facts.h"
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "generated/ts_library_data.h"
+
+static bool ts_library_qn(const char *qn) {
+    return qn && strncmp(qn, "__cbm_lib.", 10) == 0;
+}
+
+static bool ts_library_builtin(const TSLSPContext *ctx, const CBMRegisteredFunc *function) {
+    if (!ctx->has_library_facts || !function || !function->receiver_type)
+        return false;
+    if (ctx->isolated_page_context && strcmp(function->receiver_type, "Response") == 0)
+        return true;
+    static const char *const owners[] = {"String", "Array", "Promise", "Map", "Set", "Number",
+        "Boolean", "Date", "RegExp", "Math", "JSON", "console", NULL};
+    for (int i = 0; owners[i]; i++) {
+        if (strcmp(function->receiver_type, owners[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static const char *ts_library_module(const char *name) {
+    if (!name)
+        return NULL;
+    if (strcmp(name, "playwright") == 0 || strcmp(name, "playwright-core") == 0)
+        return "__cbm_lib.playwright.Module";
+    if (strcmp(name, "@playwright/test") == 0 || strcmp(name, "playwright/test") == 0)
+        return "__cbm_lib.playwright.TestModule";
+    if (strcmp(name, "url") == 0 || strcmp(name, "node:url") == 0)
+        return "__cbm_lib.node.UrlModule";
+    if (strcmp(name, "buffer") == 0 || strcmp(name, "node:buffer") == 0)
+        return "__cbm_lib.node.BufferModule";
+    return NULL;
+}
+
+static const CBMType *ts_library_decode(CBMArena *arena, int index, const CBMType **memo) {
+    if (index < 0 || (size_t)index >= sizeof(ts_lib_types) / sizeof(ts_lib_types[0]))
+        return cbm_type_unknown();
+    if (memo[index])
+        return memo[index];
+    const TSLibType *fact = &ts_lib_types[index];
+    const CBMType *children[17] = {0};
+    const char *names[17] = {0};
+    if (fact->count > 16)
+        return cbm_type_unknown();
+    for (int i = 0; i < fact->count; i++) {
+        children[i] = ts_library_decode(arena, ts_lib_children[fact->first + i], memo);
+        names[i] = ts_lib_keys[fact->first + i][0] ? ts_lib_keys[fact->first + i]
+                                                  : cbm_arena_sprintf(arena, "_%d", i);
+    }
+    const CBMType *type = cbm_type_unknown();
+    switch (fact->kind) {
+    case CBM_TYPE_NAMED: type = cbm_type_named(arena, fact->name); break;
+    case CBM_TYPE_BUILTIN: type = cbm_type_builtin(arena, fact->name); break;
+    case CBM_TYPE_TYPE_PARAM: type = cbm_type_type_param(arena, fact->name); break;
+    case CBM_TYPE_TEMPLATE:
+        type = cbm_type_template(arena, fact->name, children, fact->count);
+        break;
+    case CBM_TYPE_UNION: type = cbm_type_union(arena, children, fact->count); break;
+    case CBM_TYPE_STRUCT: type = cbm_type_object_lit(arena, names, children, NULL, NULL); break;
+    case CBM_TYPE_FUNC:
+        if (fact->count) {
+            const CBMType *returns[] = {children[fact->count - 1], NULL};
+            children[fact->count - 1] = NULL;
+            names[fact->count - 1] = NULL;
+            type = cbm_type_func(arena, names, children, returns);
+        }
+        break;
+    default: break;
+    }
+    memo[index] = type;
+    return type;
+}
+
+static void ts_library_register(CBMTypeRegistry *reg, CBMArena *arena) {
+    const CBMType *memo[sizeof(ts_lib_types) / sizeof(ts_lib_types[0])] = {0};
+    for (int i = 0; ts_lib_owners[i]; i++) {
+        const char *owner = ts_lib_owners[i];
+        const char *fields[64] = {0};
+        const CBMType *field_types[64] = {0};
+        const char *methods[128] = {0}, *method_qns[128] = {0};
+        int field_count = 0, method_count = 0;
+        for (size_t j = 0; j < sizeof(ts_lib_members) / sizeof(ts_lib_members[0]); j++) {
+            const TSLibMember *member = &ts_lib_members[j];
+            if (strcmp(member->owner, owner) != 0)
+                continue;
+            const CBMType *type = ts_library_decode(arena, member->type, memo);
+            if (!member->method) {
+                if (field_count < 63) {
+                    fields[field_count] = member->name;
+                    field_types[field_count++] = type;
+                }
+                continue;
+            }
+            CBMRegisteredFunc func = {0};
+            func.receiver_type = owner;
+            func.short_name = member->name;
+            func.qualified_name = cbm_arena_sprintf(arena, "%s.%s", owner, member->name);
+            func.signature = type;
+            func.min_params = member->min;
+            cbm_registry_add_func(reg, func);
+            if (method_count < 127) {
+                methods[method_count] = member->name;
+                method_qns[method_count++] = func.qualified_name;
+            }
+        }
+        for (size_t j = 0; j < sizeof(ts_lib_bindings) / sizeof(ts_lib_bindings[0]); j++) {
+            const TSLibBinding *binding = &ts_lib_bindings[j];
+            if (strcmp(binding->owner, owner) == 0 && field_count < 63) {
+                fields[field_count] = binding->name;
+                field_types[field_count++] = ts_library_decode(arena, binding->type, memo);
+            }
+        }
+        CBMRegisteredType type = {0};
+        type.qualified_name = owner;
+        type.short_name = strrchr(owner, '.') + 1;
+        type.field_names = cbm_arena_alloc(arena, (size_t)(field_count + 1) * sizeof(*fields));
+        type.field_types = cbm_arena_alloc(arena, (size_t)(field_count + 1) * sizeof(*field_types));
+        type.method_names = cbm_arena_alloc(arena, (size_t)(method_count + 1) * sizeof(*methods));
+        type.method_qns = cbm_arena_alloc(arena, (size_t)(method_count + 1) * sizeof(*method_qns));
+        if (!type.field_names || !type.field_types || !type.method_names || !type.method_qns)
+            continue;
+        memcpy(type.field_names, fields, (size_t)(field_count + 1) * sizeof(*fields));
+        memcpy(type.field_types, field_types, (size_t)(field_count + 1) * sizeof(*field_types));
+        memcpy(type.method_names, methods, (size_t)(method_count + 1) * sizeof(*methods));
+        memcpy(type.method_qns, method_qns, (size_t)(method_count + 1) * sizeof(*method_qns));
+        cbm_registry_add_type(reg, type);
+    }
+}
+
+static const CBMType *ts_library_global(TSLSPContext *ctx, const char *name) {
+    for (size_t i = 0; i < sizeof(ts_lib_bindings) / sizeof(ts_lib_bindings[0]); i++) {
+        const TSLibBinding *binding = &ts_lib_bindings[i];
+        if (binding->owner[0] ||
+            (!(binding->env & ctx->library_environment) && binding->env != 3) ||
+            strcmp(name, binding->name) != 0)
+            continue;
+        const TSLibType *type = &ts_lib_types[binding->type];
+        if (type->kind == CBM_TYPE_NAMED)
+            return cbm_type_named(ctx->arena, type->name);
+    }
+    return NULL;
+}
 
 /* TEST HOOK: full per-file cross-registry builds (stdlib + every cross-file
  * def registered + finalized, per file). This is the sequential-mode quadratic
@@ -76,7 +220,9 @@ static void ts_type_budget_reset(size_t source_len) {
         long v = atol(e);
         g_ts_type_budget = (v > 0) ? v : -1;
     } else {
-        g_ts_type_budget = 1000000 + (long)source_len * 64;
+        g_ts_type_budget = source_len > (size_t)(LONG_MAX - 1000000) / 64
+                               ? LONG_MAX
+                               : 1000000 + (long)source_len * 64;
     }
     g_ts_type_budget_warned = false;
 }
@@ -286,7 +432,7 @@ static void ts_emit_resolved_call_reason_at(TSLSPContext *ctx, const char *calle
     rc.reason = reason;
     rc.kind = CBM_RESOLVED_INVOCATION;
     if (!ts_node_is_null(site)) {
-        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_start_byte = ts_node_start_byte(cbm_ts_call_start_node(site, ctx->source));
         rc.site_end_byte = ts_node_end_byte(site);
     }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
@@ -333,7 +479,7 @@ static void ts_emit_unresolved_call_at(TSLSPContext *ctx, const char *expr_text,
     rc.reason = reason;
     rc.kind = CBM_RESOLVED_INVOCATION;
     if (!ts_node_is_null(site)) {
-        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_start_byte = ts_node_start_byte(cbm_ts_call_start_node(site, ctx->source));
         rc.site_end_byte = ts_node_end_byte(site);
     }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
@@ -367,8 +513,9 @@ static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, cons
     /* Dynamic budget (see g_ts_type_budget): charge proportional to this
      * slice; on exhaustion degrade to UNKNOWN instead of grinding. */
     if (g_ts_type_budget >= 0) {
-        g_ts_type_budget -= 1 + (long)(len / 16);
-        if (g_ts_type_budget < 0) {
+        size_t charge = 1 + len / 16;
+        if (charge > (size_t)g_ts_type_budget) {
+            g_ts_type_budget = 0;
             if (!g_ts_type_budget_warned) {
                 g_ts_type_budget_warned = true;
                 fprintf(stderr,
@@ -378,6 +525,7 @@ static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, cons
             }
             return cbm_type_unknown();
         }
+        g_ts_type_budget -= (long)charge;
     }
 
     // Function type `(params) => returnType` (TS function type literal).
@@ -1454,6 +1602,14 @@ static const char *ts_import_export_name(const TSLSPContext *ctx, const char *lo
     return local;
 }
 
+static bool ts_has_named_import(const TSLSPContext *ctx, const char *local) {
+    for (int i = 0; i < ctx->import_alias_count; i++) {
+        if (strcmp(ctx->import_alias_locals[i], local) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* Full QN of an imported symbol. An import value is normally the module QN
  * (symbol = module + "." + name), but may already be the symbol QN. When the
  * module QN ends in ".name" the spelling is ambiguous: `Foo.ts` exporting
@@ -1465,6 +1621,16 @@ static const char *ts_import_export_name(const TSLSPContext *ctx, const char *lo
 static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn, const char *name) {
     if (!ctx || !module_qn || !name) {
         return NULL;
+    }
+    const char *library = ts_library_module(module_qn);
+    if (library) {
+        const char *package = strncmp(library, "__cbm_lib.playwright.", 21) == 0
+                                  ? "__cbm_lib.playwright"
+                                  : strcmp(name, "Buffer") == 0 ? "__cbm_lib.node"
+                                                               : "__cbm_lib.web";
+        const char *type = cbm_arena_sprintf(ctx->arena, "%s.%s", package, name);
+        if (cbm_registry_lookup_type(ctx->registry, type))
+            return type;
     }
     const char *appended = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
     size_t module_len = strlen(module_qn);
@@ -1484,11 +1650,17 @@ static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn,
  * suffix, overload-arity, or project-wide uniqueness fallback is admissible. */
 static const CBMRegisteredFunc *ts_exact_same_module_function(TSLSPContext *ctx, const char *name) {
     if (!ctx || !ctx->registry || !ctx->module_qn || !name ||
-        ts_scope_has_binding(ctx->current_scope, name)) {
+        ctx->isolated_page_context || ts_scope_has_binding(ctx->current_scope, name)) {
         return NULL;
     }
     const char *full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
     return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
+}
+
+static bool ts_node_require_available(const TSLSPContext *ctx) {
+    return ctx && !ctx->isolated_page_context && !ctx->require_shadowed &&
+           ctx->written_functions && !cbm_scope_contains(ctx->written_functions, "require") &&
+           !ts_scope_has_binding(ctx->current_scope, "require");
 }
 
 /* Return a function only when the local import binding maps to one unambiguous
@@ -1500,7 +1672,8 @@ static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, co
         return NULL;
     }
     const char *matched_module = NULL;
-    for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
+    for (int i = ctx->isolated_page_context ? -1 : ts_import_first(ctx, name); i >= 0;
+         i = ts_import_next(ctx, name, i)) {
         const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *module_qn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !module_qn || strcmp(local, name) != 0) {
@@ -1520,7 +1693,8 @@ static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, co
 }
 
 static void ts_block_shadowed_reference_usage(TSLSPContext *ctx, const char *name, TSNode site) {
-    if (!ctx || !ctx->usages || !name || !ctx->enclosing_func_qn || ts_node_is_null(site)) {
+    if (!ctx || ctx->collecting_callback_facts || !ctx->usages || !name ||
+        !ctx->enclosing_func_qn || ts_node_is_null(site)) {
         return;
     }
     const CBMScope *binding_scope = ts_scope_binding_owner(ctx->current_scope, name);
@@ -1536,7 +1710,8 @@ static void ts_block_shadowed_reference_usage(TSLSPContext *ctx, const char *nam
             strcmp(usage->enclosing_func_qn, ctx->enclosing_func_qn) == 0 &&
             usage->site_start_byte == start && usage->site_end_byte == end) {
             usage->semantic_reference_blocked = true;
-            usage->semantic_reference_local_shadow = binding_scope->parent != NULL;
+            usage->semantic_reference_local_shadow |=
+                ctx->isolated_page_context || binding_scope->parent != NULL;
             return;
         }
     }
@@ -1555,12 +1730,21 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
     // and look it up in the registry. If it's a registered func, return its signature;
     // if it's a registered type, return NAMED. Falls back to NAMED(module_qn) for
     // namespace-style imports where no specific symbol matches.
-    for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
+    for (int i = ctx->isolated_page_context ? -1 : ts_import_first(ctx, name); i >= 0;
+         i = ts_import_next(ctx, name, i)) {
         const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !mqn || strcmp(local, name) != 0)
             continue;
 
+        const char *library = ts_library_module(mqn);
+        if (library && ts_has_named_import(ctx, name)) {
+            const char *member = ts_import_export_name(ctx, name);
+            const CBMType *value = lookup_member_type(
+                ctx, cbm_type_named(ctx->arena, library), member);
+            if (!cbm_type_is_unknown(value))
+                return value;
+        }
         // Construct the full symbol QN using the same convention as exact
         // imported function-value resolution.
         const char *full_qn = ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, name));
@@ -1575,11 +1759,11 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
 
         // No specific match — fall back to NAMED(module_qn), which is correct for
         // namespace-style imports (`import * as foo from './foo'`).
-        return cbm_type_named(ctx->arena, mqn);
+        return cbm_type_named(ctx->arena, library ? library : mqn);
     }
 
     // Module-local function or class.
-    if (ctx->module_qn) {
+    if (ctx->module_qn && !ctx->isolated_page_context) {
         const char *candidate = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, candidate);
         if (rt)
@@ -1588,6 +1772,10 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
         if (f && f->signature)
             return f->signature;
     }
+
+    const CBMType *global = ts_library_global(ctx, name);
+    if (global)
+        return global;
 
     // Global / stdlib bare-name lookup (Promise, Array, Map, Set, console, JSON, Object, ...).
     // The TS stdlib registers these with QN equal to the bare name.
@@ -1605,11 +1793,11 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
 
 // Map BUILTIN type names to their wrapper class for method dispatch.
 // `"x".split(...)` works because TS treats string primitives as having String prototype.
-static const char *builtin_wrapper_class(const char *builtin_name) {
+static const char *builtin_wrapper_class(TSLSPContext *ctx, const char *builtin_name) {
     if (!builtin_name)
         return NULL;
     if (strcmp(builtin_name, "string") == 0)
-        return "String";
+        return ctx->has_library_facts ? "__cbm_lib.ecma.String" : "String";
     if (strcmp(builtin_name, "number") == 0)
         return "Number";
     if (strcmp(builtin_name, "boolean") == 0)
@@ -1703,7 +1891,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
 
     // BUILTIN primitives delegate to their wrapper class (e.g. string → String).
     if (base->kind == CBM_TYPE_BUILTIN) {
-        const char *wrap = builtin_wrapper_class(base->data.builtin.name);
+        const char *wrap = builtin_wrapper_class(ctx, base->data.builtin.name);
         if (wrap) {
             const CBMType *wrapped = cbm_type_named(ctx->arena, wrap);
             return lookup_member_type_at(ctx, wrapped, name, depth + 1, state);
@@ -1945,7 +2133,7 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
 
     // BUILTIN primitives → look up via the wrapper class (string → String, etc.).
     if (base->kind == CBM_TYPE_BUILTIN) {
-        const char *wrap = builtin_wrapper_class(base->data.builtin.name);
+        const char *wrap = builtin_wrapper_class(ctx, base->data.builtin.name);
         if (wrap) {
             const CBMType *wrapped = cbm_type_named(ctx->arena, wrap);
             return lookup_method_at(ctx, wrapped, method_name, depth + 1, state);
@@ -2052,14 +2240,15 @@ static const CBMRegisteredFunc *ts_lookup_symbol_for_call(TSLSPContext *ctx, con
     if (!ctx || !ctx->registry || !module_qn || !symbol_name)
         return NULL;
 
-    /* Import maps may carry either a module QN or an already-qualified symbol
-     * QN.  The registry overload APIs accept the former, so strip one exact
-     * trailing `.symbol` before lookup instead of producing x.symbol.symbol. */
+    /* Import maps may carry either a module QN or a symbol QN. Let the
+     * registry distinguish target.js exporting target from a symbol QN
+     * before stripping the suffix required by the overload APIs. */
     const char *lookup_module = module_qn;
     size_t module_len = strlen(module_qn);
     size_t symbol_len = strlen(symbol_name);
     if (module_len > symbol_len + 1 && module_qn[module_len - symbol_len - 1] == '.' &&
-        strcmp(module_qn + module_len - symbol_len, symbol_name) == 0) {
+        strcmp(module_qn + module_len - symbol_len, symbol_name) == 0 &&
+        ts_import_symbol_qn(ctx, module_qn, symbol_name) == module_qn) {
         lookup_module = cbm_arena_strndup(ctx->arena, module_qn, module_len - symbol_len - 1);
     }
 
@@ -2085,7 +2274,7 @@ static const char *ts_import_module_for_local(TSLSPContext *ctx, const char *loc
                                               bool *out_matched) {
     if (out_matched)
         *out_matched = false;
-    if (!ctx || !local_name)
+    if (!ctx || !local_name || ctx->isolated_page_context)
         return NULL;
     const char *matched = NULL;
     for (int i = ts_import_first(ctx, local_name); i >= 0; i = ts_import_next(ctx, local_name, i)) {
@@ -2102,6 +2291,153 @@ static const char *ts_import_module_for_local(TSLSPContext *ctx, const char *loc
     return matched;
 }
 
+static bool ts_node_builtin_name(const char *name, size_t length) {
+    static const char *const builtins[] = {
+        "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+        "console", "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises", "domain",
+        "events", "fs", "fs/promises", "http", "http2", "https", "inspector", "module", "net",
+        "os", "path", "path/posix", "path/win32", "perf_hooks", "process", "punycode",
+        "querystring", "readline", "readline/promises", "repl", "stream", "stream/consumers",
+        "stream/promises", "stream/web", "string_decoder", "sys", "timers", "timers/promises",
+        "tls", "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi",
+        "worker_threads", "zlib"
+    };
+    for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
+        if (strlen(builtins[i]) == length && memcmp(name, builtins[i], length) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool ts_module_is_node_builtin(const char *module) {
+    return module && (strncmp(module, "node:", 5) == 0 ||
+                      ts_node_builtin_name(module, strlen(module)));
+}
+
+static bool ts_source_is(TSLSPContext *ctx, TSNode node, const char *text) {
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    return !ts_node_is_null(node) && end - start == strlen(text) &&
+           memcmp(ctx->source + start, text, end - start) == 0;
+}
+
+typedef enum { TS_LOAD_NONE, TS_LOAD_BUILTIN, TS_LOAD_RELATIVE } TSNodeLoad;
+
+static TSNodeLoad ts_node_load(TSLSPContext *ctx, TSNode call) {
+    if (!node_kind_is(call, "call_expression") ||
+        !ts_source_is(ctx, ts_node_child_by_field_name(call, "function", TS_LSP_FIELD_LEN("function")),
+                      "require") ||
+        !ts_node_is_null(ts_node_child_by_field_name(call, "optional_chain",
+                                                     TS_LSP_FIELD_LEN("optional_chain"))))
+        return TS_LOAD_NONE;
+    TSNode args = ts_node_child_by_field_name(call, "arguments", TS_LSP_FIELD_LEN("arguments"));
+    TSNode arg = ts_node_named_child(args, 0);
+    if (ts_node_named_child_count(args) != 1 || !node_kind_is(arg, "string"))
+        return TS_LOAD_NONE;
+    uint32_t start = ts_node_start_byte(arg), length = ts_node_end_byte(arg) - start;
+    const char *source = ctx->source + start;
+    if (((length >= 4 && memcmp(source + 1, "./", 2) == 0) ||
+         (length >= 5 && memcmp(source + 1, "../", 3) == 0)) &&
+        !memchr(source + 1, '\\', length - 2))
+        return TS_LOAD_RELATIVE;
+    if (length < sizeof("'node:a'") - 1 || memcmp(source + 1, "node:", 5) != 0)
+        return TS_LOAD_NONE;
+    size_t name_length = length - 7;
+    if (ts_node_builtin_name(source + 6, name_length) ||
+        (name_length == 4 && memcmp(source + 6, "test", 4) == 0))
+        return TS_LOAD_BUILTIN;
+    return TS_LOAD_NONE;
+}
+
+static bool ts_node_load_binding(TSNode pattern) {
+    if (node_kind_is(pattern, "identifier"))
+        return true;
+    if (!node_kind_is(pattern, "object_pattern"))
+        return false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(pattern); ++i) {
+        TSNode item = ts_node_named_child(pattern, i);
+        if (!node_kind_is(item, "shorthand_property_identifier_pattern") &&
+            !(node_kind_is(item, "pair_pattern") &&
+              node_kind_is(ts_node_child_by_field_name(item, "key", TS_LSP_FIELD_LEN("key")),
+                           "property_identifier") &&
+              node_kind_is(ts_node_child_by_field_name(item, "value", TS_LSP_FIELD_LEN("value")),
+                           "identifier")))
+            return false;
+    }
+    return true;
+}
+
+static uint32_t ts_leading_commonjs_loads(TSLSPContext *ctx, TSNode root) {
+    if (!ctx->js_mode || !ctx->file_defs || !ctx->file_defs->count || ts_node_has_error(root))
+        return 0;
+    const CBMDefinition *mod = &ctx->file_defs->items[0];
+    const char *path = mod->file_path;
+    size_t length = path ? strlen(path) : 0;
+    if (length < 4 || strcmp(path + length - 4, ".cjs") != 0 ||
+        !mod->label || strcmp(mod->label, "Module") != 0)
+        return 0;
+    // Earlier user code or an unknown module could replace the loader.
+    uint32_t end = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(root); ++i) {
+        TSNode statement = ts_node_named_child(root, i);
+        if (ts_node_is_extra(statement) || node_kind_is(statement, "hash_bang_line") ||
+            node_kind_is(statement, "function_declaration") ||
+            (node_kind_is(statement, "expression_statement") &&
+             node_kind_is(ts_node_named_child(statement, 0), "string")))
+            continue;
+        if (!node_kind_is(statement, "lexical_declaration") ||
+            !node_kind_is(ts_node_child(statement, 0), "const"))
+            break;
+        for (uint32_t j = 0; j < ts_node_named_child_count(statement); ++j) {
+            TSNode decl = ts_node_named_child(statement, j);
+            if (ts_node_is_extra(decl))
+                continue;
+            TSNode value = ts_node_child_by_field_name(decl, "value", TS_LSP_FIELD_LEN("value"));
+            TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
+            if (node_kind_is(name, "identifier") && node_kind_is(value, "array") &&
+                ts_node_named_child_count(value) == 0)
+                continue;
+            if (!ts_node_load_binding(name))
+                return end;
+            TSNodeLoad load = ts_node_load(ctx, value);
+            if (load != TS_LOAD_NONE) {
+                end = ts_node_end_byte(value);
+                // The relative module can change loader state before the next initializer.
+                if (load == TS_LOAD_RELATIVE)
+                    return end;
+                continue;
+            }
+            // The receiver's load precedes property access and argument evaluation.
+            if (node_kind_is(value, "call_expression"))
+                value = ts_node_child_by_field_name(value, "function", TS_LSP_FIELD_LEN("function"));
+            if (node_kind_is(value, "member_expression")) {
+                TSNode receiver = ts_node_child_by_field_name(value, "object",
+                                                              TS_LSP_FIELD_LEN("object"));
+                if (ts_node_load(ctx, receiver) != TS_LOAD_NONE)
+                    return ts_node_end_byte(receiver);
+            }
+            return end;
+        }
+    }
+    return end;
+}
+
+static bool ts_commonjs_prefix_contains(TSLSPContext *ctx, TSNode call) {
+    if (ts_node_end_byte(call) > ctx->commonjs_load_end || ts_node_load(ctx, call) == TS_LOAD_NONE)
+        return false;
+    // A hoisted function can contain a call before the prefix's end byte and execute later.
+    TSNode statement = call;
+    TSNode parent = ts_node_parent(statement);
+    while (!ts_node_is_null(parent) && !ts_node_eq(parent, ctx->file_root)) {
+        statement = parent;
+        parent = ts_node_parent(statement);
+    }
+    return !ts_node_is_null(parent) && node_kind_is(statement, "lexical_declaration");
+}
+
+static bool ts_import_is_node_builtin(TSLSPContext *ctx, const char *local_name) {
+    return ts_module_is_node_builtin(ts_import_module_for_local(ctx, local_name, NULL));
+}
+
 /* Type of `new C()` for a bare class name, in TS scoping order: a class
  * declared in this module, else the class an unambiguous import binding
  * names, else the historical current-module spelling. Without the import
@@ -2113,13 +2449,20 @@ static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cnam
     if (!ctx->module_qn)
         return cbm_type_named(ctx->arena, cname);
     const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-    if (cbm_registry_lookup_type(ctx->registry, local_qn))
+    if (!ctx->isolated_page_context && cbm_registry_lookup_type(ctx->registry, local_qn))
         return cbm_type_named(ctx->arena, local_qn);
     bool import_matched = false;
     const char *import_module = ts_import_module_for_local(ctx, cname, &import_matched);
     if (import_module)
         return cbm_type_named(
             ctx->arena, ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, cname)));
+    if (!ts_scope_has_binding(ctx->current_scope, cname)) {
+        const CBMType *global = ts_library_global(ctx, cname);
+        if (global)
+            return global;
+    }
+    if (ctx->isolated_page_context)
+        return cbm_type_unknown();
     return cbm_type_named(ctx->arena, local_qn);
 }
 
@@ -2149,6 +2492,11 @@ static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, cons
     if (out_is_import)
         *out_is_import = import_matched;
     if (import_matched) {
+        if (ts_library_module(import_module)) {
+            if (out_is_import)
+                *out_is_import = false;
+            return NULL; // external module values use the declaration's member types
+        }
         /* An import binding lexically shadows a same-named local namespace.
          * Ambiguous imports and missing imported symbols both fail closed. */
         return import_module ? ts_lookup_symbol_for_call(ctx, import_module, method_name, args)
@@ -2158,7 +2506,7 @@ static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, cons
      * App`, `Utils.fn()` addresses App.Utils.fn, not a typed instance named
      * Utils. Require an exact registered function so ordinary unknown objects
      * still fall through to receiver-type dispatch. */
-    if (ctx && ctx->module_qn && object_name) {
+    if (ctx && !ctx->isolated_page_context && ctx->module_qn && object_name) {
         const char *local_module =
             cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, object_name);
         return local_module ? ts_lookup_symbol_for_call(ctx, local_module, method_name, args)
@@ -2195,10 +2543,220 @@ static const CBMType *ts_method_signature_for_receiver(TSLSPContext *ctx, const 
 /* Return the function signature selected at this call site.  This is the
  * single boundary shared by chained return typing and contextual callback
  * typing; both must observe the same overload as edge resolution. */
-static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args) {
-    if (!ctx || ts_node_is_null(function))
+static const CBMCompilerSite *ts_compiler_site(TSLSPContext *ctx, TSNode node) {
+    if (!ctx->compiler_facts || ts_node_is_null(node))
+        return NULL;
+    return cbm_compiler_facts_find(ctx->compiler_facts, ctx->compiler_path,
+                                   ctx->compiler_sha256,
+                                   ts_node_start_byte(cbm_ts_call_start_node(node, ctx->source)),
+                                   ts_node_end_byte(node));
+}
+
+static const CBMCompilerContextParams *ts_compiler_callback(const CBMCompilerSite *site,
+                                                            uint32_t argument) {
+    if (site && site->proof_partial && !site->types_authoritative)
+        return NULL;
+    for (size_t i = 0; site && i < site->contextual_param_count; i++) {
+        if (site->contextual_params[i].argument == argument)
+            return &site->contextual_params[i];
+    }
+    return NULL;
+}
+
+static const CBMType *ts_compiler_callback_type(TSLSPContext *ctx,
+                                                const CBMCompilerContextParams *parameters,
+                                                const CBMType *fallback) {
+    if (!parameters)
+        return fallback;
+    size_t native_count = 0;
+    if (fallback && fallback->kind == CBM_TYPE_FUNC && fallback->data.func.param_types) {
+        while (fallback->data.func.param_types[native_count])
+            native_count++;
+    }
+    size_t count = parameters->parameter_count;
+    const char **names = cbm_arena_alloc(ctx->arena, (count + 1) * sizeof(*names));
+    const CBMType **types = cbm_arena_alloc(ctx->arena, (count + 1) * sizeof(*types));
+    if (!names || !types)
+        return fallback;
+    for (size_t i = 0; i < count; i++) {
+        names[i] = parameters->param_names[i];
+        const CBMType *type = parameters->param_types[i];
+        types[i] = !cbm_type_is_unknown(type) ? type
+                     : i < native_count ? fallback->data.func.param_types[i]
+                                        : cbm_type_unknown();
+    }
+    names[count] = NULL;
+    types[count] = NULL;
+    const CBMType **returns = fallback && fallback->kind == CBM_TYPE_FUNC
+                                 ? fallback->data.func.return_types : NULL;
+    return cbm_type_func(ctx->arena, names, types, returns);
+}
+
+static bool ts_page_global_object(TSLSPContext *ctx, TSNode object) {
+    if (!node_kind_is(object, "identifier"))
+        return false;
+    const char *name = node_text(ctx, object);
+    return !name || strcmp(name, "window") == 0 || strcmp(name, "globalThis") == 0 ||
+           strcmp(name, "self") == 0 || strchr(name, '\\');
+}
+
+static bool ts_page_fetch_key(TSLSPContext *ctx, TSNode node) {
+    const char *key = node_kind_is(node, "string") ? node_text(ctx, node) : NULL;
+    return !key || strcmp(key, "'fetch'") == 0 || strcmp(key, "\"fetch\"") == 0 ||
+           strchr(key, '\\');
+}
+
+static bool ts_page_fetch_target(TSLSPContext *ctx, TSNode target, bool write, unsigned depth) {
+    if (ts_node_is_null(target))
+        return false;
+    if (depth == TS_LSP_MAX_EVAL_DEPTH)
+        return true;
+    if (node_kind_is(target, "identifier") || node_kind_is(target, "type_identifier") ||
+        node_kind_is(target, "shorthand_property_identifier_pattern")) {
+        uint32_t start = ts_node_start_byte(target);
+        uint32_t length = ts_node_end_byte(target) - start;
+        const char *name = ctx->source + start;
+        return (length == 5 && memcmp(name, "fetch", 5) == 0) || memchr(name, '\\', length);
+    }
+    if (write && (node_kind_is(target, "member_expression") ||
+                  node_kind_is(target, "subscript_expression"))) {
+        TSNode object = ts_node_child_by_field_name(target, "object", TS_LSP_FIELD_LEN("object"));
+        if (!ts_page_global_object(ctx, object))
+            return false;
+        TSNode property = ts_node_child_by_field_name(target, "property",
+                                                      TS_LSP_FIELD_LEN("property"));
+        if (!ts_node_is_null(property)) {
+            const char *name = node_text(ctx, property);
+            return !name || strcmp(name, "fetch") == 0 || strchr(name, '\\');
+        }
+        TSNode index = ts_node_child_by_field_name(target, "index", TS_LSP_FIELD_LEN("index"));
+        return ts_page_fetch_key(ctx, index);
+    }
+    const char *field = NULL;
+    if (node_kind_is(target, "pair_pattern"))
+        field = "value";
+    else if (node_kind_is(target, "assignment_pattern") ||
+             node_kind_is(target, "object_assignment_pattern"))
+        field = "left";
+    if (field) {
+        TSNode child = ts_node_child_by_field_name(target, field, (uint32_t)strlen(field));
+        return ts_page_fetch_target(ctx, child, write, depth + 1);
+    }
+    if (node_kind_is(target, "object_pattern") || node_kind_is(target, "array_pattern") ||
+        node_kind_is(target, "rest_pattern") || node_kind_is(target, "parenthesized_expression")) {
+        uint32_t count = ts_node_named_child_count(target);
+        for (uint32_t i = 0; i < count; i++) {
+            if (ts_page_fetch_target(ctx, ts_node_named_child(target, i), write, depth + 1))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool ts_page_fetch_reflective_write(TSLSPContext *ctx, TSNode call) {
+    TSNode args = ts_node_child_by_field_name(call, "arguments", TS_LSP_FIELD_LEN("arguments"));
+    if (ts_node_named_child_count(args) < 2 ||
+        !ts_page_global_object(ctx, ts_node_named_child(args, 0)))
+        return false;
+    TSNode callee = ts_node_child_by_field_name(call, "function", TS_LSP_FIELD_LEN("function"));
+    if (!node_kind_is(callee, "member_expression"))
+        return false;
+    TSNode object = ts_node_child_by_field_name(callee, "object", TS_LSP_FIELD_LEN("object"));
+    TSNode property = ts_node_child_by_field_name(callee, "property", TS_LSP_FIELD_LEN("property"));
+    const char *base = node_text(ctx, object);
+    const char *method = node_text(ctx, property);
+    if (!base || !method)
+        return true;
+    bool mutation = (strcmp(base, "Object") == 0 && strcmp(method, "defineProperty") == 0) ||
+                    (strcmp(base, "Reflect") == 0 &&
+                     (strcmp(method, "set") == 0 || strcmp(method, "defineProperty") == 0 ||
+                      strcmp(method, "deleteProperty") == 0));
+    return mutation && ts_page_fetch_key(ctx, ts_node_named_child(args, 1));
+}
+
+/* shortcut: a declaration or direct global write anywhere in this serialized
+ * callback blocks fetch. Recover safe sibling scopes when their sites need it. */
+static bool ts_page_fetch_blocked(TSLSPContext *ctx, TSNode callback) {
+    unsigned remaining = 4096;
+    bool blocked = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(callback);
+    while (remaining--) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *field = NULL;
+        bool write = false;
+        if (node_kind_is(node, "variable_declarator") ||
+            node_kind_is(node, "class_declaration") || node_kind_is(node, "function_declaration") ||
+            node_kind_is(node, "function_expression") ||
+            node_kind_is(node, "generator_function_declaration") ||
+            node_kind_is(node, "generator_function")) {
+            field = "name";
+        } else if (node_kind_is(node, "catch_clause")) {
+            field = "parameter";
+        } else if (node_kind_is(node, "assignment_expression") ||
+                   node_kind_is(node, "augmented_assignment_expression") ||
+                   node_kind_is(node, "for_in_statement")) {
+            field = "left";
+            write = true;
+        } else if (node_kind_is(node, "update_expression") ||
+                   (node_kind_is(node, "unary_expression") &&
+                    node_kind_is(ts_node_child(node, 0), "delete"))) {
+            field = "argument";
+            write = true;
+        } else if (node_kind_is(node, "call_expression") && ts_page_fetch_reflective_write(ctx, node)) {
+            break;
+        }
+        if (field && ts_page_fetch_target(ctx, ts_node_child_by_field_name(
+                                              node, field, (uint32_t)strlen(field)), write, 0))
+            break;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                blocked = false;
+                goto done;
+            }
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    return blocked;
+}
+
+static const CBMRegisteredFunc *ts_page_fetch(TSLSPContext *ctx, const char *name) {
+    if (!ctx->isolated_page_context || ctx->page_fetch_blocked || !name || strcmp(name, "fetch") != 0 ||
+        ts_scope_has_binding(ctx->current_scope, name))
+        return NULL;
+    return cbm_registry_lookup_func(ctx->registry, "Window.fetch");
+}
+
+static const CBMType *ts_page_fetch_then_signature(TSLSPContext *ctx, TSNode object,
+                                                   const CBMType *receiver,
+                                                   const CBMRegisteredFunc *method) {
+    if (!ctx->isolated_page_context || !method || !method->qualified_name ||
+        strcmp(method->qualified_name, "Promise.then") != 0 ||
+        !receiver || receiver->kind != CBM_TYPE_TEMPLATE ||
+        receiver->data.template_type.arg_count != 1 ||
+        !receiver->data.template_type.template_args || !node_kind_is(object, "call_expression"))
+        return NULL;
+    TSNode callee = ts_node_child_by_field_name(object, "function", TS_LSP_FIELD_LEN("function"));
+    if (!node_kind_is(callee, "identifier") || !ts_page_fetch(ctx, node_text(ctx, callee)))
         return NULL;
 
+    const CBMType *value = receiver->data.template_type.template_args[0];
+    const CBMType *unknown = cbm_type_unknown();
+    const CBMType *on_fulfilled = cbm_type_func(
+        ctx->arena, (const char *[]){"value", NULL}, (const CBMType *[]){value, NULL},
+        (const CBMType *[]){unknown, NULL});
+    /* The handler can replace the value before the next then. */
+    const CBMType *result = cbm_type_template(ctx->arena, "Promise",
+                                              (const CBMType *[]){unknown, NULL}, 1);
+    return cbm_type_func(ctx->arena, (const char *[]){"onfulfilled", NULL},
+                         (const CBMType *[]){on_fulfilled, NULL},
+                         (const CBMType *[]){result, NULL});
+}
+
+static const CBMType *ts_native_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args,
+                                                  const CBMCompilerSite *site) {
     if (node_kind_is(function, "member_expression")) {
         TSNode object = ts_node_child_by_field_name(function, "object", TS_LSP_FIELD_LEN("object"));
         TSNode property =
@@ -2221,8 +2779,13 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
             }
         }
 
-        const CBMType *recv = ts_eval_expr_type(ctx, object);
+        const CBMType *recv = site && (!site->proof_partial || site->types_authoritative) &&
+                                      !cbm_type_is_unknown(site->receiver)
+                                  ? site->receiver : ts_eval_expr_type(ctx, object);
         const CBMRegisteredFunc *method = ts_lookup_method_for_call(ctx, recv, method_name, args);
+        const CBMType *page_signature = ts_page_fetch_then_signature(ctx, object, recv, method);
+        if (page_signature)
+            return page_signature;
         const CBMType *signature = ts_method_signature_for_receiver(ctx, recv, method);
         /* Callable fields still use ordinary member typing. Reuse the receiver
          * already evaluated above so deep fluent chains remain linear. */
@@ -2233,9 +2796,12 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
         char *name = node_text(ctx, function);
         if (name && ts_scope_has_binding(ctx->current_scope, name))
             return type_of_identifier(ctx, name);
+        const CBMRegisteredFunc *page_fetch = ts_page_fetch(ctx, name);
+        if (page_fetch)
+            return page_fetch->signature;
         if (name) {
             const CBMRegisteredFunc *registered = NULL;
-            if (ctx->module_qn)
+            if (ctx->module_qn && !ctx->isolated_page_context)
                 registered = ts_lookup_symbol_for_call(ctx, ctx->module_qn, name, args);
             if (!registered) {
                 const char *module_qn = ts_import_module_for_local(ctx, name, NULL);
@@ -2249,6 +2815,77 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
     }
 
     return ts_eval_expr_type(ctx, function);
+}
+
+/* Shallow proof rows can leave anonymous callback or return slots unknown. */
+static const CBMType *ts_compiler_signature_fallback(TSLSPContext *ctx, const CBMType *compiler,
+                                                     const CBMType *native, unsigned depth) {
+    if (cbm_type_is_unknown(compiler))
+        return native ? native : compiler;
+    if (!native || compiler == native || compiler->kind != CBM_TYPE_FUNC ||
+        native->kind != CBM_TYPE_FUNC)
+        return compiler;
+    if (depth >= TS_LSP_MAX_EVAL_DEPTH)
+        return compiler;
+
+    const CBMType **proof_slots[] = {
+        compiler->data.func.param_types, compiler->data.func.return_types};
+    const CBMType **native_slots[] = {
+        native->data.func.param_types, native->data.func.return_types};
+    const CBMType **merged[2] = {0};
+    size_t counts[2] = {0}, proof_names = 0, native_names = 0;
+    bool changed = false;
+    for (size_t slot = 0; slot < 2; slot++) {
+        size_t proof_count = 0, native_count = 0;
+        while (proof_slots[slot] && proof_slots[slot][proof_count])
+            proof_count++;
+        while (native_slots[slot] && native_slots[slot][native_count])
+            native_count++;
+        counts[slot] = proof_count;
+        merged[slot] = cbm_arena_alloc(ctx->arena, (counts[slot] + 1) * sizeof(**merged));
+        if (!merged[slot])
+            return compiler;
+        for (size_t i = 0; i < counts[slot]; i++) {
+            const CBMType *proof = proof_slots[slot][i];
+            const CBMType *fallback = i < native_count ? native_slots[slot][i] : NULL;
+            merged[slot][i] = ts_compiler_signature_fallback(ctx, proof, fallback, depth + 1);
+            changed |= merged[slot][i] != proof;
+        }
+        merged[slot][counts[slot]] = NULL;
+    }
+    if (!changed)
+        return compiler;
+    while (compiler->data.func.param_names && compiler->data.func.param_names[proof_names])
+        proof_names++;
+    while (native->data.func.param_names && native->data.func.param_names[native_names])
+        native_names++;
+    const char **names = cbm_arena_alloc(ctx->arena, (counts[0] + 1) * sizeof(*names));
+    if (!names)
+        return compiler;
+    for (size_t i = 0; i < counts[0]; i++)
+        names[i] = i < proof_names ? compiler->data.func.param_names[i]
+                     : i < native_names ? native->data.func.param_names[i] : "";
+    names[counts[0]] = NULL;
+    return cbm_type_func(ctx->arena, names, merged[0], merged[1]);
+}
+
+static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, TSNode args) {
+    if (!ctx || ts_node_is_null(function))
+        return NULL;
+    const CBMCompilerSite *site = ts_compiler_site(ctx, function);
+    /* A nested call is an expression whose type is the inner return value. */
+    if (site && (site->callee_start_byte !=
+                     ts_node_start_byte(cbm_ts_call_start_node(function, ctx->source)) ||
+                 site->callee_end_byte != ts_node_end_byte(function)))
+        site = NULL;
+    if (site && (!site->proof_partial || site->types_authoritative) &&
+        site->signature && site->signature->kind == CBM_TYPE_FUNC) {
+        if (!site->proof_partial)
+            return site->signature;
+        return ts_compiler_signature_fallback(
+            ctx, site->signature, ts_native_signature_for_call(ctx, function, args, site), 0);
+    }
+    return ts_native_signature_for_call(ctx, function, args, site);
 }
 
 // Pull the underlying return type out of a FUNC signature, collapsing single-element
@@ -2270,9 +2907,45 @@ static const CBMType *return_type_of(CBMArena *arena, const CBMType *sig) {
     return cbm_type_tuple(arena, sig->data.func.return_types, count);
 }
 
+static bool ts_await_operator_call(TSNode call, const char *source);
+
+static const CBMType *ts_unwrap_promise(const CBMType *type) {
+    if (type && type->kind == CBM_TYPE_TEMPLATE && type->data.template_type.template_name &&
+        strcmp(type->data.template_type.template_name, "Promise") == 0 &&
+        type->data.template_type.arg_count >= 1 && type->data.template_type.template_args)
+        return type->data.template_type.template_args[0];
+    return type;
+}
+
+static const CBMType *ts_await_chain_result(TSLSPContext *ctx, TSNode node,
+                                          const CBMType *type) {
+    const CBMType *awaited = ts_unwrap_promise(type);
+    if (awaited == type)
+        return type;
+    TSNode parent = ts_node_parent(node);
+    if (node_kind_is(parent, "call_expression") || node_kind_is(parent, "member_expression") ||
+        node_kind_is(parent, "subscript_expression")) {
+        const char *field = node_kind_is(parent, "call_expression") ? "function" : "object";
+        if (ts_node_eq(node, ts_node_child_by_field_name(parent, field, (uint32_t)strlen(field))))
+            return type;
+    }
+    // A recovered await applies to the entire chain, including its final result.
+    return ts_node_eq(node, cbm_ts_call_start_node(node, ctx->source)) ? type : awaited;
+}
+
 const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
+    if (node_kind_is(node, "call_expression") || node_kind_is(node, "new_expression")) {
+        const CBMCompilerSite *site = ts_compiler_site(ctx, node);
+        if (site && (!site->proof_partial || site->types_authoritative) &&
+            site->signature && site->signature->kind == CBM_TYPE_FUNC) {
+            const CBMType *result = return_type_of(ctx->arena, site->signature);
+            if (!cbm_type_is_unknown(result) &&
+                (!site->proof_partial || result->kind != CBM_TYPE_FUNC))
+                return ts_await_chain_result(ctx, node, result);
+        }
+    }
     /* Memo hit: O(1), charges no budget, ignores depth — the value came from a
      * completed, non-degraded evaluation of this exact node. */
     {
@@ -2295,8 +2968,8 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
          * charges accordingly — otherwise the default per-file budget still
          * permits ~12 s of evaluation on a crafted file. Normal files run
          * hundreds-to-thousands of entries, far under any budget. */
-        g_ts_type_budget -= 16;
-        if (g_ts_type_budget < 0) {
+        if (g_ts_type_budget < 16) {
+            g_ts_type_budget = 0;
             if (!g_ts_type_budget_warned) {
                 g_ts_type_budget_warned = true;
                 fprintf(stderr, "  [tslsp] expression-eval budget exhausted; degrading to "
@@ -2305,6 +2978,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
             g_ts_eval_degraded++;
             return cbm_type_unknown();
         }
+        g_ts_type_budget -= 16;
     }
     ctx->eval_depth++;
     /* Snapshot for the memo-store guard: any degraded return in this subtree
@@ -2373,6 +3047,36 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(fn)) {
             TSNode call_args =
                 ts_node_child_by_field_name(node, "arguments", TS_LSP_FIELD_LEN("arguments"));
+            if (node_kind_is(fn, "identifier") && ts_node_named_child_count(call_args) == 1 &&
+                ts_await_operator_call(node, ctx->source)) {
+                TSNode member = ts_node_parent(node);
+                if (node_kind_is(member, "member_expression") &&
+                    ts_node_eq(node, ts_node_child_by_field_name(member, "object",
+                                                               TS_LSP_FIELD_LEN("object")))) {
+                    /* In await (value).member, await applies to the member access. */
+                    result = ts_eval_expr_type(ctx, ts_node_named_child(call_args, 0));
+                    goto evaluated;
+                }
+            }
+            if (node_kind_is(fn, "identifier") && ts_node_require_available(ctx)) {
+                char *name = node_text(ctx, fn);
+                TSNode arg = ts_node_named_child(call_args, 0);
+                if (name && strcmp(name, "require") == 0 && node_kind_is(arg, "string")) {
+                    char *quoted = node_text(ctx, arg);
+                    size_t length = quoted ? strlen(quoted) : 0;
+                    const char *module = length >= 2
+                                             ? cbm_arena_strndup(ctx->arena, quoted + 1, length - 2)
+                                             : NULL;
+                    const char *library = ts_library_module(module);
+                    if (library || ts_module_is_node_builtin(module))
+                        ctx->library_environment = 1;
+                    if (library) {
+                        ctx->has_library_facts = true;
+                        result = cbm_type_named(ctx->arena, library);
+                        goto evaluated;
+                    }
+                }
+            }
             const CBMType *fn_type = ts_signature_for_call(ctx, fn, call_args);
             if (ctx->debug) {
                 fprintf(stderr, "[ts_lsp] eval call_expression: fn_kind=%s fn_type_kind=%d\n",
@@ -2449,15 +3153,7 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
         }
     } else if (strcmp(kind, "await_expression") == 0) {
         TSNode inner = ts_node_named_child(node, 0);
-        const CBMType *t = ts_eval_expr_type(ctx, inner);
-        // Promise<T> → T.
-        if (t && t->kind == CBM_TYPE_TEMPLATE && t->data.template_type.template_name &&
-            strcmp(t->data.template_type.template_name, "Promise") == 0 &&
-            t->data.template_type.arg_count >= 1 && t->data.template_type.template_args) {
-            result = t->data.template_type.template_args[0];
-        } else {
-            result = t;
-        }
+        result = ts_unwrap_promise(ts_eval_expr_type(ctx, inner));
     } else if (strcmp(kind, "string") == 0 || strcmp(kind, "template_string") == 0) {
         result = cbm_type_builtin(ctx->arena, "string");
     } else if (strcmp(kind, "number") == 0) {
@@ -2557,7 +3253,9 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
         }
     }
 
+evaluated:;
     ctx->eval_depth--;
+    result = ts_await_chain_result(ctx, node, result);
     /* Store only completed, non-degraded evaluations (see g_ts_eval_degraded);
      * result is never NULL here (initialized to unknown), so NULL stays the
      * empty-slot sentinel. */
@@ -2645,6 +3343,587 @@ const CBMType *ts_parse_type_node(TSLSPContext *ctx, TSNode node) {
 
 // ── Statement processing ──────────────────────────────────────────────────────
 
+enum { TS_CALLBACK_LIMIT = 128, TS_CALLBACK_VALUE_LIMIT = 256, TS_CALLBACK_WORK = 4096 };
+typedef struct {
+    TSNode node;
+    const CBMType *expected;
+    unsigned environment;
+    bool conflict;
+} TSLibCallbackFact;
+typedef struct TSLibCallbackValue {
+    CBMScope *scope;
+    const char *name;
+    TSNode value;
+    struct TSLibCallbackValue *next;
+} TSLibCallbackValue;
+typedef struct {
+    TSNode function, value;
+    uint32_t parameter;
+    bool conflict;
+} TSLibCallbackArgument;
+struct TSLibCallbackFacts {
+    TSLibCallbackFact items[TS_CALLBACK_LIMIT];
+    TSLibCallbackArgument arguments[TS_CALLBACK_LIMIT];
+    int count, argument_count, value_count, work;
+    bool truncated;
+    const struct TSLibCallbackFacts *previous;
+    TSLibCallbackValue *values;
+};
+
+static const CBMType *ts_callback_callable(const CBMType *type) {
+    if (type && type->kind == CBM_TYPE_FUNC)
+        return type;
+    if (!type || type->kind != CBM_TYPE_UNION)
+        return NULL;
+    const CBMType *found = NULL;
+    for (int i = 0; i < type->data.union_type.count; i++) {
+        const CBMType *member = type->data.union_type.members[i];
+        if (member && member->kind == CBM_TYPE_FUNC) {
+            if (found)
+                return NULL;
+            found = member;
+        }
+    }
+    return found;
+}
+
+static bool ts_callback_type_equal(const CBMType *left, const CBMType *right,
+                                    int depth, int *work);
+
+static bool ts_callback_members_equal(const char **left_names, const CBMType **left_types,
+                                       const char **right_names, const CBMType **right_types,
+                                       int depth, int *work) {
+    for (int i = 0;; i++) {
+        const CBMType *left = left_types ? left_types[i] : NULL;
+        const CBMType *right = right_types ? right_types[i] : NULL;
+        const char *left_name = left_names ? left_names[i] : NULL;
+        const char *right_name = right_names ? right_names[i] : NULL;
+        if (!left || !right)
+            return left == right && !left_name && !right_name;
+        if ((left_name || right_name) &&
+            (!left_name || !right_name || strcmp(left_name, right_name) != 0))
+            return false;
+        if (++*work > TS_CALLBACK_WORK)
+            return false;
+        if (!ts_callback_type_equal(left, right, depth + 1, work))
+            return false;
+    }
+}
+
+static bool ts_callback_type_equal(const CBMType *left, const CBMType *right,
+                                    int depth, int *work) {
+    if (left == right)
+        return true;
+    if (!left || !right || left->kind != right->kind ||
+        depth > 8 || ++*work > TS_CALLBACK_WORK)
+        return false;
+    switch (left->kind) {
+    case CBM_TYPE_OBJECT_LIT:
+        return ts_callback_members_equal(
+                   left->data.object_lit.prop_names, left->data.object_lit.prop_types,
+                   right->data.object_lit.prop_names, right->data.object_lit.prop_types,
+                   depth, work) &&
+               ts_callback_type_equal(left->data.object_lit.call_signature,
+                                       right->data.object_lit.call_signature, depth + 1, work) &&
+               ts_callback_type_equal(left->data.object_lit.index_value,
+                                       right->data.object_lit.index_value, depth + 1, work);
+    case CBM_TYPE_FUNC:
+        return ts_callback_members_equal(NULL, left->data.func.param_types,
+                                          NULL, right->data.func.param_types, depth, work) &&
+               ts_callback_members_equal(NULL, left->data.func.return_types,
+                                          NULL, right->data.func.return_types, depth, work);
+    case CBM_TYPE_SLICE:
+        return ts_callback_type_equal(left->data.slice.elem, right->data.slice.elem,
+                                       depth + 1, work);
+    case CBM_TYPE_TUPLE:
+        return left->data.tuple.count == right->data.tuple.count &&
+               ts_callback_members_equal(NULL, left->data.tuple.elems,
+                                          NULL, right->data.tuple.elems, depth, work);
+    case CBM_TYPE_TEMPLATE:
+        return left->data.template_type.arg_count == right->data.template_type.arg_count &&
+               left->data.template_type.template_name && right->data.template_type.template_name &&
+               strcmp(left->data.template_type.template_name,
+                      right->data.template_type.template_name) == 0 &&
+               ts_callback_members_equal(NULL, left->data.template_type.template_args,
+                                          NULL, right->data.template_type.template_args,
+                                          depth, work);
+    case CBM_TYPE_UNION:
+    case CBM_TYPE_INTERSECTION:
+        return left->data.union_type.count == right->data.union_type.count &&
+               ts_callback_members_equal(NULL, left->data.union_type.members,
+                                          NULL, right->data.union_type.members, depth, work);
+    default:
+        return cbm_type_equal(left, right);
+    }
+}
+
+static bool ts_callback_parameters_equal(const CBMType *left, const CBMType *right) {
+    if (left == right)
+        return true;
+    if (!left || !right || left->kind != CBM_TYPE_FUNC || right->kind != CBM_TYPE_FUNC)
+        return false;
+    // Each pass allocates fresh object/function arguments; pointer identity cannot prove stability.
+    int work = 0;
+    return ts_callback_members_equal(NULL, left->data.func.param_types,
+                                      NULL, right->data.func.param_types, 0, &work);
+}
+
+static const TSLibCallbackFact *ts_callback_fact(TSLSPContext *ctx, TSNode node) {
+    const struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    if (facts && ctx->collecting_callback_facts)
+        facts = facts->previous;
+    if (!facts || facts->truncated)
+        return NULL;
+    for (int i = 0; i < facts->count; i++) {
+        if (facts->items[i].node.id == node.id && !facts->items[i].conflict)
+            return &facts->items[i];
+    }
+    return NULL;
+}
+
+static void ts_callback_record(TSLSPContext *ctx, TSNode node, const CBMType *expected,
+                                unsigned environment) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    if (!facts || !ctx->collecting_callback_facts || facts->truncated || ts_node_is_null(node))
+        return;
+    for (int i = 0; i < facts->count; i++) {
+        TSLibCallbackFact *fact = &facts->items[i];
+        if (fact->node.id != node.id)
+            continue;
+        if (!expected || !fact->expected || fact->environment != environment ||
+            !ts_callback_parameters_equal(fact->expected, expected))
+            fact->conflict = true;
+        return;
+    }
+    if (facts->count == TS_CALLBACK_LIMIT) {
+        facts->truncated = true;
+        return;
+    }
+    facts->items[facts->count++] = (TSLibCallbackFact){
+        .node = node, .expected = expected, .environment = environment, .conflict = !expected};
+}
+
+static void ts_callback_bind_value(TSLSPContext *ctx, const char *name, TSNode value) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    if (!facts || !ctx->collecting_callback_facts || facts->truncated)
+        return;
+    if (facts->value_count == TS_CALLBACK_VALUE_LIMIT) {
+        facts->truncated = true;
+        return;
+    }
+    TSLibCallbackValue *entry = cbm_arena_alloc(ctx->arena, sizeof(*entry));
+    if (!entry) {
+        facts->truncated = true;
+        return;
+    }
+    *entry = (TSLibCallbackValue){ctx->current_scope, name, value, facts->values};
+    facts->values = entry;
+    facts->value_count++;
+}
+
+static TSNode ts_callback_local_value(TSLSPContext *ctx, TSNode identifier,
+                                       CBMScope **value_scope) {
+    TSNode none = {0};
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    char *name = node_text(ctx, identifier);
+    if (facts && !name)
+        facts->truncated = true;
+    if (!facts || !name || !ctx->written_functions ||
+        cbm_scope_contains(ctx->written_functions->parent, name))
+        return none;
+    const CBMScope *owner = ts_scope_binding_owner(ctx->current_scope, name);
+    for (TSLibCallbackValue *value = facts->values; value; value = value->next) {
+        if (value->scope == owner && strcmp(value->name, name) == 0) {
+            *value_scope = value->scope;
+            return value->value;
+        }
+    }
+    if (owner || ctx->isolated_page_context ||
+        cbm_scope_contains(ctx->written_functions, name))
+        return none;
+    // Only an exact, unshadowed module declaration is admitted. No short-name search.
+    TSNode found = {0};
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->file_root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (node_kind_is(child, "export_statement"))
+                child = ts_node_named_child(child, 0);
+            if (!node_kind_is(child, "function_declaration"))
+                continue;
+            TSNode declared = ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
+            char *declared_name = node_text(ctx, declared);
+            if (declared_name && strcmp(declared_name, name) == 0) {
+                if (!ts_node_is_null(found)) {
+                    found = none;
+                    break;
+                }
+                found = child;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+static bool ts_callback_function(TSNode node) {
+    return node_kind_is(node, "arrow_function") || node_kind_is(node, "function_expression") ||
+           node_kind_is(node, "function_declaration");
+}
+
+static TSNode ts_callback_return(TSLSPContext *ctx, TSNode function) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    TSNode body = ts_node_child_by_field_name(function, "body", TS_LSP_FIELD_LEN("body"));
+    if (!node_kind_is(body, "statement_block"))
+        return body;
+    TSNode returned = {0};
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode statement = ts_node_named_child(body, i);
+        if (node_kind_is(statement, "comment"))
+            continue;
+        if (node_kind_is(statement, "lexical_declaration") && ts_node_is_null(returned) &&
+            node_kind_is(ts_node_child(statement, 0), "const")) {
+            uint32_t declarations = ts_node_named_child_count(statement);
+            for (uint32_t j = 0; j < declarations; j++) {
+                TSNode declaration = ts_node_named_child(statement, j);
+                TSNode name = ts_node_child_by_field_name(declaration, "name",
+                                                            TS_LSP_FIELD_LEN("name"));
+                TSNode value = ts_node_child_by_field_name(declaration, "value",
+                                                             TS_LSP_FIELD_LEN("value"));
+                if (!node_kind_is(name, "identifier") ||
+                    (!ts_callback_function(value) && !node_kind_is(value, "identifier")))
+                    return (TSNode){0};
+            }
+            continue;
+        }
+        // shortcut: only inert const aliases and one direct return are modeled;
+        // add CFG facts before accepting guarded returns or side effects.
+        if (!node_kind_is(statement, "return_statement") || !ts_node_is_null(returned))
+            return (TSNode){0};
+        returned = ts_node_named_child(statement, 0);
+    }
+    for (int depth = 0; node_kind_is(returned, "identifier"); depth++) {
+        if (!facts || facts->truncated)
+            return (TSNode){0};
+        if (++facts->work > TS_CALLBACK_WORK || depth > 8) {
+            facts->truncated = true;
+            return (TSNode){0};
+        }
+        char *name = node_text(ctx, returned);
+        if (!name) {
+            facts->truncated = true;
+            return (TSNode){0};
+        }
+        if (!ctx->written_functions ||
+            cbm_scope_contains(ctx->written_functions->parent, name))
+            return (TSNode){0};
+        TSNode bound = {0};
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode statement = ts_node_named_child(body, i);
+            if (!node_kind_is(statement, "lexical_declaration"))
+                continue;
+            uint32_t declarations = ts_node_named_child_count(statement);
+            for (uint32_t j = 0; j < declarations; j++) {
+                TSNode declaration = ts_node_named_child(statement, j);
+                if (ts_node_start_byte(declaration) >= ts_node_start_byte(returned))
+                    break;
+                if (++facts->work > TS_CALLBACK_WORK) {
+                    facts->truncated = true;
+                    return (TSNode){0};
+                }
+                TSNode declared = ts_node_child_by_field_name(declaration, "name",
+                                                                TS_LSP_FIELD_LEN("name"));
+                char *declared_name = node_text(ctx, declared);
+                if (!declared_name) {
+                    facts->truncated = true;
+                    return (TSNode){0};
+                }
+                if (strcmp(declared_name, name) == 0)
+                    bound = ts_node_child_by_field_name(declaration, "value",
+                                                          TS_LSP_FIELD_LEN("value"));
+            }
+        }
+        returned = bound;
+    }
+    return ts_callback_function(returned) ? returned : (TSNode){0};
+}
+
+static TSNode ts_callback_value(TSLSPContext *ctx, TSNode value, int depth) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    if (!facts || !ctx->collecting_callback_facts || facts->truncated || ts_node_is_null(value))
+        return (TSNode){0};
+    if (++facts->work > TS_CALLBACK_WORK || depth > 8) {
+        facts->truncated = true;
+        return (TSNode){0};
+    }
+    if (ts_callback_function(value))
+        return value;
+    if (node_kind_is(value, "parenthesized_expression"))
+        return ts_callback_value(ctx, ts_node_named_child(value, 0), depth + 1);
+    if (node_kind_is(value, "ternary_expression") || node_kind_is(value, "binary_expression")) {
+        bool conditional = node_kind_is(value, "ternary_expression");
+        TSNode op = ts_node_child_by_field_name(value, "operator", TS_LSP_FIELD_LEN("operator"));
+        if (!conditional && !node_kind_is(op, "&&") && !node_kind_is(op, "||") &&
+            !node_kind_is(op, "??"))
+            return (TSNode){0};
+        TSNode left = ts_node_child_by_field_name(value, conditional ? "consequence" : "left",
+                                                   conditional ? TS_LSP_FIELD_LEN("consequence")
+                                                               : TS_LSP_FIELD_LEN("left"));
+        TSNode right = ts_node_child_by_field_name(value, conditional ? "alternative" : "right",
+                                                    conditional ? TS_LSP_FIELD_LEN("alternative")
+                                                                : TS_LSP_FIELD_LEN("right"));
+        left = ts_callback_value(ctx, left, depth + 1);
+        right = ts_callback_value(ctx, right, depth + 1);
+        return left.id == right.id ? left : (TSNode){0};
+    }
+    if (node_kind_is(value, "identifier") ||
+        node_kind_is(value, "shorthand_property_identifier")) {
+        CBMScope *saved = ctx->current_scope, *scope = saved;
+        TSNode bound = ts_callback_local_value(ctx, value, &scope);
+        ctx->current_scope = scope;
+        TSNode resolved = ts_callback_value(ctx, bound, depth + 1);
+        ctx->current_scope = saved;
+        return resolved;
+    } else if (node_kind_is(value, "call_expression")) {
+        TSNode function = ts_node_child_by_field_name(value, "function",
+                                                      TS_LSP_FIELD_LEN("function"));
+        if (node_kind_is(function, "identifier")) {
+            function = ts_callback_value(ctx, function, depth + 1);
+            // An async factory returns a Promise, not its returned callback value.
+            if (!ts_callback_function(function) ||
+                node_kind_is(ts_node_child(function, 0), "async"))
+                return (TSNode){0};
+            TSNode returned = ts_callback_return(ctx, function);
+            // Returned identifiers belong to the factory's scope, not its caller's.
+            if (ts_callback_function(returned))
+                return ts_callback_value(ctx, returned, depth + 1);
+        }
+    }
+    return (TSNode){0};
+}
+
+static void ts_callback_propagate(TSLSPContext *ctx, TSNode value, const CBMType *expected,
+                                   unsigned environment, int depth) {
+    TSNode resolved = ts_callback_value(ctx, value, depth);
+    if (!ts_node_is_null(resolved)) {
+        ts_callback_record(ctx, resolved, expected, environment);
+        return;
+    }
+    if (!ctx->callback_facts || ctx->callback_facts->truncated || ts_node_is_null(value))
+        return;
+    if (node_kind_is(value, "identifier") ||
+        node_kind_is(value, "shorthand_property_identifier")) {
+        CBMScope *saved = ctx->current_scope, *scope = saved;
+        TSNode bound = ts_callback_local_value(ctx, value, &scope);
+        ctx->current_scope = scope;
+        ts_callback_propagate(ctx, bound, NULL, environment, depth + 1);
+        ctx->current_scope = saved;
+    } else if (node_kind_is(value, "ternary_expression") ||
+               node_kind_is(value, "binary_expression") ||
+               node_kind_is(value, "sequence_expression") ||
+               node_kind_is(value, "parenthesized_expression") ||
+               node_kind_is(value, "spread_element") || node_kind_is(value, "await_expression") ||
+               node_kind_is(value, "as_expression") || node_kind_is(value, "satisfies_expression") ||
+               node_kind_is(value, "type_assertion") || node_kind_is(value, "non_null_expression")) {
+        uint32_t count = ts_node_named_child_count(value);
+        for (uint32_t i = 0; i < count; i++)
+            ts_callback_propagate(ctx, ts_node_named_child(value, i), NULL, environment, depth + 1);
+    }
+}
+
+static TSNode ts_callback_parameter(TSNode function, uint32_t index) {
+    TSNode params = ts_node_child_by_field_name(function, "parameters",
+                                                TS_LSP_FIELD_LEN("parameters"));
+    TSNode parameter = !ts_node_is_null(params)
+                           ? ts_node_named_child(params, index)
+                           : index == 0 ? ts_node_child_by_field_name(
+                                              function, "parameter", TS_LSP_FIELD_LEN("parameter"))
+                                        : (TSNode){0};
+    if (node_kind_is(parameter, "required_parameter") ||
+        node_kind_is(parameter, "optional_parameter")) {
+        if (!ts_node_is_null(ts_node_child_by_field_name(parameter, "value",
+                                                         TS_LSP_FIELD_LEN("value"))))
+            return (TSNode){0};
+        TSNode pattern = ts_node_child_by_field_name(parameter, "pattern",
+                                                      TS_LSP_FIELD_LEN("pattern"));
+        if (ts_node_is_null(pattern))
+            pattern = ts_node_child_by_field_name(parameter, "name", TS_LSP_FIELD_LEN("name"));
+        parameter = pattern;
+    }
+    return node_kind_is(parameter, "identifier") ? parameter : (TSNode){0};
+}
+
+static void ts_callback_record_argument(TSLSPContext *ctx, TSNode function, uint32_t parameter,
+                                          TSNode value) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    if (!facts || facts->truncated)
+        return;
+    for (int i = 0; i < facts->argument_count; i++) {
+        TSLibCallbackArgument *argument = &facts->arguments[i];
+        if (argument->function.id != function.id || argument->parameter != parameter)
+            continue;
+        if (argument->value.id != value.id)
+            argument->conflict = true;
+        if (argument->conflict) {
+            ts_callback_record(ctx, argument->value, NULL, ctx->library_environment);
+            if (!ts_node_is_null(value))
+                ts_callback_record(ctx, value, NULL, ctx->library_environment);
+        }
+        return;
+    }
+    if (facts->argument_count == TS_CALLBACK_LIMIT) {
+        facts->truncated = true;
+        return;
+    }
+    facts->arguments[facts->argument_count++] = (TSLibCallbackArgument){
+        .function = function, .value = value, .parameter = parameter,
+        .conflict = ts_node_is_null(value)};
+}
+
+static void ts_callback_bind_arguments(TSLSPContext *ctx, TSNode function) {
+    struct TSLibCallbackFacts *facts = ctx->callback_facts;
+    const struct TSLibCallbackFacts *previous = facts ? facts->previous : NULL;
+    if (!ctx->collecting_callback_facts || !previous || previous->truncated)
+        return;
+    bool conflict = false;
+    for (int i = 0; i < previous->count; i++) {
+        if (previous->items[i].node.id == function.id)
+            conflict = previous->items[i].conflict;
+    }
+    for (int i = 0; i < previous->argument_count; i++) {
+        const TSLibCallbackArgument *argument = &previous->arguments[i];
+        if (argument->function.id != function.id || ts_node_is_null(argument->value))
+            continue;
+        if (conflict || argument->conflict) {
+            ts_callback_record(ctx, argument->value, NULL, ctx->library_environment);
+            continue;
+        }
+        TSNode parameter = ts_callback_parameter(function, argument->parameter);
+        char *name = ts_node_is_null(parameter) ? NULL : node_text(ctx, parameter);
+        if (!name || !cbm_scope_lookup_local(ctx->current_scope, name))
+            facts->truncated = true;
+        else
+            ts_callback_bind_value(ctx, name, argument->value);
+    }
+}
+
+static unsigned ts_callback_environment(TSLSPContext *ctx, TSNode function, uint32_t argument) {
+    if (argument != 0 || !node_kind_is(function, "member_expression"))
+        return ctx->library_environment;
+    TSNode object = ts_node_child_by_field_name(function, "object", TS_LSP_FIELD_LEN("object"));
+    TSNode property = ts_node_child_by_field_name(function, "property",
+                                                  TS_LSP_FIELD_LEN("property"));
+    char *name = node_text(ctx, property);
+    const CBMRegisteredFunc *method = name
+                                         ? lookup_method(ctx, ts_eval_expr_type(ctx, object), name)
+                                         : NULL;
+    if (!method || !ts_library_qn(method->qualified_name))
+        return ctx->library_environment;
+    for (size_t i = 0; i < sizeof(ts_lib_members) / sizeof(ts_lib_members[0]); i++) {
+        const TSLibMember *member = &ts_lib_members[i];
+        if (member->browser && method->receiver_type &&
+            strcmp(member->owner, method->receiver_type) == 0 && strcmp(member->name, name) == 0)
+            return 2;
+    }
+    return ctx->library_environment;
+}
+
+static void ts_collect_call_context(TSLSPContext *ctx, TSNode call) {
+    if (!ctx->collecting_callback_facts || !ctx->callback_facts)
+        return;
+    TSNode function = ts_node_child_by_field_name(call, "function", TS_LSP_FIELD_LEN("function"));
+    TSNode args = ts_node_child_by_field_name(call, "arguments", TS_LSP_FIELD_LEN("arguments"));
+    uint32_t argc = ts_node_named_child_count(args);
+    if (argc > 15) {
+        ctx->callback_facts->truncated = true;
+        return;
+    }
+    TSNode local = node_kind_is(function, "identifier")
+                       ? ts_callback_value(ctx, function, 0) : (TSNode){0};
+    uint32_t formal_count = 0;
+    if (ts_callback_function(local)) {
+        TSNode formals = ts_node_child_by_field_name(local, "parameters",
+                                                      TS_LSP_FIELD_LEN("parameters"));
+        formal_count = !ts_node_is_null(formals) ? ts_node_named_child_count(formals)
+                                                : !ts_node_is_null(ts_callback_parameter(local, 0));
+        if (formal_count > 15) {
+            ctx->callback_facts->truncated = true;
+            return;
+        }
+        const CBMType *params[17] = {0};
+        const char *names[17] = {0};
+        for (uint32_t i = 0; i < argc; i++) {
+            params[i] = ts_eval_expr_type(ctx, ts_node_named_child(args, i));
+            names[i] = cbm_arena_sprintf(ctx->arena, "_%u", i);
+            if (!names[i]) {
+                ctx->callback_facts->truncated = true;
+                return;
+            }
+        }
+        const CBMType *returns[] = {cbm_type_unknown(), NULL};
+        const CBMType *type = cbm_type_func(ctx->arena, names, params, returns);
+        if (!type || type->kind != CBM_TYPE_FUNC || !type->data.func.param_names ||
+            !type->data.func.param_types || !type->data.func.return_types) {
+            ctx->callback_facts->truncated = true;
+            return;
+        }
+        ts_callback_record(ctx, local, type, ctx->library_environment);
+    }
+    const CBMType *signature = ts_signature_for_call(ctx, function, args);
+    const CBMCompilerSite *site = ts_compiler_site(ctx, call);
+    int param_count = 0;
+    if (signature && signature->kind == CBM_TYPE_FUNC && signature->data.func.param_types) {
+        while (signature->data.func.param_types[param_count])
+            param_count++;
+    }
+    bool spread = false;
+    for (uint32_t i = 0; i < argc; i++)
+        spread |= node_kind_is(ts_node_named_child(args, i), "spread_element");
+    for (uint32_t i = 0; i < argc || i < formal_count; i++) {
+        const CBMType *expected = (int)i < param_count
+                                      ? ts_callback_callable(signature->data.func.param_types[i])
+                                      : NULL;
+        expected = ts_compiler_callback_type(ctx, ts_compiler_callback(site, i), expected);
+        if (ts_callback_function(local) && !ts_node_is_null(ts_callback_parameter(local, i))) {
+            TSNode actual = i < argc ? ts_callback_value(ctx, ts_node_named_child(args, i), 0)
+                                    : (TSNode){0};
+            char *name = node_text(ctx, ts_callback_parameter(local, i));
+            if (!name)
+                ctx->callback_facts->truncated = true;
+            bool blocked = spread || !ctx->written_functions || !name ||
+                           cbm_scope_contains(ctx->written_functions->parent, name);
+            ts_callback_record_argument(ctx, local, i, blocked ? (TSNode){0} : actual);
+            if (blocked && !ts_node_is_null(actual))
+                ts_callback_record(ctx, actual, NULL, ctx->library_environment);
+            if (!expected && !blocked)
+                continue;
+        }
+        if (i < argc)
+            ts_callback_propagate(ctx, ts_node_named_child(args, i), expected,
+                                   ts_callback_environment(ctx, function, i), 0);
+    }
+}
+
+/* An isolated root is a callback scope. Its locals may share a graph QN
+ * with a host declaration or another callback, so require the exact anchor. */
+static bool ts_isolated_callable_matches(TSLSPContext *ctx, const char *qn, TSNode name) {
+    if (!ctx->file_defs)
+        return false;
+    const CBMDefinition *match = NULL;
+    for (int i = 0; i < ctx->file_defs->count; i++) {
+        const CBMDefinition *def = &ctx->file_defs->items[i];
+        if (!def->qualified_name || strcmp(def->qualified_name, qn) != 0)
+            continue;
+        if (match || def->name_source_origin != CBM_SOURCE_ORIGIN_RAW ||
+            def->name_start_byte != ts_node_start_byte(name) ||
+            def->name_end_byte != ts_node_end_byte(name))
+            return false;
+        match = def;
+    }
+    return match != NULL;
+}
+
 // Bind a variable_declarator: `let x: T = init` / `const x = init` / `var x = ...`.
 static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
     TSNode name = ts_node_child_by_field_name(decl, "name", TS_LSP_FIELD_LEN("name"));
@@ -2666,8 +3945,61 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
 
     if (node_kind_is(name, "identifier")) {
         char *nm = node_text(ctx, name);
-        if (nm)
-            cbm_scope_bind(ctx->current_scope, nm, bound);
+        if (nm) {
+            const char *callable_qn = NULL;
+            TSNode declaration = ts_node_parent(decl);
+            /* A mutable value's signature does not prove which function it holds. */
+            if (node_kind_is(ts_node_child(declaration, 0), "const")) {
+                ts_callback_bind_value(ctx, nm, value);
+                if (node_kind_is(value, "identifier")) {
+                    char *target_name = node_text(ctx, value);
+                    if (ctx->written_functions &&
+                        !cbm_scope_contains(ctx->written_functions, target_name)) {
+                        const CBMVarBinding *binding =
+                            cbm_scope_lookup_binding(ctx->current_scope, target_name);
+                        const CBMRegisteredFunc *target = NULL;
+                        if (binding) {
+                            callable_qn = binding->callable_qn;
+                        } else {
+                            target = ts_exact_imported_function(ctx, target_name);
+                            if (!target)
+                                target = ts_exact_same_module_function(ctx, target_name);
+                            if (target)
+                                callable_qn = target->qualified_name;
+                        }
+                    }
+                } else if ((node_kind_is(value, "arrow_function") ||
+                            node_kind_is(value, "function_expression")) &&
+                           ctx->current_scope && !ctx->current_scope->parent && ctx->module_qn) {
+                    const char *qn = cbm_js_object_owner(&ctx->js_object_owners, name);
+                    if (!qn)
+                        qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, nm);
+                    const CBMRegisteredFunc *target = cbm_registry_lookup_func(ctx->registry, qn);
+                    if (target && (!ctx->isolated_page_context ||
+                                   ts_isolated_callable_matches(ctx, qn, name)))
+                        callable_qn = target->qualified_name;
+                } else if (node_kind_is(value, "call_expression")) {
+                    TSNode fn = ts_node_child_by_field_name(value, "function",
+                                                            TS_LSP_FIELD_LEN("function"));
+                    TSNode args = ts_node_child_by_field_name(value, "arguments",
+                                                              TS_LSP_FIELD_LEN("arguments"));
+                    const char *module = ts_import_module_for_local(ctx, nm, NULL);
+                    TSNode arg = ts_node_named_child(args, 0);
+                    if (node_kind_is(fn, "identifier") && node_kind_is(arg, "string") &&
+                        ts_module_is_node_builtin(module) &&
+                        ts_node_require_available(ctx)) {
+                        char *fn_name = node_text(ctx, fn);
+                        char *specifier = node_text(ctx, arg);
+                        size_t length = specifier ? strlen(specifier) : 0;
+                        if (fn_name && strcmp(fn_name, "require") == 0 && length >= 2 &&
+                            strlen(module) == length - 2 &&
+                            strncmp(specifier + 1, module, length - 2) == 0)
+                            bound = cbm_type_named(ctx->arena, module);
+                    }
+                }
+            }
+            cbm_scope_bind_callable(ctx->current_scope, nm, bound, callable_qn);
+        }
     } else if (node_kind_is(name, "object_pattern")) {
         // Destructure object: `const { a, b } = obj` — bind a and b to obj.a and obj.b types.
         uint32_t nc = ts_node_named_child_count(name);
@@ -2718,10 +4050,37 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
     }
 }
 
-// Bind a single TS parameter into the current scope. Robust against grammar field-name
-// variations: tries `pattern`, `name`, then falls back to first named child of the param.
+// JS exposes parameter patterns directly; TS wraps them with optional annotations.
 static void bind_parameter(TSLSPContext *ctx, TSNode param) {
+    if (ts_node_is_null(param))
+        return;
     const char *pk = ts_node_type(param);
+    if (strcmp(pk, "identifier") == 0 ||
+        strcmp(pk, "shorthand_property_identifier_pattern") == 0) {
+        char *name = node_text(ctx, param);
+        if (name)
+            cbm_scope_bind(ctx->current_scope, name, cbm_type_unknown());
+        return;
+    }
+    if (strcmp(pk, "assignment_pattern") == 0 ||
+        strcmp(pk, "object_assignment_pattern") == 0) {
+        bind_parameter(ctx, ts_node_child_by_field_name(param, "left", TS_LSP_FIELD_LEN("left")));
+        return;
+    }
+    if (strcmp(pk, "rest_pattern") == 0) {
+        bind_parameter(ctx, ts_node_named_child(param, 0));
+        return;
+    }
+    if (strcmp(pk, "object_pattern") == 0 || strcmp(pk, "array_pattern") == 0) {
+        uint32_t count = ts_node_named_child_count(param);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode child = ts_node_named_child(param, i);
+            if (node_kind_is(child, "pair_pattern"))
+                child = ts_node_child_by_field_name(child, "value", TS_LSP_FIELD_LEN("value"));
+            bind_parameter(ctx, child);
+        }
+        return;
+    }
     if (strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0 &&
         strcmp(pk, "tuple_parameter") != 0 && strcmp(pk, "optional_tuple_parameter") != 0)
         return;
@@ -2837,15 +4196,21 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
                     if (knm && vnm) {
                         cbm_scope_bind(ctx->current_scope, vnm, lookup_member_type(ctx, t, knm));
                     }
+                } else if (!ts_node_is_null(val)) {
+                    bind_parameter(ctx, val);
                 }
+            } else {
+                bind_parameter(ctx, p);
             }
         }
     } else if (node_kind_is(pattern, "array_pattern")) {
         uint32_t nc = ts_node_named_child_count(pattern);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode p = ts_node_named_child(pattern, i);
-            if (!node_kind_is(p, "identifier"))
+            if (!node_kind_is(p, "identifier")) {
+                bind_parameter(ctx, p);
                 continue;
+            }
             char *pnm = node_text(ctx, p);
             if (!pnm)
                 continue;
@@ -2856,6 +4221,8 @@ static void bind_parameter(TSLSPContext *ctx, TSNode param) {
             }
             cbm_scope_bind(ctx->current_scope, pnm, et);
         }
+    } else {
+        bind_parameter(ctx, pattern);
     }
 }
 
@@ -2946,8 +4313,14 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
             }
             const CBMRegisteredFunc *target = lookup_method(ctx, receiver, method_name);
             if (target && target->qualified_name) {
-                ts_emit_resolved_reference(ctx, target->qualified_name,
-                                           "lsp_ts_bound_method_value_reference", 0.95f, property);
+                if (ts_library_qn(target->qualified_name) || ts_library_builtin(ctx, target)) {
+                    ts_emit_resolved_reference_reason(ctx, target->qualified_name,
+                        "lsp_ts_bound_method_value_reference", 0.0f,
+                        "external_symbol_not_indexed", property);
+                } else {
+                    ts_emit_resolved_reference(ctx, target->qualified_name,
+                        "lsp_ts_bound_method_value_reference", 0.95f, property);
+                }
             }
             continue;
         }
@@ -2956,6 +4329,13 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
         }
         char *name = node_text(ctx, arg);
         if (ts_scope_has_binding(ctx->current_scope, name)) {
+            const char *callable_qn = cbm_scope_lookup_callable(ctx->current_scope, name);
+            if (callable_qn && cbm_registry_lookup_func(ctx->registry, callable_qn)) {
+                ts_emit_resolved_reference_reason(ctx, callable_qn,
+                                                  "lsp_callable_value_reference", 0.95f,
+                                                  name, arg);
+                continue;
+            }
             ts_block_shadowed_reference_usage(ctx, name, arg);
             continue;
         }
@@ -2972,7 +4352,7 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
             target = ts_exact_imported_function(ctx, name);
             strategy = "lsp_ts_import_value_reference";
             /* `import { foo as bar }`: the site names `bar`, the target is `foo`. */
-            if (target && ts_import_export_name(ctx, name) != name) {
+            if (target && strcmp(ts_import_export_name(ctx, name), name) != 0) {
                 strategy = "lsp_callable_value_reference";
                 reason = name;
             }
@@ -2992,7 +4372,68 @@ static TSNode unwrap_await_callee(TSNode node) {
     return ts_node_named_child(node, 0);
 }
 
+static bool ts_is_function_boundary(TSNode node);
+
+static bool ts_await_operator_context(TSNode node) {
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (ts_is_function_boundary(parent)) {
+            uint32_t count = ts_node_child_count(parent);
+            for (uint32_t i = 0; i < count; i++)
+                if (node_kind_is(ts_node_child(parent, i), "async"))
+                    return true;
+            return false;
+        }
+        if (node_kind_is(parent, "program")) {
+            uint32_t count = ts_node_named_child_count(parent);
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode child = ts_node_named_child(parent, i);
+                if (node_kind_is(child, "import_statement") ||
+                    node_kind_is(child, "export_statement"))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool ts_await_operator_call(TSNode call, const char *source) {
+    TSNode function = ts_node_child_by_field_name(call, "function", TS_LSP_FIELD_LEN("function"));
+    // The JS grammar can parse `await (value).method()` as a call to await.
+    return node_kind_is(function, "identifier") &&
+           ts_node_end_byte(function) - ts_node_start_byte(function) == 5 &&
+           memcmp(source + ts_node_start_byte(function), "await", 5) == 0 &&
+           ts_await_operator_context(call);
+}
+
+TSNode cbm_ts_call_start_node(TSNode node, const char *source) {
+    uint32_t start = ts_node_start_byte(node);
+    if (ts_node_end_byte(node) - start < 5 || memcmp(source + start, "await", 5) != 0)
+        return node;
+
+    // In `await (x).m()`, the grammar can make `await (x)` the receiver call.
+    // The checker starts the real invocation at the opening parenthesis.
+    TSNode head = node;
+    do {
+        if (node_kind_is(head, "member_expression") || node_kind_is(head, "subscript_expression")) {
+            head = ts_node_child_by_field_name(head, "object", TS_LSP_FIELD_LEN("object"));
+        } else if (node_kind_is(head, "call_expression")) {
+            head = ts_node_child_by_field_name(head, "function", TS_LSP_FIELD_LEN("function"));
+        } else {
+            break;
+        }
+        if (node_kind_is(head, "call_expression") && ts_node_start_byte(head) == start &&
+            ts_await_operator_call(head, source)) {
+            TSNode args =
+                ts_node_child_by_field_name(head, "arguments", TS_LSP_FIELD_LEN("arguments"));
+            return node_kind_is(args, "arguments") ? args : node;
+        }
+    } while (!ts_node_is_null(head) && ts_node_start_byte(head) == start);
+    return node;
+}
+
 static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
+    const CBMCompilerSite *site = ts_compiler_site(ctx, call_node);
     TSNode fn = ts_node_child_by_field_name(call_node, "function", TS_LSP_FIELD_LEN("function"));
     fn = unwrap_await_callee(fn);
     if (ts_node_is_null(fn))
@@ -3025,21 +4466,38 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                         if (is_import) {
                             ts_emit_unresolved_call_at(
                                 ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", on, mname),
-                                "module_symbol_not_in_registry", call_node);
+                                ts_import_is_node_builtin(ctx, on) ? "external_symbol_not_indexed"
+                                                                  : "module_symbol_not_in_registry",
+                                call_node);
                             return;
                         }
                     }
                 }
                 // Type-based dispatch.
-                const CBMType *recv = ts_eval_expr_type(ctx, obj);
+                const CBMType *recv = site && (!site->proof_partial || site->types_authoritative) &&
+                                              !cbm_type_is_unknown(site->receiver)
+                                          ? site->receiver : ts_eval_expr_type(ctx, obj);
                 const CBMRegisteredFunc *f = ts_lookup_method_for_call(ctx, recv, mname, args);
 
                 if (f) {
-                    ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_method", 0.95f,
-                                             call_node);
+                    if (ts_library_qn(f->qualified_name) || ts_library_builtin(ctx, f)) {
+                        ts_emit_unresolved_call_at(ctx, f->qualified_name,
+                                                   "external_symbol_not_indexed", call_node);
+                    } else {
+                        ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_method", 0.95f,
+                                                 call_node);
+                    }
                     return;
                 }
-                ts_emit_unresolved_call_at(ctx, mname, "method_not_in_registry", call_node);
+                const char *reason = recv && recv->kind == CBM_TYPE_NAMED &&
+                                             (ts_module_is_node_builtin(
+                                                  recv->data.named.qualified_name) ||
+                                              ts_library_qn(recv->data.named.qualified_name))
+                                         ? "external_symbol_not_indexed"
+                                         : "method_not_in_registry";
+                if (ctx->isolated_page_context)
+                    reason = "dynamic_callable_target_unknown";
+                ts_emit_unresolved_call_at(ctx, node_text(ctx, fn), reason, call_node);
             }
         }
         return;
@@ -3050,8 +4508,26 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         char *name = node_text(ctx, fn);
         if (!name)
             return;
-        if (ts_scope_has_binding(ctx->current_scope, name))
+        if (ts_scope_has_binding(ctx->current_scope, name)) {
+            const char *callable_qn = cbm_scope_lookup_callable(ctx->current_scope, name);
+            if (callable_qn && cbm_registry_lookup_func(ctx->registry, callable_qn)) {
+                ts_emit_resolved_call_reason_at(ctx, callable_qn, "lsp_import_alias", 0.95f,
+                                                name, call_node);
+            } else {
+                ts_emit_unresolved_call_at(ctx, name, "dynamic_callable_target_unknown", call_node);
+            }
             return;
+        }
+        if (ctx->isolated_page_context) {
+            const CBMRegisteredFunc *fetch = ts_page_fetch(ctx, name);
+            if (fetch)
+                ts_emit_resolved_call_at(ctx, fetch->qualified_name, "lsp_ts_browser_fetch", 0.95f,
+                                         call_node);
+            else
+                ts_emit_unresolved_call_at(ctx, name, "dynamic_callable_target_unknown",
+                                           call_node);
+            return;
+        }
 
         // Module-local function: ordered argument types first, then arity.
         if (ctx->module_qn) {
@@ -3061,14 +4537,32 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 return;
             }
         }
+        if (ctx->resolved_calls && strcmp(name, "require") == 0 &&
+            ts_commonjs_prefix_contains(ctx, call_node) && ts_node_require_available(ctx)) {
+            ts_emit_unresolved_call_at(ctx, "__cbm_lib.node.require", "external_symbol_not_indexed",
+                                       call_node);
+            return;
+        }
         // Imported default/named function.
         for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
             const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
             const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
             if (lname && mqn && strcmp(lname, name) == 0) {
                 const char *member = ts_import_export_name(ctx, name);
+                const char *library =
+                    ts_library_module(ts_import_module_for_local(ctx, name, NULL));
+                if (library && ts_has_named_import(ctx, name)) {
+                    const CBMType *value = lookup_member_type(
+                        ctx, cbm_type_named(ctx->arena, library), member);
+                    if (value && value->kind == CBM_TYPE_FUNC) {
+                        ts_emit_unresolved_call_at(
+                            ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", library, member),
+                            "external_symbol_not_indexed", call_node);
+                        return;
+                    }
+                }
                 const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, mqn, member, args);
-                if (f && member != name) {
+                if (f && strcmp(member, name) != 0) {
                     ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_import_alias",
                                                     0.95f, name, call_node);
                     return;
@@ -3080,7 +4574,10 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 }
                 // Fall through to qualified_name fallback.
                 const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
-                ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
+                bool external = ts_import_is_node_builtin(ctx, name);
+                ts_emit_unresolved_call_at(ctx, external ? name : qn,
+                                            external ? "external_symbol_not_indexed"
+                                                     : "import_symbol_not_in_registry", call_node);
                 return;
             }
         }
@@ -3088,16 +4585,86 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     }
 }
 
+static void ts_bind_contextual_pattern(TSLSPContext *ctx, TSNode pattern,
+                                        const CBMType *expected, int depth) {
+    if (ts_node_is_null(pattern) || !expected || depth > 8)
+        return;
+    const char *kind = ts_node_type(pattern);
+    if (strcmp(kind, "identifier") == 0 ||
+        strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
+        char *name = node_text(ctx, pattern);
+        const CBMVarBinding *local = name ? cbm_scope_lookup_local(ctx->current_scope, name) : NULL;
+        if (name && (!local || cbm_type_is_unknown(local->type)))
+            cbm_scope_bind(ctx->current_scope, name, expected);
+    } else if (strcmp(kind, "required_parameter") == 0 ||
+               strcmp(kind, "optional_parameter") == 0) {
+        TSNode child = ts_node_child_by_field_name(pattern, "pattern", TS_LSP_FIELD_LEN("pattern"));
+        if (ts_node_is_null(child))
+            child = ts_node_child_by_field_name(pattern, "name", TS_LSP_FIELD_LEN("name"));
+        ts_bind_contextual_pattern(ctx, child, expected, depth + 1);
+    } else if (strcmp(kind, "object_pattern") == 0) {
+        uint32_t count = ts_node_named_child_count(pattern);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode field = ts_node_named_child(pattern, i);
+            TSNode key = field, value = field;
+            if (node_kind_is(field, "pair_pattern")) {
+                key = ts_node_child_by_field_name(field, "key", TS_LSP_FIELD_LEN("key"));
+                value = ts_node_child_by_field_name(field, "value", TS_LSP_FIELD_LEN("value"));
+            }
+            char *name = node_text(ctx, key);
+            if (name)
+                ts_bind_contextual_pattern(ctx, value, lookup_member_type(ctx, expected, name),
+                                             depth + 1);
+        }
+    }
+}
+
+static void ts_bind_callback_parameters(TSLSPContext *ctx, TSNode function,
+                                         const CBMType *expected) {
+    if (!expected || expected->kind != CBM_TYPE_FUNC || !expected->data.func.param_types)
+        return;
+    TSNode params = ts_node_child_by_field_name(function, "parameters",
+                                                TS_LSP_FIELD_LEN("parameters"));
+    TSNode bare = ts_node_child_by_field_name(function, "parameter", TS_LSP_FIELD_LEN("parameter"));
+    int count = 0;
+    while (expected->data.func.param_types[count])
+        count++;
+    if (!ts_node_is_null(bare) && count)
+        ts_bind_contextual_pattern(ctx, bare, expected->data.func.param_types[0], 0);
+    for (int i = 0; !ts_node_is_null(params) && i < count &&
+                    (uint32_t)i < ts_node_named_child_count(params); i++)
+        ts_bind_contextual_pattern(ctx, ts_node_named_child(params, (uint32_t)i),
+                                     expected->data.func.param_types[i], 0);
+}
+
 // Process an arrow_function or function_expression as a callback whose param types are
 // contextually typed by the enclosing call (e.g. `arr.map(x => x.length)` — `x` should
 // be bound to `arr`'s element type via Array<T>.map's `(x: T) => U` signature). The
 // caller passes `expected` = the FUNC type the callback must conform to.
-static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMType *expected) {
+static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMType *expected,
+                                    unsigned environment,
+                                    const CBMCompilerContextParams *compiler_parameters) {
     if (ts_node_is_null(arrow) || !expected || expected->kind != CBM_TYPE_FUNC)
         return;
 
     CBMScope *saved = ctx->current_scope;
-    ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    const char *saved_class = ctx->enclosing_class_qn;
+    unsigned saved_environment = ctx->library_environment;
+    bool saved_isolated = ctx->isolated_page_context;
+    bool saved_page_fetch_blocked = ctx->page_fetch_blocked;
+    struct TsEvalMemo *saved_memo = ctx->eval_memo;
+    bool isolate = environment == 2 && saved_environment != 2;
+    ctx->current_scope = cbm_scope_push(ctx->arena, isolate ? NULL : saved);
+    if (ctx->current_scope == (isolate ? NULL : saved) &&
+        ctx->collecting_callback_facts && ctx->callback_facts)
+        ctx->callback_facts->truncated = true;
+    if (isolate)
+        ctx->enclosing_class_qn = NULL;
+    ctx->library_environment = environment;
+    ctx->isolated_page_context = saved_isolated || isolate;
+    if (isolate)
+        ctx->page_fetch_blocked = ts_page_fetch_blocked(ctx, arrow);
+    ctx->eval_memo = NULL;
 
     // Tree-sitter typescript shapes for arrow functions:
     //   `(x, y) => body`  → parameters: formal_parameters
@@ -3106,6 +4673,9 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
         ts_node_child_by_field_name(arrow, "parameters", TS_LSP_FIELD_LEN("parameters"));
     TSNode bare_param =
         ts_node_child_by_field_name(arrow, "parameter", TS_LSP_FIELD_LEN("parameter"));
+    uint32_t expected_count = 0;
+    while (expected->data.func.param_types && expected->data.func.param_types[expected_count])
+        expected_count++;
     int idx = 0;
     if (!ts_node_is_null(bare_param)) {
         // Single bare param: `x => ...`.
@@ -3113,7 +4683,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
         if (strcmp(pk, "identifier") == 0) {
             char *nm = node_text(ctx, bare_param);
             const CBMType *pt =
-                (expected->data.func.param_types && expected->data.func.param_types[0])
+                expected_count
                     ? expected->data.func.param_types[0]
                     : cbm_type_unknown();
             if (nm)
@@ -3128,7 +4698,7 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
             const char *pk = ts_node_type(p);
             const char *pname = NULL;
             const CBMType *expected_pt =
-                (expected->data.func.param_types && expected->data.func.param_types[idx])
+                ((uint32_t)idx < expected_count)
                     ? expected->data.func.param_types[idx]
                     : NULL;
 
@@ -3145,7 +4715,10 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
                 }
                 // If the param has its own annotation, use that. Otherwise use expected.
                 TSNode tann = ts_node_child_by_field_name(p, "type", TS_LSP_FIELD_LEN("type"));
-                if (!ts_node_is_null(tann)) {
+                bool compiler_typed =
+                    compiler_parameters && (size_t)idx < compiler_parameters->parameter_count &&
+                    !cbm_type_is_unknown(compiler_parameters->param_types[idx]);
+                if (!compiler_typed && !ts_node_is_null(tann)) {
                     TSNode tch = (strcmp(ts_node_type(tann), "type_annotation") == 0)
                                      ? ts_node_named_child(tann, 0)
                                      : tann;
@@ -3160,11 +4733,15 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
             if (pname) {
                 cbm_scope_bind(ctx->current_scope, pname,
                                expected_pt ? expected_pt : cbm_type_unknown());
+            } else {
+                bind_parameter(ctx, p);
+                ts_bind_contextual_pattern(ctx, p, expected_pt, 0);
             }
             idx++;
         }
     }
 
+    ts_callback_bind_arguments(ctx, arrow);
     TSNode body = ts_node_child_by_field_name(arrow, "body", TS_LSP_FIELD_LEN("body"));
     if (!ts_node_is_null(body)) {
         if (strcmp(ts_node_type(body), "statement_block") == 0) {
@@ -3176,11 +4753,18 @@ static void process_callback_arrow(TSLSPContext *ctx, TSNode arrow, const CBMTyp
             }
             ts_tree_cursor_delete(&cursor);
         } else {
+            if (ctx->collecting_callback_facts && !ts_callback_function(body))
+                ts_callback_propagate(ctx, body, NULL, ctx->library_environment, 0);
             process_node(ctx, body);
         }
     }
 
     ctx->current_scope = saved;
+    ctx->enclosing_class_qn = saved_class;
+    ctx->library_environment = saved_environment;
+    ctx->isolated_page_context = saved_isolated;
+    ctx->page_fetch_blocked = saved_page_fetch_blocked;
+    ctx->eval_memo = saved_memo;
 }
 
 // Try to extract a narrowing fact from an `if`-condition: `x instanceof Foo`,
@@ -3475,12 +5059,29 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         return;
     const char *kind = ts_node_type(node);
 
+    if (strcmp(kind, "catch_clause") == 0) {
+        CBMScope *saved = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        if (ctx->current_scope == saved) {
+            if (ctx->collecting_callback_facts && ctx->callback_facts)
+                ctx->callback_facts->truncated = true;
+            return;
+        }
+        bind_parameter(ctx, ts_node_child_by_field_name(node, "parameter",
+                                                       TS_LSP_FIELD_LEN("parameter")));
+        process_node(ctx, ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body")));
+        ctx->current_scope = saved;
+        return;
+    }
+
     /* A nested statement block owns `let`/`const` declarations. Function-body
      * blocks are intentionally unwrapped by process_function_body(), so this
      * branch applies only to nested lexical blocks and cannot hide parameters. */
     if (strcmp(kind, "statement_block") == 0) {
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        if (ctx->current_scope == saved && ctx->collecting_callback_facts && ctx->callback_facts)
+            ctx->callback_facts->truncated = true;
         TSTreeCursor cursor = ts_tree_cursor_new(node);
         if (ts_tree_cursor_goto_first_child(&cursor)) {
             do {
@@ -3495,7 +5096,44 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     // Scope-affecting statements bind first, then we recurse.
     ts_process_statement(ctx, node);
 
-    if (strcmp(kind, "call_expression") == 0) {
+    if (ctx->collecting_callback_facts) {
+        if (strcmp(kind, "assignment_expression") == 0 ||
+            strcmp(kind, "augmented_assignment_expression") == 0) {
+            ts_callback_propagate(ctx, ts_node_child_by_field_name(
+                                           node, "left", TS_LSP_FIELD_LEN("left")),
+                                   NULL, ctx->library_environment, 0);
+            ts_callback_propagate(ctx, ts_node_child_by_field_name(
+                                           node, "right", TS_LSP_FIELD_LEN("right")),
+                                   NULL, ctx->library_environment, 0);
+        } else if (strcmp(kind, "array") == 0 || strcmp(kind, "new_expression") == 0) {
+            TSNode values = strcmp(kind, "new_expression") == 0
+                                ? ts_node_child_by_field_name(node, "arguments",
+                                                                 TS_LSP_FIELD_LEN("arguments"))
+                                : node;
+            uint32_t count = ts_node_named_child_count(values);
+            for (uint32_t i = 0; i < count; i++)
+                ts_callback_propagate(ctx, ts_node_named_child(values, i), NULL,
+                                       ctx->library_environment, 0);
+        } else if (strcmp(kind, "return_statement") == 0 ||
+                   strcmp(kind, "throw_statement") == 0 || strcmp(kind, "pair") == 0 ||
+                   strcmp(kind, "shorthand_property_identifier") == 0) {
+            TSNode value = strcmp(kind, "pair") == 0
+                               ? ts_node_child_by_field_name(node, "value", TS_LSP_FIELD_LEN("value"))
+                           : strcmp(kind, "shorthand_property_identifier") == 0
+                               ? node : ts_node_named_child(node, 0);
+            TSNode body = ts_node_parent(node), factory = ts_node_parent(body);
+            bool factory_return = strcmp(kind, "return_statement") == 0 &&
+                                  (ts_callback_function(value) ||
+                                   (node_kind_is(body, "statement_block") &&
+                                    ts_callback_function(factory) &&
+                                    !ts_node_is_null(ts_callback_return(ctx, factory))));
+            if (!factory_return)
+                ts_callback_propagate(ctx, value, NULL, ctx->library_environment, 0);
+        }
+    }
+
+    if (strcmp(kind, "call_expression") == 0 && !ts_await_operator_call(node, ctx->source)) {
+        ts_collect_call_context(ctx, node);
         resolve_call_at(ctx, node);
         resolve_value_references_at(ctx, node);
 
@@ -3514,9 +5152,12 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             if (ts_node_is_null(args))
                 break;
             const CBMType *fn_type = ts_signature_for_call(ctx, fn_node, args);
-            if (!fn_type || fn_type->kind != CBM_TYPE_FUNC)
-                break;
-            if (!fn_type->data.func.param_types)
+            const CBMCompilerSite *site = ts_compiler_site(ctx, node);
+            bool has_signature = fn_type && fn_type->kind == CBM_TYPE_FUNC &&
+                                 fn_type->data.func.param_types;
+            if (!has_signature &&
+                (!site || (site->proof_partial && !site->types_authoritative) ||
+                 !site->contextual_param_count))
                 break;
 
             // Process the function child for nested call resolution.
@@ -3529,7 +5170,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             // param_types[i] by the raw arg count read out of bounds → garbage
             // CBMType* → crash on expected->kind.
             uint32_t param_count = 0;
-            while (fn_type->data.func.param_types[param_count])
+            while (has_signature && fn_type->data.func.param_types[param_count])
                 param_count++;
 
             uint32_t argc = ts_node_named_child_count(args);
@@ -3539,10 +5180,16 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
                     continue;
                 const char *ak = ts_node_type(arg);
                 const CBMType *expected =
-                    (i < param_count) ? fn_type->data.func.param_types[i] : NULL;
+                    (i < param_count)
+                        ? ts_callback_callable(fn_type->data.func.param_types[i]) : NULL;
+                const CBMCompilerContextParams *compiler_parameters =
+                    ts_compiler_callback(site, i);
+                expected = ts_compiler_callback_type(ctx, compiler_parameters, expected);
                 if ((strcmp(ak, "arrow_function") == 0 || strcmp(ak, "function_expression") == 0) &&
                     expected && expected->kind == CBM_TYPE_FUNC) {
-                    process_callback_arrow(ctx, arg, expected);
+                    process_callback_arrow(ctx, arg, expected,
+                                             ts_callback_environment(ctx, fn_node, i),
+                                             compiler_parameters);
                 } else {
                     process_node(ctx, arg);
                 }
@@ -3748,25 +5395,17 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_definition") == 0 ||
         strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0 ||
         strcmp(kind, "method_signature") == 0) {
-        // Nested functions just get a fresh scope; top-level / class-method walks own
-        // their enclosing_func_qn via process_function_body.
-        CBMScope *saved = ctx->current_scope;
-        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
-        TSNode params =
-            ts_node_child_by_field_name(node, "parameters", TS_LSP_FIELD_LEN("parameters"));
-        if (!ts_node_is_null(params)) {
-            uint32_t nc = ts_node_named_child_count(params);
-            for (uint32_t i = 0; i < nc; i++)
-                bind_parameter(ctx, ts_node_named_child(params, i));
-        }
-        TSNode body = ts_node_child_by_field_name(node, "body", TS_LSP_FIELD_LEN("body"));
-        if (!ts_node_is_null(body)) {
-            // Arrow functions with a single-expression body: body IS the expression
-            // (often a call_expression). Recursing into children skips it. Always
-            // process_node(body) so resolve_call_at fires for that expression.
-            process_node(ctx, body);
-        }
-        ctx->current_scope = saved;
+        CBMLanguage lang = ctx->js_mode ? CBM_LANG_JAVASCRIPT : CBM_LANG_TYPESCRIPT;
+        TSNode name_node = cbm_resolve_func_name(node, lang);
+        const char *name = ts_node_is_null(name_node)
+                               ? NULL
+                               : cbm_func_name_node_text(ctx->arena, name_node, ctx->source, lang);
+        const char *base = ctx->enclosing_class_qn ? ctx->enclosing_class_qn : ctx->module_qn;
+        const char *qn = cbm_js_object_owner(&ctx->js_object_owners, name_node);
+        if (!qn)
+            qn = name && name[0] && base ? cbm_arena_sprintf(ctx->arena, "%s.%s", base, name)
+                                        : ctx->enclosing_func_qn;
+        process_function_body(ctx, node, qn, NULL);
         return;
     }
 
@@ -3843,10 +5482,24 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_func = ctx->enclosing_func_qn;
     const char *saved_class = ctx->enclosing_class_qn;
+    unsigned saved_environment = ctx->library_environment;
+    bool saved_isolated = ctx->isolated_page_context;
+    bool saved_page_fetch_blocked = ctx->page_fetch_blocked;
+    struct TsEvalMemo *saved_memo = ctx->eval_memo;
+    const TSLibCallbackFact *fact = ts_callback_fact(ctx, func_node);
+    bool isolate = fact && fact->environment == 2 && saved_environment != 2;
 
-    ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+    ctx->current_scope = cbm_scope_push(ctx->arena, isolate ? NULL : saved_scope);
+    if (ctx->current_scope == (isolate ? NULL : saved_scope) &&
+        ctx->collecting_callback_facts && ctx->callback_facts)
+        ctx->callback_facts->truncated = true;
     ctx->enclosing_func_qn = func_qn;
-    ctx->enclosing_class_qn = class_qn ? class_qn : saved_class;
+    ctx->enclosing_class_qn = isolate ? NULL : class_qn ? class_qn : saved_class;
+    ctx->library_environment = fact ? fact->environment : saved_environment;
+    ctx->isolated_page_context = saved_isolated || isolate;
+    if (isolate)
+        ctx->page_fetch_blocked = ts_page_fetch_blocked(ctx, func_node);
+    ctx->eval_memo = NULL;
 
     if (class_qn) {
         // Bind `this` to the class type for member resolution within methods.
@@ -3881,7 +5534,15 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
                 }
             }
         }
+    } else {
+        TSNode param =
+            ts_node_child_by_field_name(func_node, "parameter", TS_LSP_FIELD_LEN("parameter"));
+        if (!ts_node_is_null(param))
+            bind_parameter(ctx, param);
     }
+    if (fact)
+        ts_bind_callback_parameters(ctx, func_node, fact->expected);
+    ts_callback_bind_arguments(ctx, func_node);
 
     TSNode body = ts_node_child_by_field_name(func_node, "body", TS_LSP_FIELD_LEN("body"));
     if (!ts_node_is_null(body)) {
@@ -3897,6 +5558,8 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
             }
             ts_tree_cursor_delete(&cursor);
         } else {
+            if (ctx->collecting_callback_facts && !ts_callback_function(body))
+                ts_callback_propagate(ctx, body, NULL, ctx->library_environment, 0);
             process_node(ctx, body);
         }
     }
@@ -3904,9 +5567,13 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     ctx->enclosing_class_qn = saved_class;
     ctx->enclosing_func_qn = saved_func;
     ctx->current_scope = saved_scope;
+    ctx->library_environment = saved_environment;
+    ctx->isolated_page_context = saved_isolated;
+    ctx->page_fetch_blocked = saved_page_fetch_blocked;
+    ctx->eval_memo = saved_memo;
 }
 
-static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declaration) {
+static void process_top_level_initializers(TSLSPContext *ctx, TSNode declaration) {
     if (!ctx || ts_node_is_null(declaration) || !ctx->module_qn)
         return;
 
@@ -3918,19 +5585,208 @@ static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declarat
 
         TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
         TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
-        if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
+        if (ts_node_is_null(value))
             continue;
-
-        char *function_name = node_text(ctx, name);
-        if (!function_name)
+        if (node_kind_is(name, "identifier") &&
+            (node_kind_is(value, "arrow_function") || node_kind_is(value, "function_expression"))) {
+            char *function_name = node_text(ctx, name);
+            if (function_name) {
+                const char *function_qn =
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
+                process_function_body(ctx, value, function_qn, NULL);
+            }
             continue;
-        const char *function_qn =
-            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, function_name);
-        process_function_body(ctx, value, function_qn, NULL);
+        }
+        const char *saved_func = ctx->enclosing_func_qn;
+        ctx->enclosing_func_qn = ctx->module_qn;
+        process_node(ctx, value);
+        ctx->enclosing_func_qn = saved_func;
     }
 }
 
-void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
+static void ts_record_alias_blocker(TSLSPContext *ctx, TSNode target, bool actual_write,
+                                     bool registry_only, const CBMScope *module_names) {
+    if (!ctx->written_functions || ts_node_is_null(target))
+        return;
+    if (node_kind_is(target, "identifier") || node_kind_is(target, "type_identifier") ||
+        node_kind_is(target, "shorthand_property_identifier_pattern")) {
+        char *name = node_text(ctx, target);
+        const char *qn = registry_only && name && ctx->module_qn
+                             ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name)
+                             : NULL;
+        if (!name || (registry_only && !qn) ||
+            ((!registry_only || cbm_scope_contains(module_names, name) ||
+              cbm_registry_lookup_func(ctx->registry, qn)) &&
+             !cbm_scope_bind_checked(actual_write ? ctx->written_functions->parent
+                                                  : ctx->written_functions,
+                                     name, cbm_type_unknown())))
+            ctx->written_functions = NULL;
+        return;
+    }
+    if (node_kind_is(target, "pair_pattern") || node_kind_is(target, "assignment_pattern") ||
+        node_kind_is(target, "object_assignment_pattern")) {
+        const char *field = node_kind_is(target, "pair_pattern") ? "value" : "left";
+        ts_record_alias_blocker(ctx, ts_node_child_by_field_name(target, field,
+                                                                (uint32_t)strlen(field)),
+                                 actual_write, registry_only, module_names);
+        return;
+    }
+    if (node_kind_is(target, "array_pattern") || node_kind_is(target, "object_pattern") ||
+        node_kind_is(target, "rest_pattern") || node_kind_is(target, "parenthesized_expression")) {
+        uint32_t count = ts_node_named_child_count(target);
+        for (uint32_t i = 0; i < count; i++)
+            ts_record_alias_blocker(ctx, ts_node_named_child(target, i), actual_write,
+                                     registry_only, module_names);
+    }
+}
+
+static bool ts_collect_module_alias_names(TSLSPContext *ctx, TSNode declaration,
+                                           CBMScope *module_names) {
+    if (node_kind_is(declaration, "function_declaration")) {
+        TSNode name =
+            ts_node_child_by_field_name(declaration, "name", TS_LSP_FIELD_LEN("name"));
+        char *text = node_text(ctx, name);
+        return text && cbm_scope_bind_checked(module_names, text, cbm_type_unknown());
+    }
+    bool exported = node_kind_is(declaration, "export_statement");
+    if (!exported && !node_kind_is(declaration, "lexical_declaration") &&
+        !node_kind_is(declaration, "variable_declaration"))
+        return true;
+    bool ok = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(declaration);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (exported) {
+                ok = ts_collect_module_alias_names(ctx, child, module_names);
+            } else if (node_kind_is(child, "variable_declarator")) {
+                TSNode name =
+                    ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
+                if (node_kind_is(name, "identifier")) {
+                    char *text = node_text(ctx, name);
+                    ok = text &&
+                         cbm_scope_bind_checked(module_names, text, cbm_type_unknown());
+                }
+            }
+            if (!ok)
+                break;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
+static bool ts_is_function_boundary(TSNode node) {
+    return node_kind_is(node, "function_declaration") ||
+           node_kind_is(node, "generator_function_declaration") ||
+           node_kind_is(node, "function_expression") || node_kind_is(node, "generator_function") ||
+           node_kind_is(node, "method_definition") || node_kind_is(node, "arrow_function");
+}
+
+static void ts_collect_written_functions(TSLSPContext *ctx, TSNode root) {
+    /* shortcut: local writes and shadowing declarations also block same-name aliases
+     * elsewhere; add binding identity if this limits recall. Direct calls keep their policy. */
+    ctx->require_shadowed = true;
+    ctx->commonjs_load_end = ts_leading_commonjs_loads(ctx, root);
+    // Name fallback sees both frames; exact callback bindings consult only actual writes.
+    CBMScope *writes = cbm_scope_push(ctx->arena, NULL);
+    ctx->written_functions = writes ? cbm_scope_push(ctx->arena, writes) : NULL;
+    if (!ctx->written_functions || ctx->written_functions == writes) {
+        ctx->written_functions = NULL;
+        return;
+    }
+    CBMScope *module_names = cbm_scope_push(ctx->arena, NULL);
+    if (!module_names) {
+        ctx->written_functions = NULL;
+        return;
+    }
+    uint32_t child_count = 0;
+    TSNode *children = collect_children(ctx->arena, root, &child_count);
+    if (!children && ts_node_child_count(root) > 0) {
+        ctx->written_functions = NULL;
+        return;
+    }
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (!ts_collect_module_alias_names(ctx, children[i], module_names)) {
+            ctx->written_functions = NULL;
+            return;
+        }
+    }
+    for (int i = 0; i < ctx->import_count; i++) {
+        const char *name = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+        if (name && !cbm_scope_bind_checked(module_names, name, cbm_type_unknown())) {
+            ctx->written_functions = NULL;
+            return;
+        }
+    }
+    ctx->require_shadowed = cbm_scope_contains(module_names, "require");
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    int function_depth = 0;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ctx->commonjs_load_end &&
+            (node_kind_is(node, "identifier") ||
+             node_kind_is(node, "shorthand_property_identifier_pattern"))) {
+            // A declaration or indirect reference can hide a change to the wrapper's loader.
+            uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+            if (memchr(ctx->source + start, '\\', end - start)) {
+                ctx->commonjs_load_end = 0;
+            } else if (ts_source_is(ctx, node, "require")) {
+                TSNode parent = ts_node_parent(node);
+                TSNode callee =
+                    ts_node_child_by_field_name(parent, "function", TS_LSP_FIELD_LEN("function"));
+                if (!node_kind_is(parent, "call_expression") || !ts_node_eq(node, callee))
+                    ctx->commonjs_load_end = 0;
+            }
+        }
+        if (ts_is_function_boundary(node)) {
+            if (function_depth > 0 &&
+                (node_kind_is(node, "function_declaration") ||
+                 node_kind_is(node, "generator_function_declaration")))
+                ts_record_alias_blocker(ctx, ts_node_child_by_field_name(
+                                                node, "name", TS_LSP_FIELD_LEN("name")), false,
+                                         false, NULL);
+            function_depth++;
+        } else if (function_depth > 0 && node_kind_is(node, "variable_declarator") &&
+                   node_kind_is(ts_node_parent(node), "variable_declaration")) {
+            ts_record_alias_blocker(ctx, ts_node_child_by_field_name(
+                                            node, "name", TS_LSP_FIELD_LEN("name")), false,
+                                     false, NULL);
+        } else if (function_depth > 0 &&
+                   ((node_kind_is(node, "variable_declarator") &&
+                     node_kind_is(ts_node_parent(node), "lexical_declaration")) ||
+                    node_kind_is(node, "class_declaration"))) {
+            ts_record_alias_blocker(ctx, ts_node_child_by_field_name(
+                                            node, "name", TS_LSP_FIELD_LEN("name")), false, true,
+                                     module_names);
+        }
+        if (node_kind_is(node, "assignment_expression") ||
+            node_kind_is(node, "augmented_assignment_expression") ||
+            node_kind_is(node, "for_in_statement") || node_kind_is(node, "for_of_statement")) {
+            ts_record_alias_blocker(ctx, ts_node_child_by_field_name(
+                                            node, "left", TS_LSP_FIELD_LEN("left")), true,
+                                     false, NULL);
+        } else if (node_kind_is(node, "update_expression")) {
+            ts_record_alias_blocker(ctx, ts_node_child_by_field_name(
+                                            node, "argument", TS_LSP_FIELD_LEN("argument")), true,
+                                     false, NULL);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        for (;;) {
+            if (ts_is_function_boundary(ts_tree_cursor_current_node(&cursor)))
+                function_depth--;
+            if (ts_tree_cursor_goto_next_sibling(&cursor))
+                break;
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return;
+            }
+        }
+    }
+}
+
+static void ts_lsp_process_file_pass(TSLSPContext *ctx, TSNode root) {
     if (!ctx || ts_node_is_null(root))
         return;
     if (ctx->dts_mode)
@@ -3956,7 +5812,7 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         const char *kind = ts_node_type(child);
 
         if (strcmp(kind, "lexical_declaration") == 0 || strcmp(kind, "variable_declaration") == 0) {
-            process_top_level_variable_arrows(ctx, child);
+            process_top_level_initializers(ctx, child);
         } else if (strcmp(kind, "function_declaration") == 0) {
             TSNode name = ts_node_child_by_field_name(child, "name", TS_LSP_FIELD_LEN("name"));
             if (ts_node_is_null(name) || !ctx->module_qn)
@@ -3970,13 +5826,39 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
             process_node(ctx, child);
         } else if (strcmp(kind, "expression_statement") == 0) {
             /* tree-sitter-typescript wraps a namespace declaration in an
-             * expression_statement. Unwrap only that declaration shape;
-             * ordinary top-level expressions are not owned by a function. */
+             * expression_statement; window-assigned functions also own a body. */
             uint32_t count = ts_node_named_child_count(child);
             for (uint32_t j = 0; j < count; j++) {
                 TSNode inner = ts_node_named_child(child, j);
-                if (node_kind_is(inner, "internal_module"))
+                if (node_kind_is(inner, "internal_module")) {
                     process_node(ctx, inner);
+                } else if (node_kind_is(inner, "call_expression")) {
+                    // Top-level test registration supplies callback types; the
+                    // anonymous callback still needs an existing caller QN to emit.
+                    const char *saved_func = ctx->enclosing_func_qn;
+                    ctx->enclosing_func_qn = ctx->module_qn;
+                    process_node(ctx, inner);
+                    ctx->enclosing_func_qn = saved_func;
+                } else if (node_kind_is(inner, "assignment_expression") && ctx->module_qn) {
+                    TSNode value =
+                        ts_node_child_by_field_name(inner, "right", TS_LSP_FIELD_LEN("right"));
+                    if (!node_kind_is(value, "function_expression") &&
+                        !node_kind_is(value, "arrow_function"))
+                        continue;
+                    CBMLanguage lang = ctx->js_mode ? CBM_LANG_JAVASCRIPT : CBM_LANG_TYPESCRIPT;
+                    TSNode name_node = cbm_resolve_func_name(value, lang);
+                    if (ts_node_is_null(name_node) ||
+                        (!node_kind_is(name_node, "member_expression") &&
+                         !node_kind_is(name_node, "identifier")))
+                        continue;
+                    const char *name =
+                        cbm_func_name_node_text(ctx->arena, name_node, ctx->source, lang);
+                    if (name && name[0]) {
+                        const char *qn =
+                            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+                        process_function_body(ctx, value, qn, NULL);
+                    }
+                }
             }
         } else if (strcmp(kind, "export_statement") == 0) {
             // Walk the wrapped declaration.
@@ -3998,15 +5880,104 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                     process_function_body(ctx, inner, fqn, NULL);
                 } else if (strcmp(ik, "lexical_declaration") == 0 ||
                            strcmp(ik, "variable_declaration") == 0) {
-                    process_top_level_variable_arrows(ctx, inner);
+                    process_top_level_initializers(ctx, inner);
                 } else if (strcmp(ik, "class_declaration") == 0 ||
                            strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
                 }
             }
+        } else {
+            // Top-level control statements execute in the module's lexical scope.
+            const char *saved_func = ctx->enclosing_func_qn;
+            ctx->enclosing_func_qn = ctx->module_qn;
+            process_node(ctx, child);
+            ctx->enclosing_func_qn = saved_func;
         }
-        // Other top-level expression_statement bodies are not graphed as functions.
     }
+}
+
+static bool ts_callback_facts_equal(const struct TSLibCallbackFacts *a,
+                                     const struct TSLibCallbackFacts *b) {
+    if (!a || !b || a->count != b->count || a->argument_count != b->argument_count ||
+        a->truncated != b->truncated)
+        return false;
+    for (int i = 0; i < a->count; i++) {
+        const TSLibCallbackFact *left = &a->items[i], *right = &b->items[i];
+        if (left->node.id != right->node.id || left->environment != right->environment ||
+            left->conflict != right->conflict ||
+            !ts_callback_parameters_equal(left->expected, right->expected))
+            return false;
+    }
+    for (int i = 0; i < a->argument_count; i++) {
+        const TSLibCallbackArgument *left = &a->arguments[i], *right = &b->arguments[i];
+        if (left->function.id != right->function.id || left->value.id != right->value.id ||
+            left->parameter != right->parameter || left->conflict != right->conflict)
+            return false;
+    }
+    return true;
+}
+
+void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
+    if (!ctx || ts_node_is_null(root) || ctx->dts_mode)
+        return;
+    ctx->file_root = root;
+    if (!ctx->written_functions)
+        ts_collect_written_functions(ctx, root);
+    // Bind once to discover exact require() library identities before enabling
+    // the optional bounded propagation passes.
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (node_kind_is(child, "lexical_declaration") ||
+                node_kind_is(child, "variable_declaration"))
+                ts_process_statement(ctx, child);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (ctx->has_library_facts) {
+        CBMResolvedCallArray *saved_output = ctx->resolved_calls;
+        ctx->resolved_calls = NULL;
+        ctx->collecting_callback_facts = true;
+        bool stable = false;
+        bool limited = false;
+        for (int round = 0; round < 4; round++) {
+            struct TSLibCallbackFacts *facts = cbm_arena_alloc(ctx->arena, sizeof(*facts));
+            if (!facts) {
+                limited = true;
+                if (ctx->callback_facts)
+                    ctx->callback_facts->truncated = true;
+                break;
+            }
+            memset(facts, 0, sizeof(*facts));
+            facts->previous = ctx->callback_facts;
+            ctx->callback_facts = facts;
+            ctx->current_scope = cbm_scope_push(ctx->arena, NULL);
+            if (!ctx->current_scope)
+                facts->truncated = true;
+            ctx->eval_memo = NULL;
+            ts_lsp_process_file_pass(ctx, root);
+            stable = ts_callback_facts_equal(facts, facts->previous);
+            if (stable || facts->truncated)
+                break;
+        }
+        if (!stable && ctx->callback_facts)
+            ctx->callback_facts->truncated = true;
+        limited |= ctx->callback_facts && ctx->callback_facts->truncated;
+        ctx->collecting_callback_facts = false;
+        ctx->resolved_calls = saved_output;
+        if (limited && saved_output)
+            saved_output->callback_context_limited = true;
+        ctx->current_scope = cbm_scope_push(ctx->arena, NULL);
+        if (!ctx->current_scope) {
+            if (ctx->callback_facts)
+                ctx->callback_facts->truncated = true;
+            if (saved_output)
+                saved_output->callback_context_limited = true;
+        }
+        ctx->eval_memo = NULL;
+    }
+    ts_lsp_process_file_pass(ctx, root);
 }
 
 // ── Initialization ────────────────────────────────────────────────────────────
@@ -4031,6 +6002,7 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->js_mode = js_mode;
     ctx->jsx_mode = jsx_mode;
     ctx->dts_mode = dts_mode;
+    ctx->require_shadowed = true;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
 
     const char *debug_env = getenv("CBM_LSP_DEBUG");
@@ -4096,16 +6068,27 @@ static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const 
  * file's own import statements serves the per-file and both cross-file entry
  * points alike. `default as x` keeps today's local-name lookup (a default
  * import binds no exported member name); string export names and identity
- * aliases need no entry. Must run before the type passes, which resolve
- * imported type names. */
+ * aliases need no entry unless they prove a known library's named export.
+ * Must run before the type passes, which resolve imported type names. */
 static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
-    if (!ctx || !ctx->arena || ts_node_is_null(root) || ctx->import_count == 0)
+    if (!ctx || !ctx->arena || ts_node_is_null(root))
         return;
     uint32_t kn = 0;
     TSNode *kids = collect_children(ctx->arena, root, &kn);
     for (uint32_t i = 0; i < kn; i++) {
         if (!node_kind_is(kids[i], "import_statement"))
             continue;
+        TSNode source = ts_node_child_by_field_name(kids[i], "source", TS_LSP_FIELD_LEN("source"));
+        if (ts_node_is_null(source))
+            continue;
+        char *quoted = node_text(ctx, source);
+        size_t length = quoted ? strlen(quoted) : 0;
+        const char *module = length >= 2
+                                 ? cbm_arena_strndup(ctx->arena, quoted + 1, length - 2) : NULL;
+        if (ts_library_module(module) || ts_module_is_node_builtin(module))
+            ctx->library_environment = 1;
+        if (ts_library_module(module))
+            ctx->has_library_facts = true;
         TSNode named = find_first_kind(find_first_kind(kids[i], "import_clause"), "named_imports");
         if (ts_node_is_null(named))
             continue;
@@ -4117,12 +6100,17 @@ static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
             TSNode name = ts_node_child_by_field_name(specs[j], "name", TS_LSP_FIELD_LEN("name"));
             TSNode alias =
                 ts_node_child_by_field_name(specs[j], "alias", TS_LSP_FIELD_LEN("alias"));
-            if (!node_kind_is(name, "identifier") || !node_kind_is(alias, "identifier"))
+            if (!node_kind_is(name, "identifier"))
                 continue;
+            if (!node_kind_is(alias, "identifier"))
+                alias = name;
             char *exported = node_text(ctx, name);
             char *local = node_text(ctx, alias);
+            /* External packages may have no graph IMPORTS target. */
+            if (local && ts_library_module(module) && ts_import_first(ctx, local) < 0)
+                ts_lsp_add_import(ctx, local, module);
             if (exported && local && strcmp(exported, "default") != 0 &&
-                strcmp(exported, local) != 0)
+                (strcmp(exported, local) != 0 || ts_library_module(module)))
                 ts_lsp_add_import_alias(ctx, local, exported);
         }
     }
@@ -5947,9 +7935,17 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
         // Interface method signatures we need to register as separate funcs.
         const char *iface_method_names[64] = {0};
         const char *iface_method_qns[64] = {0};
-        const CBMType *iface_method_sigs[64] = {0};
         int iface_method_count = 0;
         bool is_interface = (strcmp(k, "interface_declaration") == 0);
+        int iface_existing[63];
+        int iface_existing_count = 0;
+        if (is_interface) {
+            for (int fi = 0; fi < reg->func_count && iface_existing_count < 63; fi++) {
+                const CBMRegisteredFunc *func = &reg->funcs[fi];
+                if (func->receiver_type && strcmp(func->receiver_type, class_qn) == 0)
+                    iface_existing[iface_existing_count++] = fi;
+            }
+        }
 
         uint32_t bnc = ts_node_named_child_count(body);
         for (uint32_t bi = 0; bi < bnc && field_count < 63; bi++) {
@@ -6000,10 +7996,26 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 const char *mqn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, mnm);
                 iface_method_names[iface_method_count] = mnm;
                 iface_method_qns[iface_method_count] = mqn;
-                iface_method_sigs[iface_method_count] = sig;
                 iface_method_count++;
 
-                // Also register a CBMRegisteredFunc so cbm_registry_lookup_method picks it up.
+                // Refine each extracted occurrence once; duplicate registrations
+                // would let overload lookup select the unrefined signature.
+                CBMRegisteredFunc *existing = NULL;
+                for (int ei = 0; ei < iface_existing_count; ei++) {
+                    int fi = iface_existing[ei];
+                    if (fi >= 0 && reg->funcs[fi].qualified_name &&
+                        strcmp(reg->funcs[fi].qualified_name, mqn) == 0) {
+                        existing = &reg->funcs[fi];
+                        iface_existing[ei] = -1;
+                        break;
+                    }
+                }
+                if (existing) {
+                    existing->signature = sig;
+                    existing->min_params = min_params;
+                    continue;
+                }
+
                 CBMRegisteredFunc rf;
                 memset(&rf, 0, sizeof(rf));
                 rf.qualified_name = mqn;
@@ -6047,9 +8059,116 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 rt->method_names = mn_arr;
                 rt->method_qns = mq_arr;
             }
-            (void)iface_method_sigs; // sigs already attached via cbm_registry_add_func
         }
     }
+}
+
+static void ts_mark_lexical_call(CBMCall *call, const CBMResolvedCall *blocked) {
+    if (!blocked || call->source_origin != blocked->source_origin || !call->callee_name ||
+        !call->enclosing_func_qn || !blocked->caller_qn || !blocked->callee_qn ||
+        call->site_start_byte != blocked->site_start_byte ||
+        call->site_end_byte != blocked->site_end_byte ||
+        strcmp(blocked->caller_qn, call->enclosing_func_qn) != 0)
+        return;
+    const char *call_leaf = strrchr(call->callee_name, '.');
+    const char *blocked_leaf = strrchr(blocked->callee_qn, '.');
+    if (strcmp(call_leaf ? call_leaf + 1 : call->callee_name,
+               blocked_leaf ? blocked_leaf + 1 : blocked->callee_qn) == 0) {
+        if (strcmp(blocked->reason, "dynamic_callable_target_unknown") == 0)
+            call->requires_lsp_resolution = true;
+        else
+            call->suppress_name_fallback = true;
+    }
+}
+
+static void ts_mark_lexical_calls(CBMArena *arena, CBMFileResult *result) {
+    CBMHashTable *blocked_sites = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION ||
+            resolved->source_origin != CBM_SOURCE_ORIGIN_RAW || !resolved->reason ||
+            (strcmp(resolved->reason, "dynamic_callable_target_unknown") != 0 &&
+             strcmp(resolved->reason, "external_symbol_not_indexed") != 0 &&
+             strcmp(resolved->reason, "method_not_in_registry") != 0 &&
+             strcmp(resolved->reason, "module_symbol_not_in_registry") != 0 &&
+             strcmp(resolved->reason, "import_symbol_not_in_registry") != 0) ||
+            resolved->site_end_byte <= resolved->site_start_byte)
+            continue;
+        if (!blocked_sites)
+            blocked_sites = cbm_ht_create(0);
+        const char *key = cbm_arena_sprintf(arena, "%u:%u", resolved->site_start_byte,
+                                           resolved->site_end_byte);
+        cbm_ht_set(blocked_sites, key, resolved);
+        if (!key || cbm_ht_get(blocked_sites, key) != resolved) {
+            for (int c = 0; c < result->calls.count; c++)
+                ts_mark_lexical_call(&result->calls.items[c], resolved);
+        }
+    }
+    if (!blocked_sites)
+        return;
+    for (int i = 0; i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        char key[32];
+        snprintf(key, sizeof(key), "%u:%u", call->site_start_byte, call->site_end_byte);
+        ts_mark_lexical_call(call, cbm_ht_get(blocked_sites, key));
+    }
+    cbm_ht_free(blocked_sites);
+}
+
+static bool ts_file_needs_library(TSNode root, const char *source, int source_len) {
+    bool found = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (node_kind_is(node, "identifier")) {
+            uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+            for (size_t i = 0; end <= (uint32_t)source_len &&
+                               i < sizeof(ts_lib_bindings) / sizeof(ts_lib_bindings[0]); i++) {
+                const TSLibBinding *binding = &ts_lib_bindings[i];
+                if (!binding->owner[0] && binding->env == 3 &&
+                    strlen(binding->name) == end - start &&
+                    memcmp(source + start, binding->name, end - start) == 0) {
+                    found = true;
+                    goto finished;
+                }
+            }
+        }
+        if (node_kind_is(node, "string")) {
+            TSNode parent = ts_node_parent(node);
+            bool module_source = node_kind_is(parent, "import_statement");
+            if (node_kind_is(parent, "arguments")) {
+                TSNode call = ts_node_parent(parent);
+                TSNode function = ts_node_child_by_field_name(call, "function",
+                                                              TS_LSP_FIELD_LEN("function"));
+                if (node_kind_is(function, "identifier")) {
+                    uint32_t start = ts_node_start_byte(function), end = ts_node_end_byte(function);
+                    module_source = end <= (uint32_t)source_len && end - start == 7 &&
+                                    memcmp(source + start, "require", 7) == 0;
+                }
+            }
+            uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+            if (module_source && end <= (uint32_t)source_len && end > start + 1 &&
+                end - start < 128) {
+                char module[128] = {0};
+                memcpy(module, source + start + 1, end - start - 2);
+                if (ts_library_module(module) || ts_module_is_node_builtin(module)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor))
+                break;
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto finished;
+        }
+    }
+finished:
+    ts_tree_cursor_delete(&cursor);
+    return found;
 }
 
 void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
@@ -6068,6 +8187,8 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_ts_stdlib_register(&reg, arena);
+    if (ts_file_needs_library(root, source, source_len))
+        ts_library_register(&reg, arena);
     /* The passes below ask about every definition of the file, while it fills and
      * after. It is indexed once its defs are in, with the first registration
      * answering as a scan does, and what the passes add after that is found by
@@ -6082,6 +8203,8 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
                 dts_mode, &result->resolved_calls);
+    ctx.js_object_owners = cbm_js_object_owners(arena, &result->defs);
+    ctx.file_defs = &result->defs;
     ctx.usages = &result->usages;
 
     // Add imports early so type-resolution passes can rewrite NAMED references that
@@ -6094,6 +8217,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_collect_written_functions(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);
@@ -6101,6 +8225,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     infer_implicit_returns(&ctx, root, &reg);
 
     ts_lsp_process_file(&ctx, root);
+    ts_mark_lexical_calls(arena, result);
     cbm_arena_destroy(&idx_arena);
 }
 
@@ -6266,6 +8391,7 @@ CBMTypeRegistry *cbm_ts_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         return NULL;
     cbm_registry_init(reg, arena);
     cbm_ts_stdlib_register(reg, arena);
+    ts_library_register(reg, arena);
     /* Budget scales with the def volume this build parses type texts for. */
     ts_type_budget_reset((size_t)(def_count > 0 ? def_count : 1) * 1024);
     for (int i = 0; i < def_count; i++) {
@@ -6294,9 +8420,28 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         int def_count, const char **import_names,
                                         const char **import_qns, int import_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_with_compiler(arena, source, source_len, module_qn, js_mode, jsx_mode,
+                                      dts_mode, reg, defs, def_count, import_names, import_qns,
+                                       import_count, cached_tree, out, NULL, NULL, NULL, NULL);
+}
+
+void cbm_run_ts_lsp_cross_with_compiler(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, const CBMCompilerFacts *facts, const char *rel_path,
+    const char *sha256, const CBMDefArray *file_defs) {
     if (!arena || !out || !reg)
         return;
 
+    char current_sha256[65];
+    if (facts) {
+        if (!source || source_len < 0)
+            return;
+        cbm_sha256_hex(source, (size_t)source_len, current_sha256);
+        if (!rel_path || !sha256 || strcmp(current_sha256, sha256) != 0)
+            facts = NULL;
+    }
     ts_type_budget_reset((size_t)source_len);
 
     /* Per-file overlay: register only the file's own-module defs so the
@@ -6342,6 +8487,8 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn, js_mode, jsx_mode, dts_mode,
                 out);
+    ctx.js_object_owners = cbm_js_object_owners(arena, file_defs);
+    ctx.file_defs = file_defs;
     ctx.cross_file_mode = true;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
@@ -6349,11 +8496,19 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_collect_written_functions(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &overlay);
     refine_ast_signatures(&ctx, root, &overlay);
     apply_jsdoc_signatures(&ctx, root, &overlay);
     infer_implicit_returns(&ctx, root, &overlay);
+
+    if (facts && cbm_compiler_facts_merge_registry(facts, &overlay, rel_path)) {
+        ctx.compiler_facts = facts;
+        ctx.compiler_path = rel_path;
+        ctx.compiler_sha256 = sha256;
+        cbm_registry_finalize(&overlay);
+    }
 
     ts_lsp_process_file(&ctx, root);
 
@@ -6361,11 +8516,11 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         ts_tree_delete(tree);
 }
 
-void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                          const char *module_qn, bool js_mode, bool jsx_mode, bool dts_mode,
-                          CBMLSPDef *defs, int def_count, const char **import_names,
-                          const char **import_qns, int import_count, TSTree *cached_tree,
-                          CBMResolvedCallArray *out) {
+void cbm_run_ts_lsp_cross_for_file(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMLSPDef *defs, int def_count, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    const CBMDefArray *file_defs) {
     if (!arena || !out)
         return;
 
@@ -6548,6 +8703,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
         return;
     }
 
+    if (ts_file_needs_library(root, source, source_len))
+        ts_library_register(&reg, arena);
     // Build a faux CBMFileResult so register_file_defs's downstream paths work; we don't
     // need it here because cross-file defs already came in as CBMLSPDef.
     // Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
@@ -6556,6 +8713,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, js_mode, jsx_mode, dts_mode, out);
+    ctx.js_object_owners = cbm_js_object_owners(arena, file_defs);
+    ctx.file_defs = file_defs;
     ctx.cross_file_mode = true;
 
     // Add imports early so type passes can resolve imported types.
@@ -6565,6 +8724,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
         }
     }
     ts_lsp_collect_import_aliases(&ctx, root);
+    ts_collect_written_functions(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);

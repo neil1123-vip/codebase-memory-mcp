@@ -75,6 +75,7 @@ struct CBMType {
         struct {
             const char** field_names;   // NULL-terminated
             const CBMType** field_types; // NULL-terminated
+            const CBMType** embedded_types; // NULL-terminated; Go promoted members
         } struct_type;                                      // STRUCT
         struct { const char* name; } builtin;               // BUILTIN
         struct {

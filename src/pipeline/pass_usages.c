@@ -148,6 +148,155 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
     return node;
 }
 
+typedef struct {
+    const cbm_gbuf_node_t *source;
+    const cbm_gbuf_node_t *target;
+    const CBMUsage *site;
+} sql_foreign_usage_t;
+
+static int compare_sql_foreign_usages(const void *a, const void *b) {
+    const sql_foreign_usage_t *left = a;
+    const sql_foreign_usage_t *right = b;
+    if (left->source->id != right->source->id)
+        return left->source->id < right->source->id ? -1 : 1;
+    if (left->target->id != right->target->id)
+        return left->target->id < right->target->id ? -1 : 1;
+    if (left->site->site_start_byte != right->site->site_start_byte)
+        return left->site->site_start_byte < right->site->site_start_byte ? -1 : 1;
+    if (left->site->site_end_byte != right->site->site_end_byte)
+        return left->site->site_end_byte < right->site->site_end_byte ? -1 : 1;
+    return left->site->kind - right->site->kind;
+}
+
+static bool emit_grouped_sql_usage(cbm_gbuf_t *output, const sql_foreign_usage_t *rows, size_t count) {
+    bool table = rows[0].site->kind == CBM_USAGE_SQL_TABLE_TARGET;
+    bool trigger = strcmp(rows[0].source->label, "Function") == 0;
+    /* Keep table spans when a duplicate legacy USAGE carries only callee. */
+    const char *key = table ? "{\"sql_table_sites\":[" :
+                      trigger ? ",\"sql_trigger_of_sites\":[" : ",\"sql_foreign_sites\":[";
+    size_t key_len = strlen(key);
+    const size_t site_cap = sizeof("[4294967295,4294967295,false],");
+    char legacy[CBM_SZ_512] = {0};
+    char escaped[CBM_SZ_256];
+    cbm_json_escape(escaped, sizeof(escaped), rows[0].target->name);
+    if (table)
+        (void)snprintf(legacy, sizeof(legacy), "{\"callee\":\"%s\"}", escaped);
+    size_t of_count = 0;
+    bool has_body = false;
+    for (size_t i = 0; !table && i < count; i++) {
+        const CBMUsage *site = rows[i].site;
+        bool of = site->kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN;
+        of_count += of;
+        if (of && has_body)
+            continue;
+        char props[CBM_SZ_512];
+        (void)snprintf(props, sizeof(props),
+                       "{\"callee\":\"%s\",\"%s\":true,\"site_start_byte\":%u,"
+                       "\"site_end_byte\":%u%s}",
+                       escaped, trigger ? "sql_trigger_column" : "sql_foreign_column",
+                       site->site_start_byte, site->site_end_byte,
+                       site->kind == CBM_USAGE_SQL_FOREIGN_IMPLICIT_COLUMN ?
+                           ",\"sql_foreign_implicit\":true" : "");
+        /* Prefer the existing body representative when the header also names the column. */
+        if ((trigger && !of && !has_body) || strcmp(props, legacy) > 0)
+            memcpy(legacy, props, strlen(props) + 1);
+        has_body |= trigger && !of;
+    }
+    const int64_t source = rows[0].source->id, target = rows[0].target->id;
+    if (trigger ? !of_count : !table && count == 1)
+        return cbm_gbuf_insert_edge(output, source, target, "USAGE", legacy) > 0;
+
+    const size_t base = strlen(legacy) - 1;
+    size_t published_count = trigger ? of_count : count;
+    if (published_count > (SIZE_MAX - base - key_len - 3) / site_cap)
+        return false;
+    const size_t cap = base + key_len + 3 + published_count * site_cap;
+    char *props = malloc(cap);
+    if (!props)
+        return false;
+    size_t used = table ? 0 : base;
+    memcpy(props, legacy, used);
+    memcpy(props + used, key, key_len);
+    used += key_len;
+    const char *separator = "";
+    for (size_t i = 0; i < count; i++) {
+        const CBMUsage *site = rows[i].site;
+        if (trigger && site->kind != CBM_USAGE_SQL_TRIGGER_OF_COLUMN)
+            continue;
+        int len = table || trigger
+                      ? snprintf(props + used, cap - used, "%s[%u,%u]", separator,
+                                 site->site_start_byte, site->site_end_byte)
+                      : snprintf(props + used, cap - used, "%s[%u,%u,%s]", separator,
+                                 site->site_start_byte, site->site_end_byte,
+                                 site->kind == CBM_USAGE_SQL_FOREIGN_IMPLICIT_COLUMN ? "true" : "false");
+        if (len < 0 || (size_t)len >= cap - used - 2) {
+            free(props);
+            return false;
+        }
+        used += (size_t)len;
+        separator = ",";
+    }
+    if (table) {
+        props[used++] = ']';
+        props[used++] = ',';
+        memcpy(props + used, legacy + 1, base + 1);
+    } else {
+        memcpy(props + used, "]}", sizeof("]}"));
+    }
+    bool ok = cbm_gbuf_insert_edge(output, source, target, "USAGE", props) > 0;
+    free(props);
+    return ok;
+}
+
+int cbm_pipeline_emit_grouped_sql_usages(const cbm_gbuf_t *graph, cbm_gbuf_t *output,
+                                        const CBMFileResult *result, const char *rel) {
+    size_t count = 0;
+    for (int i = 0; i < result->usages.count; i++)
+        count += cbm_pipeline_is_grouped_sql_usage(&result->usages.items[i]);
+    if (!count)
+        return 0;
+    if (count > SIZE_MAX / sizeof(sql_foreign_usage_t))
+        return CBM_NOT_FOUND;
+    sql_foreign_usage_t *rows = malloc(count * sizeof(*rows));
+    if (!rows)
+        return CBM_NOT_FOUND;
+    size_t used = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        const CBMUsage *site = &result->usages.items[i];
+        if (!cbm_pipeline_is_grouped_sql_usage(site) || !site->enclosing_func_qn || !site->ref_name)
+            continue;
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(graph, site->enclosing_func_qn);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(graph, site->ref_name);
+        bool table = site->kind == CBM_USAGE_SQL_TABLE_TARGET;
+        bool trigger = site->kind == CBM_USAGE_SQL_TRIGGER_COLUMN ||
+                       site->kind == CBM_USAGE_SQL_TRIGGER_OF_COLUMN;
+        if (!source || !target || !source->file_path || !target->file_path ||
+            strcmp(source->file_path, rel) != 0 || strcmp(target->file_path, rel) != 0 ||
+            (table ? strcmp(source->label, "Module") != 0 && strcmp(source->label, "View") != 0
+                   : strcmp(source->label, trigger ? "Function" : "Field") != 0) ||
+            strcmp(target->label, table ? "Table" : "Field") != 0)
+            continue;
+        rows[used++] = (sql_foreign_usage_t){source, target, site};
+    }
+    qsort(rows, used, sizeof(*rows), compare_sql_foreign_usages);
+    int resolved = 0;
+    for (size_t start = 0, next = 0; start < used; start = next) {
+        size_t unique = start + 1;
+        for (next = unique; next < used && rows[next].source == rows[start].source &&
+                           rows[next].target == rows[start].target; next++) {
+            if (compare_sql_foreign_usages(&rows[unique - 1], &rows[next]) != 0)
+                rows[unique++] = rows[next];
+        }
+        if (!emit_grouped_sql_usage(output, rows + start, unique - start)) {
+            resolved = CBM_NOT_FOUND;
+            break;
+        }
+        resolved++;
+    }
+    free(rows);
+    return resolved;
+}
+
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
@@ -166,10 +315,14 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, lang, result);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
-        if (!usage->ref_name) {
+        if (!usage->ref_name || cbm_pipeline_is_grouped_sql_usage(usage)) {
             continue;
         }
         const cbm_gbuf_node_t *src = find_enclosing_node(ctx, usage->enclosing_func_qn, rel);
+        /* Native Go platform variants can share a QN, but not a source file. */
+        if (lang == CBM_LANG_GO && src && (!src->file_path || strcmp(src->file_path, rel) != 0)) {
+            src = find_enclosing_node(ctx, NULL, rel);
+        }
         if (!src) {
             continue;
         }
@@ -217,6 +370,14 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
         bool property_read = false;
+        bool sql_table = usage->kind == CBM_USAGE_SQL_FOREIGN_TABLE;
+        if (sql_table) {
+            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, usage->ref_name);
+            if (!tgt || !tgt->file_path || strcmp(tgt->file_path, rel) != 0 ||
+                !src->file_path || strcmp(src->file_path, rel) != 0 ||
+                strcmp(tgt->label, "Table") != 0 || strcmp(src->label, "Table") != 0)
+                continue;
+        }
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
@@ -285,6 +446,13 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                                    imp_keys, imp_count)) {
                 continue;
             }
+            /* An external Go package qualifier is not a project value. */
+            if (lang == CBM_LANG_GO && !usage->is_member_access &&
+                cbm_suppress_external_import_shadow(
+                    usage->ref_name, res.strategy, &result->imports, imp_keys, imp_count,
+                    cbm_pipeline_get_pkgmap(), cbm_pipeline_get_nsmap())) {
+                continue;
+            }
             /* a plain value reference names the field twin of a same-named
              * method; a callable-reference candidate keeps the method */
             bool value_ref = usage->kind == CBM_USAGE_VALUE && !usage->may_be_call_reference;
@@ -316,14 +484,16 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 continue;
             }
         }
-        if (!tgt || src->id == tgt->id) {
+        if (!tgt || src->id == tgt->id ||
+            (lang == CBM_LANG_GO && cbm_pipeline_usage_semantic_reference_candidate(usage) &&
+             !cbm_pipeline_go_reference_target_allowed(tgt))) {
             continue;
         }
 
         /* ref_name is sliced source text and can contain quotes/newlines —
          * escape it or the edge properties JSON is malformed. */
         char esc_ref[CBM_SZ_256];
-        cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+        cbm_json_escape(esc_ref, sizeof(esc_ref), sql_table ? tgt->name : usage->ref_name);
         char uprops[CBM_SZ_512];
         snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
@@ -386,6 +556,10 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         }
 
         const cbm_gbuf_node_t *src = find_enclosing_node(ctx, rw->enclosing_func_qn, rel);
+        /* Native Go platform variants can share a QN, but not a source file. */
+        if (lang == CBM_LANG_GO && src && (!src->file_path || strcmp(src->file_path, rel) != 0)) {
+            src = find_enclosing_node(ctx, NULL, rel);
+        }
         if (!src) {
             continue;
         }
@@ -517,11 +691,30 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
+        if (files[i].language == CBM_LANG_GO &&
+            !cbm_pipeline_bind_go_callers(ctx->gbuf, result, rel)) {
+            cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
+            if (result_owned)
+                cbm_free_result(result);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+
         if (result->usages.count == 0 && result->throws.count == 0 && result->rw.count == 0) {
             if (result_owned) {
                 cbm_free_result(result);
             }
             continue;
+        }
+
+        if (files[i].language == CBM_LANG_SQL) {
+            int foreign = cbm_pipeline_emit_grouped_sql_usages(ctx->gbuf, ctx->gbuf, result, rel);
+            if (foreign < 0) {
+                if (result_owned)
+                    cbm_free_result(result);
+                cbm_log_error("pipeline.err", "phase", "sql_foreign_usages", "file", rel);
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            }
+            usage_resolved += foreign;
         }
 
         const char **imp_keys = NULL;

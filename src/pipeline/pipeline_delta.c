@@ -692,6 +692,12 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * its owner (doc_links_pdf.c), so a re-resolved document needs it too.
      * Only where owner + name differs from the QN (delta_owner_props).
      *
+     * Exact declaration identity also survives on Go/JS/TS proxies. A
+     * compiler target must match the final node, including after an
+       * incremental repair; keeping just its QN would lose that proof.
+       * Preserve Go identity values verbatim: true is not integer 1, and
+       * an absent field is not an explicit null.
+     *
      * And a generated member's mark (a Java record's implicit accessor, a
      * Method node): the registry seed reads it to register the member by
      * qualified name only, as the full build does (cbm_node_props_generated);
@@ -701,12 +707,35 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * (cbm_node_is_test) to rank a test definition below real code, as the
      * full build does with CBMDefinition.is_test; without it every proxy
      * scored as production and a re-resolved caller could bind a test helper
-     * the full build ranks last. */
+     * the full build ranks last.
+     *
+     * Function/Method fingerprints let the similarity post-pass rebuild over
+     * the complete corpus, including pairs with unchanged files. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
             "SELECT id, label, name, qualified_name, file_path,"
-            " CASE WHEN label IN ('Module','Variable')"
+              " CASE WHEN physical_decl IS NULL AND logical_qn IS NULL THEN proxy_props"
+              " WHEN physical_decl IS NULL"
+              " THEN json_set(proxy_props, '$.go_logical_qn', json(logical_qn))"
+              " WHEN logical_qn IS NULL"
+              " THEN json_set(proxy_props, '$.go_physical_decl', json(physical_decl))"
+              " ELSE json_set(proxy_props, '$.go_physical_decl', json(physical_decl),"
+              " '$.go_logical_qn', json(logical_qn)) END,"
+              " start_line, end_line, parent_class, generated, is_test"
+              " FROM (SELECT id, label, name, qualified_name, file_path,"
+            " json_patch(CASE WHEN instr(properties, '\"name_start_byte\"') > 0"
+            " OR instr(properties, '\"decl_ambiguous\"') > 0"
+            " THEN json_object("
+            " 'name_start_byte', json_extract(properties, '$.name_start_byte'),"
+            " 'name_end_byte', json_extract(properties, '$.name_end_byte'),"
+            " 'name_source_origin', json_extract(properties, '$.name_source_origin'),"
+            " 'source_sha256', json_extract(properties, '$.source_sha256'),"
+            " 'decl_ambiguous', json(CASE WHEN"
+            " json_extract(properties, '$.decl_ambiguous') = 1 THEN 'true' ELSE 'false' END),"
+            " 'http_client', json_extract(properties, '$.http_client'),"
+            " 'http_base_url', json_extract(properties, '$.http_base_url'))"
+            " WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
             " 'http_base_url', json_extract(properties, '$.http_base_url'))"
@@ -723,18 +752,27 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " 'swift_extension', json_extract(properties, '$.swift_extension'),"
             " 'swift_imports', json_extract(properties, '$.swift_imports'))"
             " WHEN instr(properties, '\"base_classes\"') > 0"
-            " THEN json_object('base_classes', json_extract(properties, '$.base_classes')) END,"
+            " THEN json_object('base_classes', json_extract(properties, '$.base_classes'))"
+            " ELSE '{}' END,"
+            " CASE WHEN label = 'Function' AND json_type(properties, '$.cgo_preamble') = 'text'"
+              " THEN json_object('cgo_preamble', json_extract(properties, '$.cgo_preamble'),"
+              " 'fp', json_extract(properties, '$.fp'))"
+            " WHEN label IN ('Function','Method')"
+            " AND json_type(properties, '$.fp') = 'text'"
+              " THEN json_object('fp', json_extract(properties, '$.fp')) ELSE '{}' END) AS proxy_props,"
             " start_line, end_line,"
             " CASE WHEN label IN ('Method','Variable')"
             " AND instr(properties, '\"parent_class\"') > 0"
-            " THEN json_extract(properties, '$.parent_class') END,"
+              " THEN json_extract(properties, '$.parent_class') END AS parent_class,"
             " CASE WHEN label = 'Method'"
             " AND instr(properties, '\"" CBM_PROP_GENERATED "\"') > 0"
-            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END,"
-            " instr(properties, '\"is_test\":true') > 0"
+              " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END AS generated,"
+              " instr(properties, '\"is_test\":true') > 0 AS is_test,"
+              " properties -> '$.go_physical_decl' AS physical_decl,"
+              " properties -> '$.go_logical_qn' AS logical_qn"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
-            " ('Macro','Comment','Section','Branch','Commit','Tag')"
+              " ('Macro','Comment','Section','Branch','Commit','Tag'))"
             " ORDER BY id",
             CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return -1;
@@ -918,10 +956,13 @@ static void delta_patch_node(const cbm_gbuf_node_t *node, void *userdata) {
     ctx->nodes++;
 }
 
-/* An edge of a class recomputed wholesale on every run (an Image's build
- * edges, the env join's edges): the staging graph dropped its old set, so it
- * is written even between pre-existing nodes. */
+/* An edge of a class recomputed wholesale on every run (similarity, an
+ * Image's build edges, the env join's edges): the staging graph dropped its
+ * old set, so it is written even between pre-existing nodes. */
 static bool delta_edge_recomputed(const delta_patch_ctx_t *ctx, const cbm_gbuf_edge_t *edge) {
+    if (strcmp(edge->type, "SIMILAR_TO") == 0) {
+        return true;
+    }
     const char *want = strcmp(edge->type, CBM_BUILD_EDGE_TYPE) == 0     ? CBM_BUILD_EDGE_SOURCE
                        : strcmp(edge->type, CBM_ENVJOIN_EDGE_TYPE) == 0 ? CBM_ENVJOIN_EDGE_SOURCE
                                                                         : NULL;
@@ -1001,6 +1042,13 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
         return CBM_NOT_FOUND;
     }
     if (cbm_store_begin(store) != CBM_STORE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    /* The post-pass rebuilt similarity over fresh nodes and all proxies.
+     * Replace the whole set even when it produced no edges; fast mode's set
+     * remains empty. Snapshot capture excludes this edge type. */
+    if (cbm_store_delete_edges_by_type(store, project, "SIMILAR_TO") != CBM_STORE_OK) {
+        cbm_store_rollback(store);
         return CBM_NOT_FOUND;
     }
     /* This writes the buffer's nodes itself: settle the collision spans first,

@@ -445,7 +445,8 @@ LSP_SRCS = $(CBM_DIR)/lsp_all.c
 # Makefile does not use compiler auto-dependency (-MMD) generation.
 LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
                  $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
-                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
+                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/lsp/generated/*.h \
+                            $(CBM_DIR)/*.h)
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
@@ -473,7 +474,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/call_sites.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -521,6 +522,8 @@ GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
 PIPELINE_SRCS = \
     src/pipeline/fqn.c \
     src/pipeline/lsp_surface.c \
+    src/pipeline/compiler_facts.c \
+    src/pipeline/compiler_runner.c \
     src/pipeline/pipeline_delta.c \
     src/pipeline/path_alias.c \
     src/pipeline/laravel_routing.c \
@@ -1019,6 +1022,9 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
+
+TEST_PIPELINE_SRCS += tests/test_compiler_facts.c tests/test_compiler_chunks.c tests/test_compiler_compact.c tests/test_compiler_runner.c tests/test_compiler_projection.c tests/test_compiler_pipeline.c
+TEST_STORE_SRCS += tests/test_call_sites_store.c
 
 ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_RUBY_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 

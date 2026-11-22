@@ -180,7 +180,7 @@ static const char *go_func_types[] = {"function_declaration", "method_declaratio
 static const char *go_class_types[] = {"type_spec", "type_alias", "type_declaration", NULL};
 static const char *go_field_types[] = {"field_declaration", NULL};
 static const char *go_module_types[] = {"source_file", NULL};
-static const char *go_call_types[] = {"call_expression", NULL};
+static const char *go_call_types[] = {"call_expression", "type_conversion_expression", NULL};
 static const char *go_import_types[] = {"import_declaration", "import", NULL};
 static const char *go_branch_types[] = {"if_statement",
                                         "for_statement",
@@ -241,6 +241,8 @@ static const char *ts_func_types[] = {"function_declaration",
                                       "function_expression",
                                       "arrow_function",
                                       "method_definition",
+                                      "method_signature",
+                                      "abstract_method_signature",
                                       "function_signature",
                                       NULL};
 static const char *ts_class_types[] = {"class_declaration",
@@ -251,6 +253,7 @@ static const char *ts_class_types[] = {"class_declaration",
                                        "type_alias_declaration",
                                        "internal_module",
                                        NULL};
+static const char *ts_field_types[] = {"public_field_definition", "property_signature", NULL};
 static const char *ts_decorator_types[] = {"decorator", NULL};
 
 // ==================== ARKTS (HarmonyOS .ets) ====================
@@ -1738,7 +1741,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
          js_throw_types, NULL, empty_types, NULL, js_env_members, tree_sitter_javascript, NULL},
 
     // CBM_LANG_TYPESCRIPT
-    [CBM_LANG_TYPESCRIPT] = {CBM_LANG_TYPESCRIPT, ts_func_types, ts_class_types, empty_types,
+    [CBM_LANG_TYPESCRIPT] = {CBM_LANG_TYPESCRIPT, ts_func_types, ts_class_types, ts_field_types,
                              js_module_types, js_call_types, js_import_types, js_import_types,
                              js_branch_types, js_var_types,
                              (const char *[]){"assignment_expression",
@@ -1748,7 +1751,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_TSX
     [CBM_LANG_TSX] =
-        {CBM_LANG_TSX, ts_func_types, ts_class_types, empty_types, js_module_types, js_call_types,
+        {CBM_LANG_TSX, ts_func_types, ts_class_types, ts_field_types, js_module_types, js_call_types,
          js_import_types, js_import_types, js_branch_types, js_var_types,
          (const char *[]){"assignment_expression", "augmented_assignment_expression", NULL},
          js_throw_types, NULL, ts_decorator_types, NULL, ts_env_members, tree_sitter_tsx, NULL},

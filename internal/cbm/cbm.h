@@ -220,6 +220,13 @@ typedef enum {
 
 // --- Extraction result structs ---
 
+/* Byte offsets are meaningful only within the source buffer that produced
+ * them. C-family preprocessing uses a different buffer from the raw file. */
+typedef enum {
+    CBM_SOURCE_ORIGIN_RAW = 0,
+    CBM_SOURCE_ORIGIN_PREPROCESSED,
+} CBMSourceOrigin;
+
 typedef struct {
     const char *name;           // short name
     const char *qualified_name; // project.path.name
@@ -334,6 +341,15 @@ typedef struct {
      * so the other languages pay 8 bytes per definition. Tail field:
      * zero-init stays valid. */
     const struct CBMDefTypeFacts *type_facts;
+    /* Go declared underlying type text; separate from identity-alias method sets. */
+    const char *go_underlying_type;
+    /* Complete generic Go declaration, excluding a function or method body. */
+    const char *go_generic_declaration;
+    /* Exact raw declaration name for compiler-fact admission. Zero means
+     * that extraction has no precise name node; line/name guesses are unsafe. */
+    uint32_t name_start_byte, name_end_byte;
+    CBMSourceOrigin name_source_origin;
+    bool js_object_collision;
 } CBMDefinition;
 
 /* Facts of one Go or Python definition that no graph property carries; only
@@ -398,14 +414,6 @@ typedef struct {
  * definition is the target, and the macro only when no definition is visible. */
 #define CBM_MACRO_QN_SUFFIX "#macro"
 
-/* Byte offsets are meaningful only within the source buffer that produced
- * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
- * buffers can contain unrelated occurrences at the same numeric span. */
-typedef enum {
-    CBM_SOURCE_ORIGIN_RAW = 0,
-    CBM_SOURCE_ORIGIN_PREPROCESSED,
-} CBMSourceOrigin;
-
 typedef struct {
     const char *callee_name;       // raw callee text ("pkg.Func", "foo")
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
@@ -431,8 +439,12 @@ typedef struct {
                                      // rooted in an imported name. Read by the weak-member
                                      // guard and by the pxc synthetic-carrier dedup key in
                                      // pass_lsp_cross.c. Default false.
-    bool requires_lsp_resolution;    // synthetic semantic candidate (for example an implicit
-                                     // C++ operator). Never fall back to textual resolution.
+    bool requires_lsp_resolution;    // needs semantic binding (for example an implicit C++
+                                     // operator or JS contextual name). No textual fallback.
+    bool suppress_name_fallback;     // receiver is unresolved: retain service classification,
+                                     // but require type evidence for a plain CALLS edge.
+    bool callee_has_string_identity; // IRIS string dispatch names the complete class+method;
+                                     // every target must preserve that qualified identity.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
                                      // module-level foo. Python only today. Read by the
@@ -462,6 +474,7 @@ typedef struct {
     uint8_t trailing_closure_count;
     bool trailing_closure_truncated;
     const char **trailing_closure_labels;
+    const char *compiler_route_handler_qn; // exact Go HandleFunc argument declaration, or NULL
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's
@@ -582,6 +595,12 @@ typedef struct {
 typedef enum {
     CBM_USAGE_VALUE = 0,
     CBM_USAGE_CALL_REFERENCE,
+    CBM_USAGE_SQL_FOREIGN_TABLE,
+    CBM_USAGE_SQL_FOREIGN_COLUMN,
+    CBM_USAGE_SQL_TRIGGER_COLUMN,
+    CBM_USAGE_SQL_FOREIGN_IMPLICIT_COLUMN,
+    CBM_USAGE_SQL_TABLE_TARGET,
+    CBM_USAGE_SQL_TRIGGER_OF_COLUMN,
 } CBMUsageKind;
 
 typedef struct {
@@ -731,6 +750,8 @@ typedef struct {
     CBMResolvedCall *items;
     int count;
     int cap;
+    /* Callback context stopped at its budget; ordinary resolution still ran. */
+    bool callback_context_limited;
 } CBMResolvedCallArray;
 
 /* Refinement status: existing parser/no-op exits are separate from these
@@ -1105,6 +1126,9 @@ typedef struct CBMFileResult {
     int test_owner_source_len;
     CBMLanguage test_owner_language;
     char test_owner_source_sha256[65]; /* exact raw source; identity, not authentication */
+    /* Exact Go/JS/TS extraction input, retained through compact/spill. */
+    char raw_source_sha256[65];
+    char go_build_header_sha256[65]; /* Go build header through the package clause */
 
     /* Doc-comment references of this file's definitions (doclink.h), and the
      * file's doc-link scope: a language-tagged text blob with what OTHER
@@ -1237,6 +1261,7 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    bool go_has_cgo_import;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1343,8 +1368,10 @@ void cbm_result_compact_release_thread(void);
 /* Parse one whole file as if its last line ended with "\n" (#2078). The
  * parser sees the source plus one virtual newline when the last byte is not
  * already one; the returned tree is then clamped back to `source_len`, so no
- * node range, point or text reaches past the real bytes. Every whole-file parse
- * goes through here, so a retained tree and a fallback re-parse agree. */
+ * node range, point or text reaches past the real bytes. Recognized grammar
+ * compatibility cases reparse an equal-length source view under the same opts
+ * and included ranges. Consumers still read the original source. Every
+ * whole-file parse goes through here, so retained and fallback trees agree. */
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
                          TSParseOptions opts);
 
@@ -1539,6 +1566,14 @@ void cbm_extract_definitions(CBMExtractCtx *ctx);
 /* Internal companion for embedded-language trees that contribute definitions
  * to an existing host-file Module rather than minting a second Module. */
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
+char *cbm_sql_identifier_key(CBMArena *arena, const char *text, size_t length);
+typedef struct {
+    TSNode old_name, new_name;
+} CBMSQLColumnAlter;
+CBMSQLColumnAlter cbm_sql_column_alter(CBMExtractCtx *ctx, TSNode alter, TSNode object);
+void cbm_bind_sql_columns(CBMExtractCtx *ctx, TSNode verified_transaction, bool require_replay,
+                          TSNode verified_top_level_alter);
+bool cbm_sql_relation_is_cte(CBMExtractCtx *ctx, TSNode relation, TSNode name, TSNode owner);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.
