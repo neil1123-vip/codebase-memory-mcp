@@ -34,7 +34,7 @@ mkdir "$output/cache" "$output/runtime" "$output/tmp" "$output/go-cache" "$outpu
 export GOCACHE="$output/go-cache" GOTMPDIR="$output/go-tmp" TMPDIR="$output/tmp"
 export GOTOOLCHAIN=local GOENV=off GOWORK=off GOPROXY=off GOSUMDB=off GONOPROXY=none
 export GOAUTH=off GOTELEMETRY=off GOCACHEPROG= SDKROOT="$sdk"
-export CGO_ENABLED=1 CGO_CFLAGS=-mmacosx-version-min=12.0 CGO_LDFLAGS=-mmacosx-version-min=12.0
+export CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -mmacosx-version-min=12.0" CGO_LDFLAGS=-mmacosx-version-min=12.0
 export CC="$(xcrun --sdk macosx --find clang)"
 GOOS=$("$go" env GOHOSTOS)
 GOARCH=$("$go" env GOHOSTARCH)

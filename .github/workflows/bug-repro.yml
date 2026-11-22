@@ -76,8 +76,6 @@ jobs:
             sysctl hw.logicalcpu hw.memsize
             df -k "$RUNNER_TEMP"
           } | tee "$RUNNER_TEMP/magpie-darwin-inputs/runner-resources.txt"
-          git apply --check "$script_dir/admit-native-darwin.patch"
-          git apply "$script_dir/admit-native-darwin.patch"
           CBM_NO_CCACHE=1 scripts/build.sh CC=cc CXX=c++
           sh "$script_dir/index-darwin.sh" "$GITHUB_WORKSPACE/build/c/codebase-memory-mcp" \
             "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.tmp-darwin-magpie-public" \

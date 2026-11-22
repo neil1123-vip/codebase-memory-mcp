@@ -114,13 +114,15 @@ def main():
             assert all(row[3] != "lsp_compiler_external" for row in call(db, site)), site["path"]
         selection = {}
         if selected is not None:
-            unbound_paths = {
-                path for (path,) in db.execute(
-                    "select distinct rel_path from call_sites "
-                    "where category='unresolved' and rel_path glob '*.go'"
-                )
-                if path in selected
-            }
+            unresolved_rows = [
+                dict(path=path, start_byte=start, end_byte=end, leaf=leaf, reason=reason, strategy=strategy)
+                for path, start, end, leaf, reason, strategy in db.execute(
+                    "select rel_path,start_byte,end_byte,leaf,reason,strategy from call_sites "
+                    "where category='unresolved' and rel_path glob '*.go' "
+                    "order by rel_path,start_byte,end_byte"
+                ) if path in selected
+            ]
+            unbound_paths = {row['path'] for row in unresolved_rows}
             indexed = {path for (path,) in db.execute(
                 "select rel_path from file_hashes where rel_path glob '*.go'"
             )}
@@ -128,6 +130,7 @@ def main():
                 "go_list_selected_files": len(selected),
                 "go_list_selected_files_missing_from_graph": sorted(selected - indexed),
                 "go_list_selected_files_with_unresolved_calls": sorted(unbound_paths),
+                "go_list_selected_unresolved_call_sites": unresolved_rows,
             }
 
     print(json.dumps({

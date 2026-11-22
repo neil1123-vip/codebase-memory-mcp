@@ -4306,7 +4306,11 @@ static void extract_go_cgo_preamble(CBMExtractCtx *ctx, TSParseOptions options) 
     TSParser *parser = ts_parser_new();
     if (!parser)
         return;
-    TSTree *tree = ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)) &&
+    CBMLanguage language = CBM_LANG_C;
+#ifdef __APPLE__
+    language = CBM_LANG_OBJC;
+#endif
+    TSTree *tree = ts_parser_set_language(parser, cbm_ts_language(language)) &&
                            ts_parser_set_included_ranges(parser, &range, 1)
                        ? cbm_parse_source(parser, ctx->source, (uint32_t)ctx->source_len, options)
                        : NULL;
@@ -4323,10 +4327,10 @@ static void extract_go_cgo_preamble(CBMExtractCtx *ctx, TSParseOptions options) 
         TSNode node = ts_node_named_child(root, i);
         if (strcmp(ts_node_type(node), "function_definition") != 0 || ts_node_has_error(node))
             continue;
-        TSNode name = cbm_resolve_func_name(node, CBM_LANG_C);
+        TSNode name = cbm_resolve_func_name(node, language);
         if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0)
             continue;
-        const char *text = cbm_func_name_node_text(ctx->arena, name, ctx->source, CBM_LANG_C);
+        const char *text = cbm_func_name_node_text(ctx->arena, name, ctx->source, language);
         uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
         if (!text || start < range.start_byte || end > range.end_byte || start >= end)
             continue;

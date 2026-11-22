@@ -1150,7 +1150,12 @@ static const char *cf_context(yyjson_val *root, bool go, bool go_index,
         yyjson_val *env = yyjson_obj_get(context, "env");
         const char *cgo_policy = cf_str(context, "cgo_policy");
         const char *goos = cf_str(env, "GOOS"), *goarch = cf_str(env, "GOARCH");
-        bool native_cgo = go_index && cbm_go_cgo_enabled() && cf_equal(goos, "linux") &&
+        bool native_cgo = go_index && cbm_go_cgo_enabled() &&
+#ifdef __APPLE__
+                          cf_equal(goos, "darwin") &&
+#else
+                          cf_equal(goos, "linux") &&
+#endif
                           cf_equal(cgo_policy, "explicit-native") &&
                           cf_equal(cf_str(env, "CGO_ENABLED"), "1") &&
                           cf_equal(goos, cf_str(env, "GOHOSTOS")) &&
@@ -1540,13 +1545,18 @@ static char *cf_external_method_name(const CBMCompilerFacts *facts, CFValue symb
 static bool cf_string_member(yyjson_val *array, const char *value);
 
 static bool cf_cgo_native_context(const CFGraph *graph) {
-#ifdef __linux__
     yyjson_val *context = yyjson_obj_get(cbm_compiler_facts_json(graph->facts), "context");
-    return cf_equal(cf_str(context, "cgo_policy"), "explicit-native") &&
-           cf_equal(cf_str(yyjson_obj_get(context, "env"), "GOOS"), "linux");
+    yyjson_val *env = yyjson_obj_get(context, "env");
+    const char *goos = cf_str(env, "GOOS");
+    return cbm_go_cgo_enabled() &&
+           cf_equal(cf_str(context, "cgo_policy"), "explicit-native") &&
+           cf_equal(cf_str(env, "CGO_ENABLED"), "1") &&
+           cf_equal(goos, cf_str(env, "GOHOSTOS")) &&
+           cf_equal(cf_str(env, "GOARCH"), cf_str(env, "GOHOSTARCH")) &&
+#ifdef __APPLE__
+           cf_equal(goos, "darwin");
 #else
-    (void)graph;
-    return false;
+           cf_equal(goos, "linux");
 #endif
 }
 

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"debug/dwarf"
 	"debug/elf"
+	"debug/macho"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1314,10 +1315,8 @@ func (l *loader) cgoDeclarations(meta *listPackage) map[string]cgoTarget {
 		}
 		name := strings.TrimSuffix(strings.TrimSpace(string(header[:16])), "/")
 		if strings.HasPrefix(name, "_x") && strings.HasSuffix(name, ".o") && size <= 8<<20 {
-			object, err := elf.NewFile(io.NewSectionReader(archive, offset, size))
-			if err == nil {
-				l.cgoObjectDeclarations(meta, object, targets)
-				object.Close()
+			if data := cgoObjectDWARF(io.NewSectionReader(archive, offset, size), runtime.GOOS); data != nil {
+				l.cgoObjectDeclarations(meta, data, runtime.GOOS == "darwin", targets)
 			}
 		}
 		offset += size + (size & 1)
@@ -1325,18 +1324,39 @@ func (l *loader) cgoDeclarations(meta *listPackage) map[string]cgoTarget {
 	return targets
 }
 
-func (l *loader) cgoObjectDeclarations(meta *listPackage, object *elf.File, targets map[string]cgoTarget) {
-	var bytes uint64
-	for _, section := range object.Sections {
-		if section.Size > 8<<20-bytes {
-			return
+func cgoObjectDWARF(source io.ReaderAt, goos string) *dwarf.Data {
+	var total uint64
+	if goos == "darwin" {
+		object, err := macho.NewFile(source)
+		if err != nil || object.Type != macho.TypeObj {
+			return nil
 		}
-		bytes += section.Size
+		defer object.Close()
+		for _, section := range object.Sections {
+			if strings.HasPrefix(section.Name, "__zdebug_") || section.Size > 8<<20-total {
+				return nil
+			}
+			total += section.Size
+		}
+		data, _ := object.DWARF()
+		return data
 	}
-	data, err := object.DWARF()
+	object, err := elf.NewFile(source)
 	if err != nil {
-		return
+		return nil
 	}
+	defer object.Close()
+	for _, section := range object.Sections {
+		if section.Size > 8<<20-total {
+			return nil
+		}
+		total += section.Size
+	}
+	data, _ := object.DWARF()
+	return data
+}
+
+func (l *loader) cgoObjectDeclarations(meta *listPackage, data *dwarf.Data, machoObject bool, targets map[string]cgoTarget) {
 	reader := data.Reader()
 	var lines *dwarf.LineReader
 	var stack []*dwarf.Entry
@@ -1366,7 +1386,7 @@ func (l *loader) cgoObjectDeclarations(meta *listPackage, object *elf.File, targ
 					attribute = dwarf.AttrAbstractOrigin
 				}
 				if offset, ok := entry.Val(attribute).(dwarf.Offset); ok {
-					target, matched := l.cgoDeclaration(meta, data, lines, name, offset)
+					target, matched := l.cgoDeclaration(meta, data, lines, name, offset, machoObject)
 					if matched {
 						if previous, found := targets[name]; found && previous != target {
 							target = cgoTarget{}
@@ -1389,7 +1409,7 @@ func cgoWrapperName(wrapper string) (string, bool) {
 }
 
 func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwarf.LineReader,
-	name string, offset dwarf.Offset) (cgoTarget, bool) {
+	name string, offset dwarf.Offset, machoObject bool) (cgoTarget, bool) {
 	reader := data.Reader()
 	reader.Seek(offset)
 	decl, err := reader.Next()
@@ -1400,7 +1420,7 @@ func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwar
 	line, _ := decl.Val(dwarf.AttrDeclLine).(int64)
 	column, _ := decl.Val(dwarf.AttrDeclColumn).(int64)
 	files := lines.Files()
-	if index <= 0 || index >= int64(len(files)) || files[index] == nil || line <= 0 || column <= 0 {
+	if index <= 0 || index >= int64(len(files)) || files[index] == nil || line <= 0 || (!machoObject && column <= 0) {
 		return cgoTarget{}, true
 	}
 	path := filepath.Clean(files[index].Name)
@@ -1435,6 +1455,16 @@ func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwar
 	if lineEnd < 0 {
 		lineEnd = len(source.Data) - start
 	}
+	if column <= 0 {
+		// Apple clang omits DW_AT_decl_column. Require one spelling on the proven declaration line.
+		declaration := source.Data[start : start+lineEnd]
+		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `[	 ]*\(`)
+		matches := pattern.FindAllIndex(declaration, 2)
+		if len(matches) != 1 {
+			return cgoTarget{}, true
+		}
+		column = int64(matches[0][0] + 1)
+	}
 	start += int(column) - 1
 	end := start + len(name)
 	if int(column)-1+len(name) > lineEnd || string(source.Data[start:end]) != name {
@@ -1461,6 +1491,7 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		end bool
 	}
 	nativeCalls := make(map[nativePosition]string)
+	toolchainCalls := make(map[nativePosition]bool)
 	fs := g.loader.fset
 	generatedSource := g.loader.sources[fs.PositionFor(generated.Pos(), false).Filename]
 	ast.Inspect(generated, func(node ast.Node) bool {
@@ -1476,8 +1507,22 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 				if wrapper && bound && fn.Pkg() == pkg.Types && pos.Filename == source.Abs && pos.Column != 0 {
 					_, direct := call.Fun.(*ast.ParenExpr)
 					key := nativePosition{position{pos.Line, pos.Column}, !direct}
+					if runtime.GOOS == "darwin" {
+						switch name {
+						case "CString", "CBytes", "GoString", "GoStringN", "GoBytes", "_CMalloc":
+							source := g.loader.sources[fs.PositionFor(fn.Pos(), false).Filename]
+							if source != nil && bytes.HasPrefix(source.Data, []byte("// Code generated by cmd/cgo; DO NOT EDIT.")) &&
+								g.loader.manifest[source.Abs] == nil {
+								toolchainCalls[key] = true
+								if name == "_CMalloc" {
+									name = "malloc"
+								}
+							}
+						}
+					}
 					if _, duplicate := nativeCalls[key]; duplicate {
 						name = ""
+						delete(toolchainCalls, key)
 					}
 					nativeCalls[key] = name
 					return true
@@ -1548,10 +1593,14 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		var native cgoTarget
 		nativeName, isC := strings.CutPrefix(callee, "C.")
 		if isC {
-			startName := nativeCalls[nativePosition{position{pos.Line, pos.Column}, false}]
-			endName := nativeCalls[nativePosition{position{callEnd.Line, callEnd.Column}, true}]
-			if (startName == nativeName) != (endName == nativeName) {
+			from := nativePosition{position{pos.Line, pos.Column}, false}
+			to := nativePosition{position{callEnd.Line, callEnd.Column}, true}
+			startMatch, endMatch := nativeCalls[from] == nativeName, nativeCalls[to] == nativeName
+			if startMatch != endMatch {
 				native = pkg.CgoDeclarations[nativeName]
+				if (startMatch && toolchainCalls[from]) || (endMatch && toolchainCalls[to]) {
+					native = cgoTarget{external: true}
+				}
 				if native.preamble && native.declaration.Path != source.Path {
 					native = cgoTarget{}
 				}
@@ -2635,7 +2684,7 @@ func analyze(ctx context.Context, opts options) (out facts, err error) {
 	if err != nil {
 		return out, err
 	}
-	cgoHeaders := opts.Cgo && runtime.GOOS == "linux" && (opts.PackageIndex || opts.ChunkIndex || opts.ChunkIndexV2)
+	cgoHeaders := opts.Cgo && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && (opts.PackageIndex || opts.ChunkIndex || opts.ChunkIndexV2)
 	manifest, files, err := readManifest(ctx, out.Root, opts.Manifest, cgoHeaders)
 	if err != nil {
 		return out, err

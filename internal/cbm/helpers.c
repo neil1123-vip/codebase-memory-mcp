@@ -31,7 +31,7 @@ enum {
 #define SLEN(s) (sizeof(s) - SKIP_ONE)
 
 bool cbm_go_cgo_enabled(void) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     char setting[8];
     const char *value = cbm_safe_getenv("CBM_GO_FACTS_CGO", setting, sizeof(setting), NULL);
     return value && strcmp(value, "1") == 0;
