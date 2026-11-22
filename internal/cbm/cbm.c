@@ -4250,7 +4250,7 @@ static void record_included_files(CBMArena *a, CBMFileResult *result,
     result->included_files = list;
 }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 static TSNode cgo_preamble_comment(const CBMExtractCtx *ctx) {
     uint32_t count = ts_node_named_child_count(ctx->root);
     for (uint32_t i = 1; i < count; i++) {
@@ -5361,7 +5361,7 @@ static CBMFileResult *extract_file_ex_body(
      * doc-link scope: both read the complete docstrings and the tree. */
     cbm_doclinks_extract(&ctx);
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (ctx.go_has_cgo_import && rel_path && cbm_go_cgo_enabled())
         extract_go_cgo_preamble(&ctx, opts);
 #endif

@@ -64,10 +64,15 @@ static int language_group(CBMLanguage language) {
 }
 
 static int manifest_group(const cbm_file_info_t *file, bool cgo_headers) {
-    if (cgo_headers && (file->language == CBM_LANG_C || file->language == CBM_LANG_CPP)) {
+    if (cgo_headers) {
         const char *extension = strrchr(file->rel_path, '.');
-        if (extension && strcmp(extension, ".h") == 0)
+        if (extension && (file->language == CBM_LANG_C || file->language == CBM_LANG_CPP) &&
+            strcmp(extension, ".h") == 0)
             return 0;
+#ifdef __APPLE__
+        if (extension && file->language == CBM_LANG_OBJC && strcmp(extension, ".m") == 0)
+            return 0;
+#endif
     }
     return language_group(file->language);
 }

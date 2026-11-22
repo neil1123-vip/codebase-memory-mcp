@@ -239,16 +239,17 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 // --- Helpers ---
 
 static void def_set_source_name(const CBMExtractCtx *ctx, CBMDefinition *def, TSNode name) {
-    bool raw_header = false;
-#ifdef __linux__
-    if ((ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP) &&
-        ctx->test_declarations_raw_source && ctx->rel_path) {
+    bool raw_native = false;
+    if (ctx->test_declarations_raw_source && ctx->rel_path && cbm_go_cgo_enabled()) {
         const char *extension = strrchr(ctx->rel_path, '.');
-        raw_header = extension && strcmp(extension, ".h") == 0 && cbm_go_cgo_enabled();
-    }
+        raw_native = extension && (ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP) &&
+                     strcmp(extension, ".h") == 0;
+#ifdef __APPLE__
+        raw_native |= extension && ctx->language == CBM_LANG_OBJC && strcmp(extension, ".m") == 0;
 #endif
+    }
     if ((ctx->language != CBM_LANG_GO && ctx->language != CBM_LANG_JAVASCRIPT &&
-         ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX && !raw_header) ||
+         ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX && !raw_native) ||
         ts_node_is_null(name)) {
         return;
     }

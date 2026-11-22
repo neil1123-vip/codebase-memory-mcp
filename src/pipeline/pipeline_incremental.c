@@ -334,7 +334,11 @@ static int semantic_manifest_add_cgo_preamble(semantic_manifest_builder_t *build
                                                const char *project) {
     if (!cbm_go_cgo_enabled())
         return 0;
+#ifdef __APPLE__
+    static const char profile[] = CBM_SEMANTIC_INPUT_PREFIX "darwin-cgo-native-v1";
+#else
     static const char profile[] = CBM_SEMANTIC_INPUT_PREFIX "linux-cgo-preamble-v1";
+#endif
     char digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(profile, sizeof(profile) - 1, digest);
     return semantic_manifest_add_digest(builder, project, profile, digest, 0, 0);

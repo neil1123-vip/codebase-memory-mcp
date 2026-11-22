@@ -84,9 +84,15 @@ def main():
         assert build["patterns"] == ["./..."]
         assert go["status"] in ("complete", "partial") and go["sites"] > 0
         assert db.execute("pragma quick_check").fetchone() == ("ok",)
-        assert db.execute(
-            "select count(*) from call_sites where target_qn like '%tmp-rebase-%'"
-        ).fetchone() == (0,)
+        (temp_call_sites,) = db.execute(
+            """select count(*) from call_sites
+               where target_qn like '%tmp-rebase-%'"""
+        ).fetchone()
+        (temp_call_edges,) = db.execute(
+            """select count(*) from edges as e join nodes as n on n.id=e.target_id
+               where e.type='CALLS' and
+                 (n.file_path like '%.tmp-rebase-%' or n.qualified_name like '%tmp-rebase-%')"""
+        ).fetchone()
 
         unresolved = []
         confirmed = Counter()
@@ -115,9 +121,10 @@ def main():
         selection = {}
         if selected is not None:
             unresolved_rows = [
-                dict(path=path, start_byte=start, end_byte=end, leaf=leaf, reason=reason, strategy=strategy)
-                for path, start, end, leaf, reason, strategy in db.execute(
-                    "select rel_path,start_byte,end_byte,leaf,reason,strategy from call_sites "
+                dict(path=path, start_byte=start, end_byte=end, leaf=leaf, reason=reason,
+                     strategy=strategy, is_reference=bool(is_reference))
+                for path, start, end, leaf, reason, strategy, is_reference in db.execute(
+                    "select rel_path,start_byte,end_byte,leaf,reason,strategy,is_reference from call_sites "
                     "where category='unresolved' and rel_path glob '*.go' "
                     "order by rel_path,start_byte,end_byte"
                 ) if path in selected
@@ -136,9 +143,10 @@ def main():
     print(json.dumps({
         "platform": opts.platform, "architecture": env["GOARCH"], "toolchain": build["tool_version"],
         "go_status": go["status"], "go_sites": go["sites"], "expected": expected_count,
-        "confirmed": dict(confirmed), "unresolved": unresolved, **selection,
+        "confirmed": dict(confirmed), "unresolved": unresolved,
+        "tmp_rebase_call_sites": temp_call_sites, "tmp_rebase_calls_edges": temp_call_edges, **selection,
     }, indent=2))
-    return int(go["status"] != "complete" or bool(unresolved) or
+    return int(go["status"] != "complete" or bool(unresolved) or temp_call_sites or temp_call_edges or
                bool(selection.get("go_list_selected_files_missing_from_graph")) or
                bool(selection.get("go_list_selected_files_with_unresolved_calls")))
 

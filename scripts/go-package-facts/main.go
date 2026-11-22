@@ -331,14 +331,14 @@ type module struct {
 }
 
 type listPackage struct {
-	ImportPath, Name, Dir, ForTest, Export string
-	Standard                               bool
-	GoFiles, CompiledGoFiles, Imports      []string
-	CgoFiles, HFiles, InvalidGoFiles       []string
-	ImportMap                              map[string]string
-	Module                                 *module
-	Error                                  *struct{ Err string }
-	DepsErrors                             []struct{ Err string }
+	ImportPath, Name, Dir, ForTest, Export   string
+	Standard                                 bool
+	GoFiles, CompiledGoFiles, Imports        []string
+	CgoFiles, HFiles, MFiles, InvalidGoFiles []string
+	ImportMap                                map[string]string
+	Module                                   *module
+	Error                                    *struct{ Err string }
+	DepsErrors                               []struct{ Err string }
 }
 
 type sourceFile struct {
@@ -458,6 +458,10 @@ func digestFile(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+func cgoNativeSource(path string) bool {
+	return strings.HasSuffix(path, ".h") || (runtime.GOOS == "darwin" && strings.HasSuffix(path, ".m"))
+}
+
 func readManifest(ctx context.Context, root, path string, cgoHeaders bool) (map[string]*sourceFile, []fileFact, error) {
 	if path == "" {
 		return nil, nil, errors.New("discovery manifest is required; no files were admitted")
@@ -487,7 +491,7 @@ func readManifest(ctx context.Context, root, path string, cgoHeaders bool) (map[
 		if !ok || rel != clean {
 			return nil, nil, fmt.Errorf("manifest path is outside the admitted root: %q", clean)
 		}
-		if !strings.HasSuffix(clean, ".go") && !(cgoHeaders && strings.HasSuffix(clean, ".h")) {
+		if !strings.HasSuffix(clean, ".go") && !(cgoHeaders && cgoNativeSource(clean)) {
 			continue
 		}
 		if _, exists := paths[abs]; exists {
@@ -1271,6 +1275,7 @@ type cgoTarget struct {
 	declaration location
 	external    bool
 	preamble    bool
+	forward     bool
 }
 
 // cgo's package archive contains the native wrapper objects that supplied the
@@ -1279,8 +1284,12 @@ func (l *loader) cgoDeclarations(meta *listPackage) map[string]cgoTarget {
 	if !l.cgoHeaders || meta.Export == "" {
 		return nil
 	}
+	var objcFiles []string
+	if runtime.GOOS == "darwin" {
+		objcFiles = meta.MFiles
+	}
 	// C line control can make unrelated physical declarations share a DWARF location.
-	for _, name := range slices.Concat(meta.CgoFiles, meta.HFiles) {
+	for _, name := range slices.Concat(meta.CgoFiles, meta.HFiles, objcFiles) {
 		source, err := l.source(name, meta.Dir)
 		if err != nil || cgoLineControl.Match(cgoLineSplice.ReplaceAll(source.Data, nil)) {
 			return nil
@@ -1300,6 +1309,10 @@ func (l *loader) cgoDeclarations(meta *listPackage) map[string]cgoTarget {
 		return nil
 	}
 	targets := make(map[string]cgoTarget)
+	var definitions map[string]cgoTarget
+	if len(objcFiles) != 0 {
+		definitions = make(map[string]cgoTarget)
+	}
 	for offset := int64(len(magic)); offset < info.Size(); {
 		var header [60]byte
 		if l.ctx.Err() != nil {
@@ -1316,10 +1329,15 @@ func (l *loader) cgoDeclarations(meta *listPackage) map[string]cgoTarget {
 		name := strings.TrimSuffix(strings.TrimSpace(string(header[:16])), "/")
 		if strings.HasPrefix(name, "_x") && strings.HasSuffix(name, ".o") && size <= 8<<20 {
 			if data := cgoObjectDWARF(io.NewSectionReader(archive, offset, size), runtime.GOOS); data != nil {
-				l.cgoObjectDeclarations(meta, data, runtime.GOOS == "darwin", targets)
+				l.cgoObjectDeclarations(meta, data, runtime.GOOS == "darwin", targets, definitions)
 			}
 		}
 		offset += size + (size & 1)
+	}
+	for name, target := range targets {
+		if target.forward {
+			targets[name] = definitions[name]
+		}
 	}
 	return targets
 }
@@ -1356,7 +1374,8 @@ func cgoObjectDWARF(source io.ReaderAt, goos string) *dwarf.Data {
 	return data
 }
 
-func (l *loader) cgoObjectDeclarations(meta *listPackage, data *dwarf.Data, machoObject bool, targets map[string]cgoTarget) {
+func (l *loader) cgoObjectDeclarations(meta *listPackage, data *dwarf.Data, machoObject bool,
+	targets, definitions map[string]cgoTarget) {
 	reader := data.Reader()
 	var lines *dwarf.LineReader
 	var stack []*dwarf.Entry
@@ -1374,6 +1393,22 @@ func (l *loader) cgoObjectDeclarations(meta *listPackage, data *dwarf.Data, mach
 		}
 		if entry.Tag == dwarf.TagCompileUnit {
 			lines, _ = data.LineReader(entry)
+		}
+		if definitions != nil && lines != nil && entry.Tag == dwarf.TagSubprogram &&
+			entry.Val(dwarf.AttrExternal) == true && entry.Val(dwarf.AttrDeclaration) != true &&
+			(entry.Val(dwarf.AttrLowpc) != nil || entry.Val(dwarf.AttrRanges) != nil) {
+			name, _ := entry.Val(dwarf.AttrName).(string)
+			linkage, _ := entry.Val(dwarf.AttrLinkageName).(string)
+			path := cgoDeclarationPath(lines, entry)
+			if name != "" && (linkage == "" || linkage == name) &&
+				strings.HasSuffix(path, ".m") && filepath.Dir(path) == meta.Dir &&
+				slices.Contains(meta.MFiles, filepath.Base(path)) {
+				target := l.cgoLocation(entry, path, name, true)
+				if _, duplicate := definitions[name]; duplicate {
+					target = cgoTarget{}
+				}
+				definitions[name] = target
+			}
 		}
 		if lines != nil && len(stack) != 0 &&
 			(entry.Tag == dwarf.TagCallSite || entry.Tag == dwarf.TagInlinedSubroutine) {
@@ -1408,6 +1443,19 @@ func cgoWrapperName(wrapper string) (string, bool) {
 	return name, found && cgo && len(hash) == 12 && strings.Trim(hash, "0123456789abcdef") == ""
 }
 
+func cgoDeclarationPath(lines *dwarf.LineReader, decl *dwarf.Entry) string {
+	index, ok := decl.Val(dwarf.AttrDeclFile).(int64)
+	files := lines.Files()
+	if !ok || index < 0 || index >= int64(len(files)) || files[index] == nil {
+		return ""
+	}
+	path := filepath.Clean(files[index].Name)
+	if !filepath.IsAbs(path) {
+		return ""
+	}
+	return path
+}
+
 func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwarf.LineReader,
 	name string, offset dwarf.Offset, machoObject bool) (cgoTarget, bool) {
 	reader := data.Reader()
@@ -1416,38 +1464,48 @@ func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwar
 	if err != nil || decl == nil || decl.Tag != dwarf.TagSubprogram || decl.Val(dwarf.AttrName) != name {
 		return cgoTarget{}, false
 	}
-	index, _ := decl.Val(dwarf.AttrDeclFile).(int64)
+	path := cgoDeclarationPath(lines, decl)
 	line, _ := decl.Val(dwarf.AttrDeclLine).(int64)
 	column, _ := decl.Val(dwarf.AttrDeclColumn).(int64)
-	files := lines.Files()
-	if index <= 0 || index >= int64(len(files)) || files[index] == nil || line <= 0 || (!machoObject && column <= 0) {
+	if path == "" || line <= 0 || (!machoObject && column <= 0) {
 		return cgoTarget{}, true
-	}
-	path := filepath.Clean(files[index].Name)
-	if !filepath.IsAbs(path) {
-		return cgoTarget{}, true
-	}
-	if decl.Val(dwarf.AttrDeclaration) == true {
-		_, local := within(l.root, path)
-		// The SDK declaration proves external linkage, without naming a library or implementation.
-		return cgoTarget{external: !local && strings.HasSuffix(path, ".h") &&
-			decl.Val(dwarf.AttrExternal) == true}, true
 	}
 	nameInPackage := filepath.Base(path)
 	preamble := strings.HasSuffix(path, ".go") && slices.Contains(meta.CgoFiles, nameInPackage)
 	header := strings.HasSuffix(path, ".h") && slices.Contains(meta.HFiles, nameInPackage)
+	if decl.Val(dwarf.AttrDeclaration) == true {
+		_, local := within(l.root, path)
+		// A local forward declaration needs a unique compiled definition from this package.
+		if machoObject && decl.Val(dwarf.AttrExternal) == true &&
+			filepath.Dir(path) == meta.Dir && (preamble || header) &&
+			l.cgoLocation(decl, path, name, true) != (cgoTarget{}) {
+			return cgoTarget{forward: true}, true
+		}
+		// The SDK declaration proves external linkage, without naming a library or implementation.
+		return cgoTarget{external: !local && strings.HasSuffix(path, ".h") &&
+			decl.Val(dwarf.AttrExternal) == true}, true
+	}
 	if filepath.Dir(path) != meta.Dir || (!preamble && !header) {
 		return cgoTarget{}, true
 	}
+	target := l.cgoLocation(decl, path, name, machoObject)
+	target.preamble = preamble && target != (cgoTarget{})
+	return target, true
+}
+
+func (l *loader) cgoLocation(decl *dwarf.Entry, path, name string, machoObject bool) cgoTarget {
+	line, _ := decl.Val(dwarf.AttrDeclLine).(int64)
+	column, _ := decl.Val(dwarf.AttrDeclColumn).(int64)
 	source := l.manifest[path]
-	if source == nil || line > int64(len(source.Data)) || column > int64(len(source.Data)) {
-		return cgoTarget{}, true
+	if source == nil || line <= 0 || line > int64(len(source.Data)) ||
+		column > int64(len(source.Data)) || (!machoObject && column <= 0) {
+		return cgoTarget{}
 	}
 	start := 0
 	for i := int64(1); i < line; i++ {
 		newline := bytes.IndexByte(source.Data[start:], '\n')
 		if newline < 0 {
-			return cgoTarget{}, true
+			return cgoTarget{}
 		}
 		start += newline + 1
 	}
@@ -1461,17 +1519,16 @@ func (l *loader) cgoDeclaration(meta *listPackage, data *dwarf.Data, lines *dwar
 		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `[	 ]*\(`)
 		matches := pattern.FindAllIndex(declaration, 2)
 		if len(matches) != 1 {
-			return cgoTarget{}, true
+			return cgoTarget{}
 		}
 		column = int64(matches[0][0] + 1)
 	}
 	start += int(column) - 1
 	end := start + len(name)
 	if int(column)-1+len(name) > lineEnd || string(source.Data[start:end]) != name {
-		return cgoTarget{}, true
+		return cgoTarget{}
 	}
-	return cgoTarget{declaration: location{fileFact{source.Path, source.SHA256}, start, end, start, end},
-		preamble: preamble}, true
+	return cgoTarget{declaration: location{fileFact{source.Path, source.SHA256}, start, end, start, end}}
 }
 
 func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, source *sourceFile, maxSites int) {
@@ -1481,11 +1538,12 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 	}
 	type position struct{ line, column int }
 	type target struct {
-		fn         *types.Func
-		selector   string
-		conversion bool
+		fn       *types.Func
+		selector string
+		dispatch string
 	}
 	mapped := make(map[position]target)
+	conversions := make(map[position]string)
 	type nativePosition struct {
 		position
 		end bool
@@ -1529,6 +1587,20 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 				}
 			}
 		}
+		if id, ok := call.Fun.(*ast.Ident); ok && pkg.Info.Types[id].IsType() {
+			if suffix, ok := strings.CutPrefix(id.Name, "_Ctype_"); ok {
+				// cgo pointer checks can move the type token and preserve only its opening parenthesis.
+				pos := fs.PositionFor(call.Lparen, true)
+				if pos.Filename == source.Abs && pos.Column != 0 {
+					key := position{pos.Line, pos.Column}
+					if _, duplicate := conversions[key]; duplicate {
+						conversions[key] = ""
+					} else {
+						conversions[key] = "C." + suffix
+					}
+				}
+			}
+		}
 		pos := fs.PositionFor(call.Fun.Pos(), true)
 		if pos.Filename != source.Abs || pos.Column == 0 {
 			return true
@@ -1539,9 +1611,15 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 			return true
 		}
 		mapped[key] = target{}
-		if name, ok := call.Fun.(*ast.Ident); ok && pkg.Info.Types[name].IsType() {
-			if suffix, ok := strings.CutPrefix(name.Name, "_Ctype_"); ok {
-				mapped[key] = target{selector: "C." + suffix, conversion: true}
+		if name, ok := call.Fun.(*ast.Ident); ok {
+			if pkg.Info.Types[name].IsType() {
+				if suffix, ok := strings.CutPrefix(name.Name, "_Ctype_"); ok {
+					mapped[key] = target{selector: "C." + suffix, dispatch: "conversion"}
+				}
+			} else if variable, ok := pkg.Info.Uses[name].(*types.Var); ok {
+				if _, callable := variable.Type().Underlying().(*types.Signature); callable {
+					mapped[key] = target{selector: name.Name, dispatch: "function_value"}
+				}
 			}
 			return true
 		}
@@ -1568,7 +1646,7 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		}
 		start := fs.PositionFor(selector.Pos(), false).Offset
 		end := fs.PositionFor(selector.End(), false).Offset
-		mapped[key] = target{fn: fn, selector: string(generatedSource.Data[start:end])}
+		mapped[key] = target{fn: fn, selector: string(generatedSource.Data[start:end]), dispatch: "static"}
 		return true
 	})
 	if len(nativeCalls) != 0 && pkg.CgoDeclarations == nil {
@@ -1590,6 +1668,12 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		end := fs.PositionFor(call.Fun.End(), false).Offset
 		callee := string(source.Data[pos.Offset:end])
 		callEnd := fs.PositionFor(call.End(), false)
+		if target.selector == "" {
+			paren := fs.PositionFor(call.Lparen, false)
+			if conversions[position{paren.Line, paren.Column}] == callee {
+				target.selector, target.dispatch = callee, "conversion"
+			}
+		}
 		var native cgoTarget
 		nativeName, isC := strings.CutPrefix(callee, "C.")
 		if isC {
@@ -1616,7 +1700,7 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		row := siteFact{
 			fileFact: fileFact{source.Path, source.SHA256}, PackageID: pkg.Fact.ID,
 			Start: fs.PositionFor(call.Pos(), false).Offset, End: callEnd.Offset,
-			CalleeStart: pos.Offset, CalleeEnd: end, Dispatch: "conversion",
+			CalleeStart: pos.Offset, CalleeEnd: end, Dispatch: target.dispatch,
 		}
 		if native != (cgoTarget{}) {
 			if len(g.out.Symbols) >= maxSymbols {
@@ -1637,8 +1721,7 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 			}
 			row.TargetPackage = symbol.Package
 			g.out.Symbols = append(g.out.Symbols, symbol)
-		} else if !target.conversion {
-			row.Dispatch = "static"
+		} else if target.fn != nil {
 			row.TargetSymbol = g.symbol(target.fn)
 			if row.TargetSymbol == 0 {
 				return true
@@ -1931,7 +2014,11 @@ func packageKeys(l *loader, base string, exports map[string]string) map[string]s
 				admitted[source.Abs] = l.manifest[source.Abs] != nil
 			}
 			if l.cgoHeaders && len(meta.CgoFiles) != 0 {
-				for _, name := range meta.HFiles {
+				nativeFiles := meta.HFiles
+				if runtime.GOOS == "darwin" {
+					nativeFiles = slices.Concat(nativeFiles, meta.MFiles)
+				}
+				for _, name := range nativeFiles {
 					if source := l.manifest[filepath.Join(dir, name)]; source != nil {
 						inputs[source.Path] = source.SHA256
 					}
@@ -2039,7 +2126,7 @@ func validPackageContent(entry packageCache, l *loader, meta *listPackage, key, 
 		if row.Internal {
 			loc := row.Declaration
 			if loc == nil || (row.LocationStatus != "exact" &&
-				!(l.cgoHeaders && ((row.LocationStatus == "cgo_native" && strings.HasSuffix(loc.Path, ".h")) ||
+				!(l.cgoHeaders && ((row.LocationStatus == "cgo_native" && cgoNativeSource(loc.Path)) ||
 					(row.LocationStatus == "cgo_preamble" && strings.HasSuffix(loc.Path, ".go"))) &&
 					row.Kind == "function" && row.PackageID == meta.ImportPath &&
 					row.Type == 0 && row.Receiver == 0)) {
@@ -2737,7 +2824,7 @@ func analyze(ctx context.Context, opts options) (out facts, err error) {
 		}
 	}
 	listData, err := goPackageList(ctx, out.Root, opts, out.Context.BuildFlags,
-		"-json=ImportPath,Name,Dir,ForTest,Export,Standard,GoFiles,CgoFiles,HFiles,CompiledGoFiles,InvalidGoFiles,Imports,ImportMap,Module,Error,DepsErrors")
+		"-json=ImportPath,Name,Dir,ForTest,Export,Standard,GoFiles,CgoFiles,HFiles,MFiles,CompiledGoFiles,InvalidGoFiles,Imports,ImportMap,Module,Error,DepsErrors")
 	if err != nil {
 		return out, err
 	}

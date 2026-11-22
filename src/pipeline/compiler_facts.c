@@ -251,6 +251,14 @@ static bool cf_cgo_header(const char *path) {
     return path && cf_equal(strrchr(path, '.'), ".h");
 }
 
+static bool cf_cgo_native_source(const char *path) {
+#ifdef __APPLE__
+    if (path && cf_equal(strrchr(path, '.'), ".m"))
+        return true;
+#endif
+    return cf_cgo_header(path);
+}
+
 static uint8_t cf_callable_kind(const char *label) {
     return cf_equal(label, "Function") ? 1 : cf_equal(label, "Method") ? 2 : 0;
 }
@@ -774,7 +782,7 @@ bool cbm_compiler_facts_go_package_manifest_valid(yyjson_val *cache,
         const char *previous = NULL;
         for (size_t i = 0; i < n; i++) {
             const char *path = cf_string(yyjson_arr_get(files, i));
-            if (!cf_relative(path) || cf_cgo_header(path) ||
+            if (!cf_relative(path) || cf_cgo_native_source(path) ||
                 (previous && strcmp(previous, path) >= 0) ||
                 !bsearch(&path, paths, count, sizeof(*paths), cf_string_compare)) {
                 valid = false;
@@ -1610,8 +1618,9 @@ static const char *cf_symbols(CBMCompilerFacts *facts, CFValue array, size_t typ
                  (cgo_external ? !out->external || !cf_equal(out->package, "C") || decl.raw ||
                                      cfv_get(symbol, "package_id").raw
                                : out->external || !declaration_path ||
-                                     !cf_equal(strrchr(declaration_path, '.'),
-                                               cgo_preamble ? ".go" : ".h"))))
+                                     !(cgo_preamble
+                                           ? cf_equal(strrchr(declaration_path, '.'), ".go")
+                                           : cf_cgo_native_source(declaration_path)))))
                 return "invalid cgo native symbol";
             if ((!out->external &&
                  (!package || (!out->cgo_native && !cf_equal(location_status, "exact")))) ||
