@@ -23,7 +23,7 @@ def selected_go_files(packages, root):
             continue
         assert not package.get("Error") and not package.get("DepsErrors"), package["ImportPath"]
         local_packages += 1
-        for key in ("GoFiles", "CgoFiles", "CompiledGoFiles"):
+        for key in ("GoFiles", "CgoFiles", "TestGoFiles", "XTestGoFiles", "CompiledGoFiles"):
             for name in package.get(key, []):
                 file = directory / name
                 if file.is_relative_to(root) and file.suffix == ".go":

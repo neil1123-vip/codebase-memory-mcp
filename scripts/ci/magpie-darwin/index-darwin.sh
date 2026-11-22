@@ -58,17 +58,23 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from time import monotonic
 
 go, cbm, root, project, output = sys.argv[1:]
 output = Path(output)
 for name, seconds, argv in (
-    ("go-list", 240, [go, "list", "-deps", "-e", "-test", "-compiled", "-export",
-                      "-json=ImportPath,Name,Dir,Error,DepsErrors,Export,CgoFiles,GoFiles,CompiledGoFiles,ForTest", "./..."]),
+    ("go-list", 120, [go, "list", "-deps", "-e",
+                      "-json=ImportPath,Dir,Error,DepsErrors,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles", "./..."]),
+    # Use the helper's export and cgo build inputs to fill the same GOCACHE before its 60 s deadline.
+    ("go-export-prewarm", 600, [go, "list", "-deps", "-export", "-compiled", "-test", "./..."]),
     ("index", 300, [cbm, "cli", "index_repository", "--repo-path", root, "--name", project,
                     "--mode", "full", "--json"]),
 ):
+    print(f"Starting macOS acceptance step: {name}", flush=True)
+    start = monotonic()
     with (output / (name + ".json")).open("w") as stdout, (output / (name + ".stderr")).open("w") as stderr:
         subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=seconds, check=True)
+    print(f"Completed {name} in {monotonic() - start:.1f} seconds", flush=True)
 reply = json.loads((output / "index.json").read_bytes())
 assert not reply.get("isError"), reply
 data = reply.get("structuredContent") or json.loads(reply["content"][0]["text"])

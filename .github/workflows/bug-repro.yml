@@ -72,6 +72,10 @@ jobs:
         shell: bash
         run: |
           script_dir="$GITHUB_WORKSPACE/scripts/ci/magpie-darwin"
+          {
+            sysctl hw.logicalcpu hw.memsize
+            df -k "$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/magpie-darwin-inputs/runner-resources.txt"
           git apply --check "$script_dir/admit-native-darwin.patch"
           git apply "$script_dir/admit-native-darwin.patch"
           CBM_NO_CCACHE=1 scripts/build.sh CC=cc CXX=c++
@@ -88,7 +92,9 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/magpie-darwin-inputs/verified.json
+            ${{ runner.temp }}/magpie-darwin-inputs/runner-resources.txt
             ${{ runner.temp }}/magpie-darwin-output/acceptance.json
+            ${{ runner.temp }}/magpie-darwin-output/index.json
             ${{ runner.temp }}/magpie-darwin-output/input-hashes.txt
             ${{ runner.temp }}/magpie-darwin-output/sdk-version.txt
             ${{ runner.temp }}/magpie-darwin-output/toolchain.txt
