@@ -1669,8 +1669,8 @@ func (g *exporter) exportCgoFile(pkg *checkedPackage, generated *ast.File, sourc
 		callee := string(source.Data[pos.Offset:end])
 		callEnd := fs.PositionFor(call.End(), false)
 		if target.selector == "" {
-			paren := fs.PositionFor(call.Lparen, false)
-			if conversions[position{paren.Line, paren.Column}] == callee {
+			calleeEnd := fs.PositionFor(call.Fun.End(), false)
+			if conversions[position{calleeEnd.Line, calleeEnd.Column}] == callee {
 				target.selector, target.dispatch = callee, "conversion"
 			}
 		}
