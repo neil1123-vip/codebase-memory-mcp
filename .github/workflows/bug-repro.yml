@@ -62,9 +62,9 @@ jobs:
           script_dir="$GITHUB_WORKSPACE/scripts/ci/magpie-darwin"
           cd "$source_dir"
           test "$(git rev-parse HEAD)" = 803d7747e7eb4599b21b84e9e035071f22ad19df
-          go mod download all
-          go mod verify
-          go mod download -json github.com/wailsapp/wails/v3@v3.0.0-beta.24 > "$RUNNER_TEMP/magpie-darwin-inputs/wails-module.json"
+          CGO_ENABLED=1 go list -mod=readonly -tags=production -p=4 -deps -test ./... >/dev/null
+          (cd "$RUNNER_TEMP/magpie-darwin-inputs" &&
+            go mod download -json github.com/wailsapp/wails/v3@v3.0.0-beta.24) > "$RUNNER_TEMP/magpie-darwin-inputs/wails-module.json"
           git diff --exit-code HEAD
           python3 "$script_dir/verify-native-inputs.py" "$source_dir" "$script_dir/source-sites.json" "$RUNNER_TEMP/magpie-darwin-inputs/wails-module.json" > "$RUNNER_TEMP/magpie-darwin-inputs/verified.json"
 
